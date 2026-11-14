@@ -449,6 +449,7 @@ class Settings:
     custom_rules: tuple[str, ...] = ()
     # `[notify] waiting`：Claude 会话进入「等你」时往主人单聊推卡（bridge/fleet/notify.py）。默认开。
     notify_waiting: bool = True
+    notify_group: bool = True
 
     @classmethod
     def load(cls, path: str) -> "Settings":
@@ -501,6 +502,7 @@ class Settings:
             config_path=path,
             custom_rules=tuple(raw.get("review", {}).get("deny_patterns") or []),
             notify_waiting=_truthy((raw.get("notify") or {}).get("waiting", True)),
+            notify_group=_truthy((raw.get("notify") or {}).get("group", True)),
         )
 
 
@@ -645,6 +647,14 @@ class Bridge:
             self.waiting_notifier = WaitingNotifier(enabled=settings.notify_waiting)
         except Exception:  # noqa: BLE001
             logger.exception("「等你」推送没起来，会话等你时不会主动提醒")
+        # 会话绑定的群里推「要人介入的事 + 重要进展」（bridge/fleet/grouppush.py）。
+        self.group_pusher = None
+        try:
+            from .fleet.grouppush import GroupPusher
+
+            self.group_pusher = GroupPusher(enabled=settings.notify_group)
+        except Exception:  # noqa: BLE001
+            logger.exception("群进展推送没起来，绑定群里不会主动推进展")
         # 第 12 轮：常驻菜单自愈。装机那一刻缺权限写不成菜单的，桥起来后自己补；成功一次永不再写
         # （2026-11-06 同事装完没有悬浮菜单：菜单只在装机时写一次，之后没人再写）。
         self.menu_heal = None
@@ -2934,6 +2944,12 @@ class Bridge:
             )
         finally:
             inflight.pop(scope, None)
+            pusher = getattr(self, "group_pusher", None)
+            if pusher is not None and str(scope).startswith("group:"):
+                try:
+                    pusher.note_relay(target.tool, target.id, time.time() - (time.monotonic() - sent_at))
+                except Exception:  # noqa: BLE001
+                    logger.debug("记群里发进去的这一轮失败", exc_info=True)
             wait_stop.set()
             try:
                 await wait_task
@@ -5609,13 +5625,23 @@ class Bridge:
         """
         notifier = getattr(self, "waiting_notifier", None)
         control = getattr(self, "fleet", None)
-        if notifier is None or not notifier.enabled or control is None:
+        pusher = getattr(self, "group_pusher", None)
+        waiting_on = notifier is not None and notifier.enabled
+        group_on = pusher is not None and pusher.enabled
+        if control is None or not (waiting_on or group_on):
             return
         try:
             # 和主人点「会话」共用一次扫描（第 11 轮）：撞上时谁后到谁等，不再互相把对方那一家「跳过」
             view = self._fleet_scanner().overview()
         except Exception:  # noqa: BLE001 —— 扫描失败 = 这一拍不推
             logger.exception("「等你」推送：扫描失败，这一拍跳过")
+            return
+        if group_on:
+            try:
+                self._group_push_tick(view)
+            except Exception:  # noqa: BLE001 —— 群推送出错不能拖累单聊那条
+                logger.exception("群进展推送这一拍失败")
+        if not waiting_on:
             return
         try:
             due = notifier.due(view)
@@ -5640,6 +5666,41 @@ class Bridge:
             notifier.record(sess.key, ok)
             # 只记工具和短 id，不记标题（标题是用户项目里的文字）
             logger.info("「等你」推送 tool=%s 会话=%s 送达=%s", sess.tool, str(sess.id)[:8], ok)
+
+    def _group_push_tick(self, view) -> None:
+        """绑定群：要人介入的一定推；做完一轮推结果摘要；群里自己发进去的那轮不重复推。"""
+        pusher = getattr(self, "group_pusher", None)
+        binds = getattr(self, "chat_binds", None)
+        control = getattr(self, "fleet", None)
+        if pusher is None or binds is None or control is None:
+            return
+        pushes = pusher.due(view, binds)
+        if not pushes:
+            return
+        from .fleet.cards import project_of, session_label
+        from .fleet.grouppush import build_push_text
+
+        for push in pushes:
+            sess = push.sess
+            last_reply = ""
+            if push.kind == "done":
+                try:
+                    _fresh, messages, _note = control.detail(sess.tool, sess.id, 4)
+                    for msg in reversed(messages or []):
+                        if getattr(msg, "role", "") == "assistant" and getattr(msg, "text", ""):
+                            last_reply = msg.text
+                            break
+                except Exception:  # noqa: BLE001
+                    logger.debug("群进展推送：读最后一条回复失败", exc_info=True)
+            try:
+                label = session_label(sess, _redact_text)
+            except Exception:  # noqa: BLE001
+                label = sess.tool
+            project = _redact_text(project_of(getattr(sess, "cwd", "") or ""))
+            text = build_push_text(push, label, project, last_reply, redact=_redact_text)
+            ok = self._say(push.chat_id, text)
+            logger.info("群进展推送 类型=%s tool=%s 会话=%s 送达=%s", push.kind, sess.tool,
+                        str(sess.id)[:8], ok)
 
     def _send_card_or_text_ok(self, chat_id: str, card: str, fallback: str) -> bool:
         """同 `_send_card_or_text`，但告诉调用方到底送没送到（限流要知道）。"""
