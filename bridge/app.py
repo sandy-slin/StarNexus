@@ -4036,11 +4036,20 @@ class Bridge:
         if len(args) == 1:
             await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool)
             return True
-        found = workspace_mod.resolve_request(self.policy, self._new_current_dir(scope), " ".join(args[1:]))
+        from .fleet.newsession import pick_model
+
+        rest = args[1:]
+        model = pick_model(tool, rest[-1]) if rest else ""
+        if model:
+            rest = rest[:-1]
+        if not rest:
+            await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool, model)
+            return True
+        found = workspace_mod.resolve_request(self.policy, self._new_current_dir(scope), " ".join(rest))
         if not found.ok or not found.workspace:
             self._say(chat_id, found.reply.replace("/cd ", f"/newsession {tool} "))
             return True
-        self._arm_new_session(scope, chat_id, tool, found.workspace)
+        self._arm_new_session(scope, chat_id, tool, found.workspace, model)
         return True
 
     def _send_new_tool_card(self, chat_id: str) -> None:
@@ -4050,7 +4059,7 @@ class Bridge:
         if sender is None or not sender(chat_id, build_tool_card(_do_button("newcancel"))):
             self._say(chat_id, "选工具的卡片发不出去。也可以直接发：/newsession claude（或 codex、cursor）")
 
-    def _send_new_dir_card(self, scope: str, chat_id: str, tool: str) -> None:
+    def _send_new_dir_card(self, scope: str, chat_id: str, tool: str, model: str = "") -> None:
         from .fleet.newsession import MAX_DIRS, build_dir_card
 
         policy = self.policy
@@ -4059,26 +4068,42 @@ class Bridge:
             self._say(chat_id, "没找到手机能用的项目目录。要放开得在电脑上改这个助手的设置。")
             return
         nonce = self._newsession_state().offer(scope, tool, dirs)
+        if model:
+            self._newsession_models()[scope] = (tool, model)
+        else:
+            self._newsession_models().pop(scope, None)
         labels = [_redact_text(workspace_mod.short_name(d, policy)) for d in dirs]
         card = build_dir_card(tool, labels, nonce, _do_button("newcancel"))
         sender = getattr(getattr(self, "replier", None), "send_card", None)
         if sender is None or not sender(chat_id, card):
             self._say(chat_id, f"选项目的卡片发不出去。也可以直接发：/newsession {tool} 项目名")
 
-    def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str) -> None:
-        from .fleet.newsession import permission_line
+    def _newsession_models(self) -> dict:
+        """选项目卡发出去时带的模型（`/newsession claude opus` 再点卡上的项目）。scope → 模型。"""
+        if not hasattr(self, "_new_models"):
+            self._new_models = {}
+        return self._new_models
+
+    def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str, model: str = "") -> None:
+        from .fleet.newsession import model_hint, permission_line
         from .fleet.scan import TOOL_LABELS
 
         policy = self.policy
-        self._newsession_state().arm(scope, tool, cwd)
-        logger.info("新建会话 选好 tool=%s scope=%s", tool, scope[:16])
+        carried = self._newsession_models().pop(scope, None)
+        if not model and carried and carried[0] == tool:
+            model = carried[1]
+        self._newsession_state().arm(scope, tool, cwd, model)
+        logger.info("新建会话 选好 tool=%s model=%s scope=%s", tool, model or "-", scope[:16])
         short = _redact_text(workspace_mod.short_name(cwd, policy))
         mode = MODE_LABELS.get(policy.mode, policy.mode)
         self._say_with_buttons(
             chat_id,
             f"好，在「{short}」新开一个 **{TOOL_LABELS.get(tool, tool)}** 会话。\n"
             f"{permission_line(tool, mode)}\n"
-            "**下一句话就是它的第一句**，直接打字发过来（10 分钟内有效）。开好之后就进对话模式，接着说都发给它。",
+            + (f"模型：**{model}**\n" if model else
+               (f"模型：默认。要指定就发「/newsession {tool} 项目名 模型」，可选 {model_hint(tool)}\n"
+                if model_hint(tool) else ""))
+            + "**下一句话就是它的第一句**，直接打字发过来（10 分钟内有效）。开好之后就进对话模式，接着说都发给它。",
             [_do_button("newcancel")],
         )
 
@@ -4170,6 +4195,7 @@ class Bridge:
             result = await asyncio.to_thread(
                 control.start, tool, cwd, text, policy=policy, approval_dir=approval_dir,
                 timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
+                model=armed.get("model", ""),
             )
         finally:
             inflight.pop(scope, None)

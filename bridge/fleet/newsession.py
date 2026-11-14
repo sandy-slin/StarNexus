@@ -41,6 +41,24 @@ WORDS = frozenset({"新建会话", "新会话", "开新会话"})
 START_TOOLS = ("claude", "codex", "cursor")
 TOOL_ALIASES = {"claude": "claude", "cc": "claude", "codex": "codex", "cx": "codex",
                 "cursor": "cursor", "cursor-agent": "cursor"}
+MODEL_ALIASES = {
+    "claude": {"sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5",
+               "claude-sonnet-5-5": "claude-sonnet-5-5", "claude-opus-5-5": "claude-opus-5-5",
+               "claude-haiku-5-5": "claude-haiku-5-5"},
+    "codex": {"sol": "gpt-6-sol", "luna": "gpt-6-luna", "gpt-6-sol": "gpt-6-sol", "gpt-6-luna": "gpt-6-luna"},
+}
+
+
+def pick_model(tool: str, word: str) -> str:
+    """`opus` / `luna` / 全名 → 这家认的模型名；认不出 ⇒ 空串（用默认模型）。"""
+    return MODEL_ALIASES.get(tool, {}).get(str(word or "").strip().lower(), "")
+
+
+def model_hint(tool: str) -> str:
+    names = sorted({v for v in MODEL_ALIASES.get(tool, {}).values()})
+    return " / ".join(names)
+
+
 TOOL_HINTS = {
     "claude": "按手机这边的权限干活",
     "codex": "只读：能看、能回答，不改文件",
@@ -110,9 +128,10 @@ class NewSessionState:
             self._offers.pop(scope, None)
             return got["tool"], got["dirs"][index]
 
-    def arm(self, scope: str, tool: str, cwd: str) -> None:
+    def arm(self, scope: str, tool: str, cwd: str, model: str = "") -> None:
         with self._lock:
-            self._armed[scope] = {"tool": tool, "cwd": cwd, "expires": self._now() + ARMED_TTL_SEC}
+            self._armed[scope] = {"tool": tool, "cwd": cwd, "model": model,
+                                  "expires": self._now() + ARMED_TTL_SEC}
 
     def peek(self, scope: str) -> tuple:
         """(没过期的 armed 或 None, 是否过期)。过期的顺手清掉。"""
