@@ -46,7 +46,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from .model import (
     ActionResult,
@@ -1147,7 +1147,8 @@ class ClaudeAdapter(Adapter):
     # ---------- start：手机上新建会话 ----------
 
     def start(self, cwd: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
-              approval_dir: str = "", model: str = "") -> ActionResult:
+              approval_dir: str = "", model: str = "",
+              on_pid: Optional[Callable[[int], None]] = None) -> ActionResult:
         """在 `cwd` 新开一个会话，第一句是 `text`。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
         只是把 `--resume <id>` 换成 `--session-id <新 uuid>`：id 由我们先定好，起进程前就能登记，
         这样「停下」和占用判断从第一秒起就认得它。
@@ -1187,6 +1188,11 @@ class ClaudeAdapter(Adapter):
         def on_spawn(pid: int) -> None:
             spawned.append(pid)
             self.jobs.register_spawned(pid, TOOL, sid)
+            if on_pid is not None:
+                try:
+                    on_pid(pid)
+                except Exception:  # noqa: BLE001
+                    pass
 
         try:
             result = self.runner.run(argv, timeout=float(timeout or DEFAULT_SEND_TIMEOUT), cwd=inside,

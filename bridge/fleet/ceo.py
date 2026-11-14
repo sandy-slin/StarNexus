@@ -342,10 +342,13 @@ class Orchestrator:
             m["state"] = "cancelled"
             self._event(m, "董事长叫停")
             self.store.save()
-            subs = [s for s in m["subtasks"] if s.get("state") == "running" and s.get("session_id")]
+            subs = [dict(s) for s in m["subtasks"] if s.get("state") == "running"]
         for sub in subs:
             try:
-                self.control.stop(sub["tool"], sub["session_id"])
+                if sub.get("pid") and hasattr(self.control, "signal_spawned"):
+                    self.control.signal_spawned(sub["tool"], sub["pid"])
+                elif sub.get("session_id"):
+                    self.control.stop(sub["tool"], sub["session_id"])
             except Exception:  # noqa: BLE001
                 logger.debug("停子任务失败", exc_info=True)
         return f"🛑 已叫停：{short(m['goal'], 40)}。正在跑的子任务会尽量停下，之后的结果不再处理。"
@@ -576,6 +579,11 @@ class Orchestrator:
                      "做完后用几句话总结：做了什么、结果、还有什么问题。")
         policy = self.policy()
         timeout = float(self.timeout() or 600)
+
+        def on_pid(pid: int) -> None:
+            with self.store.lock:
+                sub["pid"] = int(pid)
+
         try:
             if sub.get("session_id"):
                 res = self.control.send(sub["tool"], sub["session_id"], instr, policy=policy,
@@ -584,13 +592,14 @@ class Orchestrator:
             else:
                 res = self.control.start(sub["tool"], sub["cwd"], instr, policy=policy,
                                          approval_dir=self.approval_dir(sub["tool"], f"ceo-{m['id']}-{sub['n']}"),
-                                         timeout=timeout, model=sub.get("model", ""))
+                                         timeout=timeout, model=sub.get("model", ""), on_pid=on_pid)
         except Exception as exc:  # noqa: BLE001
             res = None
             err = str(exc)
         else:
             err = ""
         with self.store.lock:
+            sub.pop("pid", None)
             sub["turns"] += 1
             sub["next"] = ""
             if res is not None and getattr(res, "session_id", ""):

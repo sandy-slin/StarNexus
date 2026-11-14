@@ -68,7 +68,7 @@ import sqlite3
 import threading
 import time
 import urllib.parse
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .model import (
     ActionResult,
@@ -869,7 +869,7 @@ class CodexAdapter(Adapter):
     # ---------- start：手机上新建会话 ----------
 
     def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "readonly",
-              model: str = "") -> ActionResult:
+              model: str = "", on_pid: Optional[Callable[[int], None]] = None) -> ActionResult:
         """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
 
         🔴 和 send 同一条红线：手机上发进 Codex 一律按只读（control.start 传 readonly）。
@@ -895,6 +895,11 @@ class CodexAdapter(Adapter):
         def on_spawn(pid: int) -> None:
             spawned.append(pid)
             self.jobs.register_spawned(pid, self.tool, "")
+            if on_pid is not None:
+                try:
+                    on_pid(pid)
+                except Exception:  # noqa: BLE001
+                    pass
 
             def soft_stop() -> None:
                 fired.set()

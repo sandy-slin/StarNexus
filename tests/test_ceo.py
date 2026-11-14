@@ -35,7 +35,7 @@ class FakeControl:
         self.fail_tools = fail_tools
         self.lock = threading.Lock()
 
-    def start(self, tool, cwd, text, *, policy=None, approval_dir="", timeout=600, model=""):
+    def start(self, tool, cwd, text, *, policy=None, approval_dir="", timeout=600, model="", on_pid=None):
         with self.lock:
             self.starts.append((tool, cwd, text, model))
             n = len(self.starts)
@@ -202,6 +202,49 @@ class CeoTest(unittest.TestCase):
         self.assertIn("已叫停", o.cancel("oc_ceo"))
         self.assertEqual(control.stops, [("claude", "s1")])
         self.assertEqual(store.missions[mid]["state"], "cancelled")
+
+    def test_cancel_first_turn_signals_spawned_process(self):
+        store = ceo.MissionStore(self.path)
+        control = FakeControl()
+        control.signals = []
+        control.signal_spawned = lambda tool, pid: control.signals.append((tool, pid))
+        o = ceo.Orchestrator(store, FakeBrain(PLAN, []), control, lambda c, t: None,
+                             policy=lambda: None, projects=lambda: [("p", "/p")], spawn=lambda fn: None)
+        _, mid = o.start("oc_ceo", "任务")
+        store.missions[mid]["state"] = "running"
+        store.missions[mid]["subtasks"] = [
+            {"n": 1, "tool": "codex", "session_id": "", "pid": 4321, "state": "running"},
+            {"n": 2, "tool": "claude", "session_id": "s2", "state": "running"},
+            {"n": 3, "tool": "claude", "session_id": "s3", "state": "done"},
+        ]
+        o.cancel("oc_ceo")
+        self.assertEqual(control.signals, [("codex", 4321)])
+        self.assertEqual(control.stops, [("claude", "s2")])
+
+    def test_dispatch_records_pid_then_clears_it(self):
+        seen = []
+
+        class PidControl(FakeControl):
+            def start(self, tool, cwd, text, *, policy=None, approval_dir="", timeout=600, model="", on_pid=None):
+                on_pid(999)
+                seen.append(dict(sub_ref[0]))
+                return super().start(tool, cwd, text, policy=policy, approval_dir=approval_dir,
+                                     timeout=timeout, model=model)
+
+        sub_ref = []
+        store = ceo.MissionStore(self.path)
+        o = ceo.Orchestrator(store, FakeBrain(PLAN, []), PidControl(), lambda c, t: None,
+                             policy=lambda: None, projects=lambda: [("p", "/p")], spawn=lambda fn: None)
+        _, mid = o.start("oc_ceo", "任务")
+        m = store.missions[mid]
+        m["state"] = "running"
+        sub = {"n": 1, "title": "t", "tool": "codex", "model": "", "project": "p", "cwd": "/p", "brief": "b",
+               "next": "b", "state": "running", "session_id": "", "result": "", "turns": 0}
+        m["subtasks"] = [sub]
+        sub_ref.append(sub)
+        o._one(m, sub)
+        self.assertEqual(seen[0].get("pid"), 999)
+        self.assertNotIn("pid", sub)
 
     def test_restart_recover_and_resume(self):
         store = ceo.MissionStore(self.path)

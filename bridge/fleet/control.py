@@ -237,7 +237,7 @@ class FleetControl:
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
 
     def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
-              timeout: float = 600, model: str = "") -> ActionResult:
+              timeout: float = 600, model: str = "", on_pid: Any = None) -> ActionResult:
         """手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
 
         闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
@@ -254,6 +254,8 @@ class FleetControl:
             return ActionResult(False, WHY_OUTSIDE_WORKSPACE, "")
         try:
             extra = {"model": model} if model and tool in ("claude", "codex") else {}
+            if on_pid is not None and tool in ("claude", "codex"):
+                extra["on_pid"] = on_pid
             if tool == "claude":
                 result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
                                        **extra)
@@ -299,6 +301,14 @@ class FleetControl:
     def _cwd_of(self, tool: str, sid: str) -> str:
         sess = self.cached(tool, sid)
         return str(getattr(sess, "cwd", "") or "") if sess else ""
+
+    def signal_spawned(self, tool: str, pid: int) -> ActionResult:
+        """停一个桥自己起的进程（新开会话那一轮，还不知道会话编号时用）。只认登记过的进程。"""
+        adapter = self.fleet.adapter(tool)
+        jobs = getattr(adapter, "jobs", None)
+        if jobs is None:
+            return ActionResult(False, WHY_NO_ADAPTER, "")
+        return jobs.signal(pid)
 
     def stop(self, tool: str, sid: str, *, relay: bool = False) -> ActionResult:
         """`relay=True`：对话模式里的 `/stop`。
