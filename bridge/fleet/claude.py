@@ -1147,7 +1147,7 @@ class ClaudeAdapter(Adapter):
     # ---------- start：手机上新建会话 ----------
 
     def start(self, cwd: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
-              approval_dir: str = "") -> ActionResult:
+              approval_dir: str = "", model: str = "") -> ActionResult:
         """在 `cwd` 新开一个会话，第一句是 `text`。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
         只是把 `--resume <id>` 换成 `--session-id <新 uuid>`：id 由我们先定好，起进程前就能登记，
         这样「停下」和占用判断从第一秒起就认得它。
@@ -1175,6 +1175,12 @@ class ClaudeAdapter(Adapter):
         argv = self._send_argv(sid, text, policy, hook)
         at = argv.index("--resume")
         argv[at:at + 2] = ["--session-id", sid]
+        if model:
+            from .codex import safe_model_name
+
+            if not safe_model_name(model):
+                return ActionResult(False, f"模型名不对：{short_title(str(model), 40)}", "")
+            argv[at + 2:at + 2] = ["--model", model]
         env = self._send_env(approval_dir if hook else "")
         spawned: list = []
 

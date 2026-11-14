@@ -868,7 +868,8 @@ class CodexAdapter(Adapter):
 
     # ---------- start：手机上新建会话 ----------
 
-    def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "readonly") -> ActionResult:
+    def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "readonly",
+              model: str = "") -> ActionResult:
         """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
 
         🔴 和 send 同一条红线：手机上发进 Codex 一律按只读（control.start 传 readonly）。
@@ -881,7 +882,12 @@ class CodexAdapter(Adapter):
             return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
         codex = self._codex()
         sandbox = SANDBOX_BY_MODE.get(mode or "readonly", SANDBOX_BY_MODE["readonly"]) or SANDBOX_BY_MODE["readonly"]
-        argv = [codex, "exec", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"', "--", text]
+        argv = [codex, "exec", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"']
+        if model:
+            if not safe_model_name(model):
+                return ActionResult(False, f"模型名不对：{short_title(str(model), 40)}", "")
+            argv += ["-m", model]
+        argv += ["--", text]
         spawned: list = []
         timer_box: list = []
         fired = threading.Event()
@@ -1236,3 +1242,11 @@ def thread_id_from_exec_output(stdout: str) -> str:
             tid = ev.get("thread_id")
             return tid.lower() if is_thread_id(tid) else ""
     return ""
+
+
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
+
+
+def safe_model_name(name: Any) -> bool:
+    """模型名只认字母数字和 `._:/-`，不以 `-` 开头（不会被当成参数）。"""
+    return isinstance(name, str) and bool(_MODEL_NAME_RE.match(name))

@@ -237,7 +237,7 @@ class FleetControl:
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
 
     def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
-              timeout: float = 600) -> ActionResult:
+              timeout: float = 600, model: str = "") -> ActionResult:
         """手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
 
         闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
@@ -253,10 +253,12 @@ class FleetControl:
         if not resolved:
             return ActionResult(False, WHY_OUTSIDE_WORKSPACE, "")
         try:
+            extra = {"model": model} if model and tool in ("claude", "codex") else {}
             if tool == "claude":
-                result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir)
+                result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
+                                       **extra)
             else:
-                result = adapter.start(resolved, text, timeout=timeout, mode="readonly")
+                result = adapter.start(resolved, text, timeout=timeout, mode="readonly", **extra)
         except Exception as exc:
             return ActionResult(False, friendly_error(exc, log_as=f"新建会话失败 tool={tool}"), "")
         if result.session_id:
