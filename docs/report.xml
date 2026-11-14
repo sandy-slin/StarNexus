@@ -1,0 +1,71 @@
+<title>Her Remote · MacBook pro2 远程控制开发报告（2026-11-15）</title>
+<callout emoji="📌" background-color="light-blue"><p>结论：本机已运行 Her Remote，飞书机器人「Her remote · MacBook pro2」可控制本机 Claude 和 Codex。新增三项能力：新建会话（可选模型）、绑定群推送重要进展、CEO 编排（独立功能）。自动化测试 58 条全部通过，飞书端到端实测通过。红色字为需要林森事后关注的事项。Cursor 已按要求移出范围。</p></callout>
+<h1 seq="auto">两个安装文件哪个新</h1>
+<p>较新的是 feishu-agent-mac-20261113-e9dd47bc-dirty-1038f472.command：导入时间更晚，且与本机正在运行的版本号一致。本机代码已用 git 管理，仓库在 /Users/LinSen/work/remote_control（未推送到远端）。</p>
+<h1 seq="auto">整体架构</h1>
+<ul>
+<li>飞书机器人 ⇄ 本机常驻服务（launchd：com.carher.feishu-agent，代码在 ~/.carher-feishu-agent/bridge）⇄ 本机 Claude / Codex 命令行会话。</li>
+<li>原有能力（根基）：私聊控制、会话总览、会话绑定群、群内转发对话、权限确认。</li>
+<li>新增一：新建会话，在飞书里选择 Claude 或 Codex、项目和模型。</li>
+<li>新增二：群进展推送。绑定群只收「需要人介入」和「重要进展」，不刷屏。</li>
+<li>新增三：CEO 编排（独立模块 bridge/fleet/ceo.py）。董事长（人）在 CEO 群里下任务，CEO 拆成子任务，分派给多个 Claude/Codex 会话并行执行，汇总、仲裁、再下指令；需要人拍板时在群里问，最终结果在群里汇报。它不改动原有功能，仅在被标记为 CEO 群的群里生效。</li>
+</ul>
+<h1 seq="auto">功能状态</h1>
+<table><thead><tr><th background-color="light-gray"><p>功能</p></th><th background-color="light-gray"><p>用法</p></th><th background-color="light-gray"><p>状态</p></th></tr></thead><tbody>
+<tr><td><p>新建会话</p></td><td><p>/newsession claude|codex 项目 [模型]，或卡片流程。模型别名：sonnet / opus / haiku，sol / luna</p></td><td><p>已完成，实测通过</p></td></tr>
+<tr><td><p>群进展推送</p></td><td><p>需要人介入：等待 20 秒后必推；做完一轮：稳定 45 秒后推送，同一会话 10 分钟最多一次，附最后回复；失败：立即推。群里发起的对话不重复推。每分钟最多 6 条。配置开关 [notify] group</p></td><td><p>已完成；「做完一轮」实测通过，<span text-color="red">「需要人介入」仅单元测试覆盖</span></p></td></tr>
+<tr><td><p>CEO 编排</p></td><td><p>/ceo 群、/ceo 任务、/ceo 状态、/ceo 停、/ceo 继续、/ceo 退出；CEO 群内直接发文字即下任务，等待拍板时直接回复即答复</p></td><td><p>已完成，实测通过</p></td></tr>
+<tr><td><p>会话总览等原有功能</p></td><td><p>发「会话」</p></td><td><p>正常</p></td></tr>
+</tbody></table>
+<h1 seq="auto">CEO 编排的工作方式</h1>
+<ol>
+<li>CEO 的“大脑”用 Claude（Sonnet，无工具，只输出结构化计划）。</li>
+<li>把任务拆成最多 4 个子任务，每个指定 Claude 或 Codex 和允许的模型，并行启动。</li>
+<li>子任务全部回来后复盘：继续下指令、请人拍板或收尾，最多 3 轮。</li>
+<li>状态保存在 ~/.carher-feishu-agent/ceo_missions.json；服务重启时进行中的任务标记为中断，可用 /ceo 继续。</li>
+<li>已绑定会话的群不能再设为 CEO 群，避免与原功能冲突。</li>
+</ol>
+<h1 seq="auto">测试结果</h1>
+<h2 seq="auto">自动化测试：58 条全部通过</h2>
+<table><thead><tr><th background-color="light-gray"><p>测试文件</p></th><th background-color="light-gray"><p>条数</p></th><th background-color="light-gray"><p>覆盖内容</p></th></tr></thead><tbody>
+<tr><td><p>test_ceo</p></td><td><p>19</p></td><td><p>拆分、分派、复盘、拍板、轮数上限、持久化与中断恢复</p></td></tr>
+<tr><td><p>test_ceo_wiring</p></td><td><p>12</p></td><td><p>CEO 命令接入、群内文字路由、与已绑定群互斥</p></td></tr>
+<tr><td><p>test_grouppush</p></td><td><p>13</p></td><td><p>需要人介入/做完/失败三类推送、去重、限流</p></td></tr>
+<tr><td><p>test_grouppush_wiring</p></td><td><p>4</p></td><td><p>推送接入服务主流程、群内发起不重复推</p></td></tr>
+<tr><td><p>test_newsession_model</p></td><td><p>7</p></td><td><p>新建会话的工具、项目、模型解析</p></td></tr>
+<tr><td><p>test_spawn_stop</p></td><td><p>3</p></td><td><p>停止时连首轮进程一起停</p></td></tr>
+</tbody></table>
+<h2 seq="auto">飞书端到端实测（真实消息）</h2>
+<table><thead><tr><th background-color="light-gray"><p>场景</p></th><th background-color="light-gray"><p>结果</p></th></tr></thead><tbody>
+<tr><td><p>/ceo 群 设置 CEO 群，下发测试任务</p></td><td><p>通过，18.8 秒完成拆分</p></td></tr>
+<tr><td><p>CEO 全流程：两个 Codex 子任务（gpt-6-luna、gpt-6-sol）</p></td><td><p>通过：两个子任务回报；第 1 轮复盘发现数字冲突并追加指令；第 2 轮请人拍板，回复「选 B」被采纳；最终报告送达</p></td></tr>
+<tr><td><p>/ceo 状态</p></td><td><p>通过</p></td></tr>
+<tr><td><p>/ceo 停</p></td><td><p>首次发现首轮进程未停，已修复；复测停前 2 个进程，停后 0 个</p></td></tr>
+<tr><td><p>新建会话 Codex + luna</p></td><td><p>通过，回复正确并进入对话模式</p></td></tr>
+<tr><td><p>新建会话 Claude + haiku</p></td><td><p>通过</p></td></tr>
+<tr><td><p>会话总览</p></td><td><p>通过</p></td></tr>
+<tr><td><p>绑定群「做完一轮」推送</p></td><td><p>通过，附最后回复</p></td></tr>
+<tr><td><p>群内转发对话与权限确认</p></td><td><p>通过，且该轮未重复推送</p></td></tr>
+<tr><td><p>「需要人介入」推送</p></td><td><p><span text-color="red">未实测，仅单元测试覆盖</span></p></td></tr>
+<tr><td><p>通过屏幕操作飞书界面测试</p></td><td><p><span text-color="red">未完成：电脑处于锁屏，无法操作屏幕。以上实测均用林森身份发送真实飞书消息完成</span></p></td></tr>
+</tbody></table>
+<h1 seq="auto">关键决策</h1>
+<ul>
+<li>新功能都做成独立模块，原有功能代码只加接入点，互不影响。</li>
+<li>群推送只推「需要人介入」「做完一轮」「失败」三类，并去重、限流，避免刷屏。</li>
+<li>CEO 大脑不给工具、只输出结构化计划，执行全部交给子会话，便于控制和停止。</li>
+<li>CEO 最多 4 个子任务、3 轮，防止失控消耗。</li>
+<li>保持本机版本号不变，避免自动更新覆盖本地改动。</li>
+<li>按林森要求，Cursor 移出本次目标，相关代码保留但不验收。</li>
+</ul>
+<h1 seq="auto">需要林森关注</h1>
+<ul>
+<li><span text-color="red">上游自动更新或重新安装会覆盖本地改动；备份在 ~/.carher-feishu-agent/bridge.bak-20261115，代码在 git 仓库。</span></li>
+<li><span text-color="red">手机端发起的 Codex 会话是只读模式。</span></li>
+<li><span text-color="red">Claude 当前为全授权模式（跟随手机端权限设置）；CEO 大脑也沿用 Claude 的授权设置。</span></li>
+<li><span text-color="red">留有测试用的群和会话：「CEO 编排测试」「群推送测试」及若干探测会话，可自行清理。</span></li>
+<li><span text-color="red">把已有群绑定到会话目前没有界面入口，本次是改配置文件完成的。</span></li>
+<li><span text-color="red">早先部分模型曾返回网关 403，如遇模型不可用可换别名。</span></li>
+<li><span text-color="red">屏幕操作的飞书界面测试待电脑解锁后补做；「需要人介入」推送待实测。</span></li>
+</ul>
+
