@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+# CarHer 飞书助手 自检 (macOS)
+# 用法：双击本文件。**只读** —— 只看不改，不会动你的配置。
+# 由 build.sh 生成，别直接改；源在 feishu-agent-oneclick/src/
+#
+# 最前面是「先看这三行」：我是哪一版 / 我在和哪个机器人说话 / 现在连着飞书吗。
+# 🔴 2026-11-06 的代价（这三行存在的理由，每条都是现场）：
+#   - 一天换了 3 次安装包附件，同事和领导**无法判断自己手上是哪一版** ⇒ 我这边修好了，
+#     他也不知道有没有到他机器上，于是又重装一次、又问一遍。
+#   - 21:34/21:35 有人发消息过来，日志里只有一行「丢弃非授权用户消息」，**发的人那边
+#     毫无反应**。他手上这个脚本当时答不出「我在和哪个机器人说话」里的任何一个字。
+#   - 20:35 长连接退出、21:14 才连上，中间 39 分钟没人知道它断了（飞书不补发）。
+#
+# 后面按「同事最可能卡在哪」排序：服务在不在 → 连上飞书没 → 凭据对不对 →
+# 白名单有没有人 → claude 能不能跑 → 会不会睡着 → 最近有没有报错。
+#
+# 🔴 第 9/10 两项是「信任漏洞」类检查，不是故障检查：
+#   [9] 电脑睡着 ⇒ 飞书长连接**只投递给在线客户端，没有任何补发**。合盖期间发的
+#       消息一个字都不会回，醒了也不补 —— 而这和「它正在思考」在用户眼里完全一样。
+#       **只读**：睡眠策略影响整机，只给命令让用户自己决定，绝不代改。
+#   [10] 上次收到消息多久了 ⇒ lark-oapi issue #169：重连路径有个没设超时的请求，
+#       卡住时进程还活着、不报错、日志直接断掉（有人实测静默失联 3 天 13 小时）。
+set -uo pipefail   # 故意不用 -e：自检要把所有项都跑完，不能一项失败就退
+
+BLUE=$'\033[1;34m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[1;31m'; NC=$'\033[0m'
+say()  { printf '%s%s%s\n' "$BLUE" "$1" "$NC"; }
+ok()   { printf '%s  ✓ %s%s\n' "$GREEN" "$1" "$NC"; }
+bad()  { printf '%s  ✗ %s%s\n' "$RED" "$1" "$NC"; FAILED=$((FAILED+1)); }
+warn() { printf '%s  ⚠ %s%s\n' "$YELLOW" "$1" "$NC"; }
+hint() { printf '      → %s\n' "$1"; }
+
+APP_HOME="$HOME/.carher-feishu-agent"
+CONFIG="$APP_HOME/config.toml"
+VENV="$APP_HOME/venv"
+LOG="$APP_HOME/logs/agent.log"
+LABEL="com.carher.feishu-agent"
+BUILDINFO="$APP_HOME/bridge/buildinfo.py"
+# 最新版在哪儿看。公网可读、不要登录（2026-11-06 实测 200），和自动更新用的是同一份。
+# 🔴 域名写死，不从配置读 —— 这一行决定「doctor 拿谁的话当权威」。
+UPDATE_URL="https://chat.auto-link.com.cn/ccdl/feishu-agent/latest.json"
+# IT 放的只读策略（可选）。存在就说明管理员固定了某些值，用户改 config.toml 也不生效。
+POLICY_FILE="/Library/Application Support/CarHer/policy.toml"
+# 日志多久没动就当「可能静默失联」。
+#
+# 取 30 分钟的理由：程序内置看门狗阈值是 15 分钟（app.py 的 `threshold = 15 * 60`，
+# 超了就 `os._exit(75)` 让 KeepAlive 拉起，重启会写新的「桥已启动」+「connected to」）。
+# 阈值必须**大于**看门狗那一档，否则「自愈刚成功」会被报成「失联」—— 报错一次用户
+# 下次就不信这一项了。留一倍余量给重启和 pip 慢启动。
+#
+# ⚠️ 未实测到的部分：2026-11-03 在本机连续观察 20 分钟空闲，看门狗**一次都没触发**
+# （日志里 `长连接已静默` 为 0）。那段时间的几次重启全部能对上「有人重跑安装器
+# 覆盖了 bridge/app.py」，不是看门狗。所以「空闲 15 分钟必然自杀重启」这条只是
+# 读代码得出的推断，**没有现场证据**；30 这个数是按代码里的常量取的，不是实测校准的。
+STALE_WARN_MIN=30
+FAILED=0
+# [0] 填这三个，结论那一屏再读一次 ⇒ 先置空，不然 set -u 下走到 early return 的
+# 分支时结论那几行会把脚本炸掉（最后一屏炸掉 = 用户什么结论都看不到）。
+MY_BUILD=""
+LATEST_BUILD=""
+APP_ID_HEAD=""
+
+echo
+say "=================================================="
+say "   CarHer 飞书助手 自检"
+say "=================================================="
+echo
+
+# ── 0. 先看这三行 ────────────────────────────────────────────────────
+# 这一节回答同事截图发过来时我最先要问的三个问题。之前这三个问题**一个都答不出**，
+# 只能让他再去翻日志、或者我凭猜测下结论。
+#
+# 🔴 这一节只读、只打分类和时间，**绝不打印日志原文**：本机真日志里
+# `connected to wss://…?access_key=…&ticket=…` 整条就躺在 INFO 行里，
+# 而这一屏正是用户最可能截图外发的一屏（同一条纪律见 bridge/status.py 的 ERROR_CLASSES）。
+# 🔴 也绝不打印 App Secret —— 这一节根本不读那个字段，只读 app_id 并且只显示前 12 位。
+# FIRST-SCREEN-BEGIN  ← 按这对标记可以把这段抽出来单独跑（和 [10] 那段同一种做法）
+say "[0] 先看这三行"
+
+# 一台还没装过的电脑：这三个问题全都没有答案，说三遍「没有」只会让人以为坏了三处。
+# 说一句真话然后让 [1] 收尾（它会告诉他去双击安装器并退出）。
+if [ ! -d "$APP_HOME" ]; then
+  bad "这台电脑还没装过，所以这三行都还没有答案"
+  hint "双击 feishu-agent-mac.command 装一次，再回来跑本自检"
+  echo
+else
+
+# (a) 我是哪一版、是不是最新。
+# 本机版本号由安装器写在 bridge/buildinfo.py（装机那一刻），最新版看 UPDATE_URL。
+# 🔴 查不到最新版时只许说「查不到」。说成「已是最新」= 把一个装着旧版的人劝回去，
+# 而 2026-11-06 一天换了 3 次安装包，这正是最常发生的那种误判。
+MY_BUILD=""
+if [ -f "$BUILDINFO" ]; then
+  MY_BUILD="$(sed -n 's/^BUILD_ID *= *"\([^"]*\)".*/\1/p' "$BUILDINFO" 2>/dev/null | head -1)"
+fi
+# 占位符没被替换过 ⇒ 当没有版本号，别把 @@…@@ 当成版本号给人看
+case "$MY_BUILD" in @@*) MY_BUILD="" ;; esac
+LATEST_BUILD="$(curl -fsS -m 10 "$UPDATE_URL" 2>/dev/null \
+  | sed -n 's/.*"build_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+if [ -z "$MY_BUILD" ]; then
+  bad "查不出你手上是哪一版"
+  hint "重新双击 feishu-agent-mac.command；装完这一行就会有版本号"
+elif [ -z "$LATEST_BUILD" ]; then
+  warn "你手上这一版是 ${MY_BUILD} —— 查不到最新版是哪一版，所以不敢说你是不是最新"
+  hint "连上公司网络再跑一次本自检；这一行查不到不影响平时使用"
+elif [ "$MY_BUILD" = "$LATEST_BUILD" ]; then
+  ok "你手上这一版是 ${MY_BUILD}，已是最新"
+else
+  warn "你手上这一版是 ${MY_BUILD}，最新的是 ${LATEST_BUILD} ⇒ 你这版旧了"
+  hint "它自己会在十几分钟内换成新版（换完会重启一次，那半分钟内发的消息要重发）"
+  hint "不想等就重新双击 feishu-agent-mac.command，装完立刻是最新"
+fi
+
+# (b) 我在和哪个机器人说话。
+# 🔴 2026-11-06 21:34/21:35 现场：有人发消息过来，日志里只有一行「丢弃非授权用户消息」，
+# 发的人那边毫无反应。最可能的两种原因是「两个人用同一个机器人」和「他找错了机器人」——
+# 两种都只要双方把这 12 位对一下就当场分清，而之前这个脚本一个字都没显示。
+APP_ID_HEAD=""
+if [ -f "$CONFIG" ]; then
+  APP_ID_HEAD="$(sed -n 's/^app_id *= *"\(.*\)"/\1/p' "$CONFIG" 2>/dev/null | head -1)"
+fi
+if [ -n "$APP_ID_HEAD" ]; then
+  ok "这台电脑连的机器人是 ${APP_ID_HEAD:0:12}…（后面几位不显示）"
+  hint "和同事对一下这 12 位：一样就是你们在用同一个机器人"
+  hint "同一个机器人只会把每条消息随机投给其中一台 ⇒ 两边都会「时好时坏」"
+  hint "那就各自去 open.feishu.cn 建一个自己的应用，别共用"
+else
+  bad "配置里没写是哪个机器人 ⇒ 谁发消息它都收不到"
+  hint "重新双击 feishu-agent-mac.command"
+fi
+
+# (c) 它现在连着飞书吗。
+# 🔴 判据只认 SDK 自己那两行（`connected to` / `connect failed`），**不看「桥已启动」**：
+# 那一行是主线程在 ws_client.start() 之后立刻打的，不等握手结果 ⇒ 凭据错、没发布、
+# 被代理挡住这几种最常见的失败全都会打出那一行（同一条判据见 tests/test_install_verdict.py）。
+# 只看**这一轮**（最后一次「桥已启动」往后）：agent.log 跨重启累积，整文件 grep 会命中上周那一行。
+# 断开也要认出来：2026-11-06 20:35 `receive message loop exit` → 21:14 才连上，
+# 中间 39 分钟谁都不知道它断了，而飞书**不补发**那段时间的消息。
+if [ -f "$LOG" ]; then
+  ROUND_FROM="$(grep -n "桥已启动" "$LOG" 2>/dev/null | tail -1 | cut -d: -f1)"
+  [ -n "$ROUND_FROM" ] || ROUND_FROM=1
+  CONN_LINE="$(tail -n "+${ROUND_FROM}" "$LOG" 2>/dev/null \
+    | grep -E 'connected to|connect failed|receive message loop exit|keepalive ping timeout' \
+    | tail -1)"
+  # 只取时间戳和类别，日志原文一个字都不往屏幕上打（见本节开头红字）
+  CONN_TS="$(printf '%s' "$CONN_LINE" \
+    | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | tail -1)"
+  # 🔴 第 25 轮（P-newbie 复现）：SDK 断线那行是 `disconnected to wss://…` —— 里面正好含 `connected to`
+  # ⇒ 断着的时候第一屏说「✓ 它现在连着飞书」。断开那条必须排在前面先认。
+  case "$CONN_LINE" in
+    *"disconnected to"*)
+      bad "它和飞书的连接断了（${CONN_TS:-时间不详} 断的），还没重新连上 ⇒ 你现在发的消息它收不到"
+      hint "多半是电脑睡着或网络切换，等一两分钟它会自己重连；一直不好就重启电脑" ;;
+    *"connected to"*)
+      ok "它现在连着飞书（这一轮 ${CONN_TS:-时间不详} 连上的）"
+      hint "连着也不等于你发的消息它会理 —— 还要下面 [6] 那项绿（绑的是不是你）" ;;
+    *"connect failed"*)
+      bad "它没连上飞书 ⇒ 你现在发的消息它一条都收不到"
+      hint "这一轮最后一次尝试是 ${CONN_TS:-时间不详}，失败了"
+      hint "失败之后它不会马上重试：本机实测 3 次，分别等了 11、19、22 分钟才自己重连"
+      hint "别干等，现在手动拉一把：launchctl kickstart -k gui/\$(id -u)/${LABEL}"
+      hint "拉完等 20 秒再跑一次本自检；还红就看下面 [4] [5] 两项（网络 / 凭据）" ;;
+    *"receive message loop exit"*|*"keepalive ping timeout"*)
+      bad "它连上过，但现在断开了 ⇒ 这期间你发的消息收不到"
+      hint "断在 ${CONN_TS:-时间不详}"
+      hint "飞书不补发断开期间的消息，重新连上也不补 —— 那几条要你自己再发一遍"
+      hint "现在手动拉一把：launchctl kickstart -k gui/\$(id -u)/${LABEL}" ;;
+    *)
+      warn "看不出它连上飞书了没有（这一轮日志里还没有连接结果）"
+      hint "刚装完 / 刚重启的话，等 30 秒再跑一次本自检"
+      hint "一直是这样就看下面 [2] [4] [5] 三项" ;;
+  esac
+else
+  warn "看不出它连上飞书了没有（还没有日志，服务可能一次都没启动过）"
+  hint "看下面 [2] 那项；它说服务没在跑就重新双击 feishu-agent-mac.command"
+fi
+fi
+# FIRST-SCREEN-END
+echo
+
+# ── 1. 装没装 ────────────────────────────────────────────────────────
+say "[1] 安装状态"
+if [ -d "$APP_HOME" ]; then ok "程序目录在 $APP_HOME"; else
+  bad "没装"; hint "双击 feishu-agent-mac.command 安装"; echo; exit 1
+fi
+[ -f "$CONFIG" ] && ok "配置文件在" || { bad "配置文件缺失"; hint "重新双击 feishu-agent-mac.command，它会补回来"; }
+if [ -x "$VENV/bin/python" ]; then
+  ok "运行环境在"
+else
+  bad "运行环境坏了"
+  hint "重新双击 feishu-agent-mac.command（装过一次之后它不会再问你任何问题）"
+fi
+echo
+
+# ── 2. 服务在不在跑 ──────────────────────────────────────────────────
+say "[2] 后台服务"
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  PID="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | sed -n 's/.*pid = \([0-9]*\).*/\1/p' | head -1)"
+  if [ -n "$PID" ] && [ "$PID" != 0 ]; then
+    ok "在跑（PID ${PID}）"
+  else
+    bad "已注册但进程不在 ⇒ 现在发消息它收不到"
+    hint "先自己拉一把：launchctl kickstart -k gui/\$(id -u)/${LABEL}"
+    hint "等 20 秒再跑一次本自检；还是这样就重新双击 feishu-agent-mac.command"
+  fi
+  # 反复重启通常是配置错或凭据错，比"没在跑"更难自己发现
+  RESTARTS="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | sed -n 's/.*runs = \([0-9]*\).*/\1/p' | head -1)"
+  if [ -n "$RESTARTS" ] && [ "$RESTARTS" -gt 20 ] 2>/dev/null; then
+    warn "已重启 $RESTARTS 次 —— 大概是起来就崩、崩了又被拉起"
+    hint "先看下面 [5] 那项：凭据不对是最常见的一种"
+    hint "[5] 是绿的就重新双击 feishu-agent-mac.command；还这样就把这个窗口截图发给管理员"
+  fi
+else
+  bad "服务没注册 ⇒ 关机或重启之后它不会自己起来"
+  hint "重新双击 feishu-agent-mac.command（它会把开机自启重新装上）"
+fi
+echo
+
+# ── 3. 跑两个会抢消息 ────────────────────────────────────────────────
+say "[3] 实例唯一性"
+# 🔴 别用 pgrep -fc：macOS 的 BSD pgrep 没有 -c，整条命令会 usage 报错 + rc=2，
+# 被 `|| echo 0` 吞成 0 ⇒ 这一项永远报「只有一个」，而它正是为了抓多实例而写的。
+# 🔴 匹配模式要精确到「python ... -m bridge.app」结尾。
+# 宽松的 `pgrep -f bridge.app` 会把任何**命令行里含这串字**的进程算进来 ——
+# 包括 doctor 自己、以及任何在排查时敲过这个名字的 shell。
+# 2026-11-03 实测误报成「有 2 个进程在跑」，而同事看到这个会以为出故障了。
+RUNNING="$(pgrep -f 'python.* -m bridge\.app$' 2>/dev/null | wc -l | tr -d ' ')"
+[ -n "$RUNNING" ] || RUNNING=0
+if [ "$RUNNING" -le 1 ] 2>/dev/null; then
+  ok "只有一个在跑"
+else
+  bad "有 ${RUNNING} 个进程在跑"
+  hint "飞书长连接是随机投递，多个进程会抢消息、让机器人时好时坏"
+  hint "多余的那个用 kill <上面的 pid> 停掉（别用 pkill 按名字杀），然后 launchctl kickstart -k gui/\$(id -u)/$LABEL"
+fi
+echo
+
+# ── 4. 能不能连飞书 ──────────────────────────────────────────────────
+say "[4] 飞书连通性"
+HTTP="$(curl -s -o /dev/null -m 12 -w '%{http_code}' https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal -X POST -H 'Content-Type: application/json' -d '{}' 2>/dev/null)"
+if [ "$HTTP" = 200 ]; then
+  ok "能连上 open.feishu.cn"
+else
+  bad "连不上飞书（HTTP ${HTTP}）"
+  hint "飞书长连接必须直连，走代理不行。检查 VPN / 代理设置"
+fi
+echo
+
+# ── 5. 凭据对不对 ────────────────────────────────────────────────────
+say "[5] 机器人凭据"
+if [ -f "$CONFIG" ]; then
+  APP_ID="$(sed -n 's/^app_id *= *"\(.*\)"/\1/p' "$CONFIG" | head -1)"
+  APP_SECRET="$(sed -n 's/^app_secret *= *"\(.*\)"/\1/p' "$CONFIG" | head -1)"
+  if [ -n "$APP_ID" ] && [ -n "$APP_SECRET" ]; then
+    RESP="$(curl -s -m 15 https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal \
+        -H 'Content-Type: application/json' \
+        -d "{\"app_id\":\"$APP_ID\",\"app_secret\":\"$APP_SECRET\"}" 2>/dev/null)"
+    CODE="$(printf '%s' "$RESP" | sed -n 's/.*"code":\([0-9]*\).*/\1/p' | head -1)"
+    case "$CODE" in
+      0) ok "凭据有效（App ID ${APP_ID:0:12}…）" ;;
+      10003|10013|10014)
+        bad "App ID 或 Secret 不对（code ${CODE}）"
+        hint "去 open.feishu.cn 的「凭证与基础信息」重新复制，注意别贴反" ;;
+      10012)
+        bad "应用还没发布或审批没过（code ${CODE}）"
+        hint "去 open.feishu.cn 右上角「创建版本」→「申请发布」，等管理员审批" ;;
+      *)  bad "凭据校验失败（code ${CODE:-没拿到回应}）"
+        hint "上面 [4] 那项红的话先解决网络，这一项会跟着好"
+        hint "[4] 是绿的就把这个窗口截图发给给你装的同事" ;;
+    esac
+  else
+    bad "配置里没写机器人凭据 ⇒ 谁发消息它都收不到"
+    hint "重新双击 feishu-agent-mac.command，它会带你把凭据填回去"
+  fi
+fi
+echo
+
+# ── 5b. 悬浮菜单 ─────────────────────────────────────────────────────
+# 🔴 2026-11-06 第 12 轮：同事装完、也发了版，就是没有输入框上方那排悬浮按钮，
+# 而 doctor 一项都没报。菜单只在装机那一刻写一次，写的时候缺权限就静默没了。
+#
+# **只读**：只换 token（POST /auth/v3/tenant_access_token/internal，不改任何东西）+ 两个 GET：
+#   1) GET /application/v6/applications/:app_id/app_versions —— 版本里带 ability.bot.bot_menus，
+#      看**线上版本**（status=1）里有没有菜单。要 application:application.app_version:readonly
+#      或 application:application:self_manage（2026-11-06 本机应用两个都没有 ⇒ 99991672）。
+#      v7 没有读 ability 的 GET（实测 GET .../v7/applications/:id/ability 回 404）。
+#   2) 读不了 ⇒ GET /application/v6/scopes（文档「权限要求：无」）看写菜单要的
+#      application:application:patch 批没批：没批 = 「等管理员批」；批了 = 只是看不出来。
+# Python 段两个 doctor 共用同一份文本、只用 ASCII（Windows 的 PS 5.1 往管道写非 ASCII 会变 ?），
+# tests/test_r12_install_verify.py 核对两边逐字一致、并且除了换 token 只发 GET。
+# MENU-CHECK-BEGIN  ← tests/test_r12_install_verify.py 按这对标记抽这段真跑
+say "[5b] 悬浮菜单（输入框上方那排按钮）"
+if [ -f "$CONFIG" ] && [ -x "$VENV/bin/python" ]; then
+  MENU_CHECK="$("$VENV/bin/python" - "$CONFIG" 2>/dev/null <<'PY'
+# menu-check: read-only. token + GET only.
+import json, sys, tomllib, urllib.error, urllib.request
+
+BASE = "https://open.feishu.cn/open-apis"
+PATCH_SCOPE = "application:application:patch"
+
+
+def call(method, path, token=None, body=None):
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.load(exc)
+        except Exception:
+            return {"code": exc.code}
+    except OSError:
+        return {"code": -1}
+
+
+def say(state, detail=""):
+    print("MENU_CHECK=" + state + "|" + str(detail))
+    sys.exit(0)
+
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        feishu = tomllib.load(handle).get("feishu", {})
+except Exception:
+    say("error", "config")
+app_id, secret = feishu.get("app_id", ""), feishu.get("app_secret", "")
+if not app_id or not secret:
+    say("error", "config")
+got = call("POST", "/auth/v3/tenant_access_token/internal", None,
+           {"app_id": app_id, "app_secret": secret})
+token = got.get("tenant_access_token")
+if got.get("code") or not token:
+    say("error", "token code=%s" % got.get("code"))
+
+out = call("GET", "/application/v6/applications/%s/app_versions?lang=zh_cn&page_size=20&order=0"
+           % app_id, token)
+if not out.get("code"):
+    items = [i for i in (out.get("data") or {}).get("items") or [] if isinstance(i, dict)]
+    live = [i for i in items if i.get("status") == 1]
+    if live:
+        def when(item):
+            try:
+                return int(item.get("publish_time") or 0)
+            except (TypeError, ValueError):
+                return 0
+        cur = max(live, key=when)
+        bot = (cur.get("ability") or {}).get("bot") or {}
+        menus = bot.get("bot_menus") or []
+        if bot.get("bot_menu_enable") and menus:
+            say("ok", "%s|%d" % (cur.get("version", ""), len(menus)))
+        say("missing", cur.get("version", ""))
+    say("unreadable", "no live version in list")
+
+scopes = call("GET", "/application/v6/scopes", token)
+if scopes.get("code"):
+    say("unreadable", "versions code=%s scopes code=%s" % (out.get("code"), scopes.get("code")))
+granted = False
+for item in (scopes.get("data") or {}).get("scopes") or []:
+    if isinstance(item, dict) and item.get("scope_name") == PATCH_SCOPE \
+            and item.get("scope_type") in (None, "", "tenant"):
+        granted = granted or item.get("grant_status") == 1
+if not granted:
+    say("noperm", PATCH_SCOPE)
+say("unreadable", "versions code=%s" % out.get("code"))
+PY
+)"
+  MENU_DETAIL="${MENU_CHECK#*|}"
+  case "$MENU_CHECK" in
+    MENU_CHECK=ok\|*)
+      ok "悬浮菜单在（线上版本 ${MENU_DETAIL%%|*}，${MENU_DETAIL##*|} 个按钮）"
+      hint "飞书里还是看不到：飞书客户端要 7.22 以上，而且只在和机器人的单聊里显示" ;;
+    MENU_CHECK=missing\|*)
+      bad "线上版本里没有悬浮菜单（版本 ${MENU_DETAIL}）⇒ 单聊输入框上面不会有那排按钮"
+      hint "权限批下来后它会自己补上；过一会儿还没有，就重新双击 feishu-agent-mac.command"
+      hint "在那之前，聊天里发「菜单」两个字照样有按钮" ;;
+    MENU_CHECK=noperm\|*)
+      warn "悬浮菜单还写不进去：缺「${MENU_DETAIL}」权限，等管理员批"
+      hint "批完它会自己补上，不用重装；在那之前，聊天里发「菜单」两个字照样有按钮" ;;
+    MENU_CHECK=unreadable\|*)
+      warn "看不出悬浮菜单在不在（这个应用没有读版本信息的权限，不影响使用）"
+      hint "自己看一眼：飞书里和机器人的单聊，输入框上面有没有「🖥 会话  🔑 权限  🧠 模型」那排按钮"
+      hint "没有的话，重新双击 feishu-agent-mac.command；在那之前发「菜单」两个字照样有按钮" ;;
+    *)
+      warn "查不了悬浮菜单（${MENU_DETAIL:-没拿到结果}）"
+      hint "先看上面 [4] [5] 两项：网络和凭据通了，这一项才查得了" ;;
+  esac
+else
+  warn "这一项先跳过了（上面 [1] 里有一项是红的，要先把那个弄好）"
+  hint "照 [1] 那里的 → 做完，再跑一次本自检"
+fi
+# MENU-CHECK-END
+echo
+
+# ── 6. 白名单 ────────────────────────────────────────────────────────
+say "[6] 授权用户"
+# 🔴 2026-11-06：按**配对码**判。原来这一项还是「首条消息自动绑定」时代的判据
+# （那条路早就因为「谁抢先发谁当主人」删掉了），没绑定时一律报红、叫人「翻日志抄 open_id 填进
+# config.toml」—— 而安装器自己就叫新同事「等两分钟双击 doctor」⇒ **每个新同事都会撞上这个红**，
+# 还被引去手改配置。现在：有主人 = 绿；码还在有效期 = 黄 + 「去飞书发码」；码过期 = 「重新装一次拿新码」。
+if [ -f "$CONFIG" ]; then
+  OWNERS="$(sed -n 's/^owner_open_ids *= *\(.*\)/\1/p' "$CONFIG" | head -1)"
+  PAIR_CODE="$(sed -n 's/^pairing_code *= *"\(.*\)"/\1/p' "$CONFIG" | head -1)"
+  PAIR_AT="$(sed -n 's/^pairing_issued_at *= *\([0-9]*\).*/\1/p' "$CONFIG" | head -1)"
+  PAIR_TTL="$(sed -n 's/^pairing_ttl_min *= *\([0-9]*\).*/\1/p' "$CONFIG" | head -1)"
+  if printf '%s' "$OWNERS" | grep -q 'ou_'; then
+    ok "已绑定主人"
+  elif [ -n "$PAIR_CODE" ] && [ -n "$PAIR_AT" ]; then
+    LEFT=$(( ${PAIR_AT} + ${PAIR_TTL:-30} * 60 - $(date +%s) ))
+    if [ "$LEFT" -gt 0 ]; then
+      warn "还没绑定 —— 在飞书里给机器人发安装最后一屏那 6 位码（还有约 $(( LEFT / 60 + 1 )) 分钟有效）"
+      hint "码就在安装窗口最后一屏；窗口关了的话，重新双击安装包会给一个新码"
+    else
+      bad "还没绑定，配对码已经过期"
+      hint "重新双击你的安装包，最后一屏会给一个新码，拿到后在飞书发给机器人"
+    fi
+  else
+    bad "还没绑定主人，也没有配对码 ⇒ 你发的消息它都不会理"
+    hint "重新双击你的安装包；还不行就把这份诊断截图发给给你装的同事"
+  fi
+fi
+echo
+
+# ── 7. claude 能不能用 ───────────────────────────────────────────────
+say "[7] Claude Code"
+if command -v claude >/dev/null 2>&1; then
+  ok "claude 在 $(command -v claude)"
+  # 真打一发，别只看命令存在 —— 装了但没配网关是很常见的
+  if printf '' | claude -p "say OK" --model claude-haiku-5-5 --output-format json >/tmp/.cfa_probe 2>&1; then
+    if grep -q '"stop_reason"' /tmp/.cfa_probe 2>/dev/null; then
+      ok "claude 能真跑通"
+    else
+      warn "claude 跑了但输出不对劲"
+      hint "在终端手敲一次看看：claude -p 'hi'"
+      hint "它那边也不对就去 https://chat.auto-link.com.cn/oneclick/ 重新配一次"
+    fi
+  else
+    bad "claude 跑不通"
+    hint "先确认 Claude Code 自己能用：claude -p 'hi'"
+    hint "没配好的话去 https://chat.auto-link.com.cn/oneclick/"
+  fi
+  rm -f /tmp/.cfa_probe
+else
+  bad "没找到 claude 命令"
+  hint "装一下：https://chat.auto-link.com.cn/oneclick/"
+fi
+echo
+
+# ── 7b. 桥的 claude 配置有没有凭据 ───────────────────────────────────
+say "[7b] 桥的 claude 配置"
+BRIDGE_CC="$HOME/.claude-feishu-bridge/settings.json"
+if [ -f "$BRIDGE_CC" ]; then
+  if grep -q "ANTHROPIC_BASE_URL\|ANTHROPIC_API_KEY\|ANTHROPIC_AUTH_TOKEN" "$BRIDGE_CC" 2>/dev/null; then
+    ok "桥已继承网关配置"
+  else
+    bad "它那份配置里没有凭据 ⇒ 你在飞书问它，它会回一句「没登录」"
+    hint "重新双击 feishu-agent-mac.command（它会把你电脑上能用的那份配置抄过来）"
+  fi
+  # 真打一发：配置在不代表能用
+  if CLAUDE_CONFIG_DIR="$HOME/.claude-feishu-bridge" claude -p "say OK" \
+       --model claude-haiku-5-5 --output-format json </dev/null 2>/dev/null \
+       | grep -q '"stop_reason"'; then
+    ok "桥这边 claude 能真跑通"
+  else
+    bad "它这边跑不通 ⇒ 你在飞书问它，它会答不出话"
+    hint "重新双击 feishu-agent-mac.command（它会把能用的那份配置抄过来）"
+    hint "想自己看一眼：CLAUDE_CONFIG_DIR=~/.claude-feishu-bridge claude -p hi"
+  fi
+else
+  warn "它还没生成自己那份配置（服务可能一次都没启动过）"
+  hint "看上面 [2] 那项；它说服务没在跑就按那里的 → 做"
+fi
+echo
+
+# ── 8. 最近的错 ──────────────────────────────────────────────────────
+say "[8] 最近日志"
+if [ -f "$LOG" ]; then
+  LINES="$(wc -l < "$LOG" | tr -d ' ')"
+  ok "日志有 $LINES 行：$LOG"
+  # 只用来报「最后一次启动是几点」，**不是**连通性判据（那个只认 SDK 的 connected to，见 [0]）。
+  # 写成取值而不是 `grep -q` 判断：test_install_verdict 把所有 `grep -q` 的模式都当判据收，
+  # 一个「桥已启动」的 grep -q 会被当成「拿启动日志判连上了」—— 那正是 11-05 的假绿形状。
+  LAST="$(grep "桥已启动" "$LOG" 2>/dev/null | tail -1 | cut -c1-19)"
+  if [ -n "$LAST" ]; then
+    ok "最后一次启动：$LAST"
+    hint "这一行只说明它起来了，**不说明它连上了飞书** —— 连没连上看最上面 [0]"
+  fi
+  if grep -q "长连接已静默" "$LOG" 2>/dev/null; then
+    warn "它自己发现过「很久没动静」并重启了一次（这是设计好的自救）"
+    hint "每次重启之间发的消息是丢的，那几条要自己重发一遍"
+  fi
+  ERRS="$(grep -c "ERROR" "$LOG" 2>/dev/null || echo 0)"
+  if [ "$ERRS" -gt 0 ] 2>/dev/null; then
+    # 🔴 只报**类别和条数**，不打日志原文。本机真日志里
+    # `connected to wss://…&ticket=…`、`open_id=ou_…`、`/Users/<真名>/…` 都在 ERROR 行附近，
+    # 而这一屏是用户最可能截图外发的一屏（同 bridge/status.py 的 ERROR_CLASSES）。
+    # 原来这里 `tail -3 | sed` 把原文整行打出来 —— 那是一条外发凭据的路。
+    warn "日志里有 ${ERRS} 条报错。最近这些属于："
+    printf '%s\n' "连不上飞书|connect failed" "长连接断开|receive message loop exit" \
+      "看门狗重启|长连接已静默" "卡片发不出|卡片发送失败" "消息发不出|飞书回消息失败" \
+      "凭据或权限被拒|99991672" "它没回话|零输出" \
+    | while IFS='|' read -r NAME PAT; do
+        N="$(grep -c -- "$PAT" "$LOG" 2>/dev/null || echo 0)"
+        [ "${N:-0}" -gt 0 ] 2>/dev/null && printf '        · %s %s 次\n' "$NAME" "$N"
+      done
+    hint "「连不上飞书 / 长连接断开」⇒ 看最上面 [0] 的第三行，照那里的 → 做"
+    hint "「凭据或权限被拒」⇒ 看上面 [5]；别的类别就把这个窗口截图发给管理员"
+    hint "要给管理员看原文的话，自己打开这个文件看一眼再发：open -e $LOG"
+    hint "里面有你的用户名和文件路径，发出去之前自己确认一下"
+  else
+    ok "没有报错"
+  fi
+else
+  warn "还没有日志（服务可能一次都没启动过）"
+  hint "看上面 [2] 那项，按那里的 → 做"
+fi
+echo
+
+# ── 9. 会不会睡着（最大的信任漏洞）────────────────────────────────────
+# 飞书长连接只投递给**在线**的客户端，且**没有任何补发机制**。合盖/睡着期间
+# 用户在飞书发的消息直接消失，醒了也不会补 —— 用户只看到「发出去了，没人回」。
+#
+# 🔴 这一项**只读**。睡眠策略影响整机（关掉它笔记本背包里会发烫掉电），
+# 必须用户自己决定 ⇒ 只打印命令让他复制，绝不代改。
+say "[9] 电脑会不会睡着"
+# pmset -g custom 分 "Battery Power" / "AC Power" 两段。只按插电那段判 ——
+# 电池供电时睡着是合理的，插电时睡着才是我们要提醒的那种「静默丢消息」。
+PM_CUSTOM="$(pmset -g custom 2>/dev/null)"
+AC_SLEEP="$(printf '%s\n' "$PM_CUSTOM" | awk '/^AC Power/{f=1;next} /^(Battery Power|UPS Power)/{f=0} f && $1=="sleep"{print $2; exit}')"
+if [ -z "$AC_SLEEP" ]; then
+  # 台式机（没电池）只有一段，退回 pmset -g 的「当前在用」
+  AC_SLEEP="$(pmset -g 2>/dev/null | awk '$1=="sleep"{print $2; exit}')"
+fi
+if [ -z "$AC_SLEEP" ]; then
+  warn "读不出这台电脑的睡眠设置"
+  hint "不管设的是什么，这条先记住：电脑睡着期间你在飞书发的消息，飞书**不补发**"
+  hint "醒来之后也不会补，那几条要你自己重发一遍"
+  hint "想自己看一眼当前设置：pmset -g custom"
+elif [ "$AC_SLEEP" = 0 ]; then
+  ok "插电时不会自动睡"
+  hint "不过这台电脑真要睡着（你合盖、或手动睡眠），那期间的消息飞书**不补发**"
+  hint "醒来之后也不会补 —— 那几条要你自己重发一遍"
+else
+  # 不记 FAILED：这不是「装坏了」，是用户要自己拍的一个取舍。
+  warn "插电时 ${AC_SLEEP} 分钟没人用就会睡着"
+  hint "睡着期间你在飞书发的消息会丢 —— 飞书只投给在线的那台，**不补发**"
+  hint "醒了也不会补发，你只会看到「发出去了但没人回」，和「它正在思考」长得一样"
+  hint "想让它一直在线，自己跑这条（要输开机密码，影响整机，所以不替你改）："
+  hint "    sudo pmset -c sleep 0"
+  hint "笔记本合盖还要加这条（合盖也不睡；代价是背包里会发烫掉电）："
+  hint "    sudo pmset -c disablesleep 1"
+  hint "不想改也行 —— 那就记住：睡着期间的消息要醒来之后自己重发一遍"
+fi
+# 合盖这件事单独说：sleep=0 只管「空闲不睡」，合上盖子照样睡。
+if [ "$AC_SLEEP" = 0 ] && pmset -g batt 2>/dev/null | grep -q 'InternalBattery'; then
+  DISABLE_SLEEP="$(printf '%s\n' "$PM_CUSTOM" | awk '$1=="disablesleep"{print $2; exit}')"
+  if [ "${DISABLE_SLEEP:-0}" = 1 ]; then
+    ok "合盖也不睡"
+  else
+    warn "空闲不睡了，但**合上盖子还是会睡** ⇒ 合盖期间的消息照样丢、也不补发"
+    hint "要连合盖都不睡，自己跑这条（影响整机，所以不替你改）："
+    hint "    sudo pmset -c disablesleep 1"
+    hint "不想改就记住：合盖那段时间发的消息，醒来之后要自己重发一遍"
+  fi
+fi
+echo
+
+# ── 10. 上次收到消息是多久以前 ───────────────────────────────────────
+# lark-oapi issue #169（至今未修）：重连路径里一个 requests.post 没设超时且全程持锁，
+# 半开连接下永久阻塞 ⇒ **进程还活着、不报错、日志直接断掉**。报告者实测静默失联
+# 3 天 13 小时。所以「进程在跑」这一项是绿的也不代表它还能收消息，必须看日志时间。
+# STALENESS-CHECK-BEGIN  ← tests/test_oneclick_lifecycle.py 按这对标记抽这段真跑
+say "[10] 上次有动静是多久以前"
+if [ -f "$LOG" ]; then
+  # 两种时间戳都抓：我们自己的 `2026-11-03 17:46:39,118` 和 SDK 的 `[Lark] [...]`
+  LAST_TS="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$LOG" 2>/dev/null | tail -1)"
+  if [ -n "$LAST_TS" ]; then
+    LAST_EPOCH="$(date -j -f '%Y-%m-%d %H:%M:%S' "$LAST_TS" +%s 2>/dev/null)"
+  else
+    LAST_EPOCH=""
+  fi
+  if [ -z "$LAST_EPOCH" ]; then
+    warn "日志里没有能认出来的时间戳，改用文件修改时间"
+    LAST_EPOCH="$(stat -f %m "$LOG" 2>/dev/null)"
+    LAST_TS="$(stat -f '%Sm' "$LOG" 2>/dev/null)"
+  fi
+  if [ -n "$LAST_EPOCH" ]; then
+    AGE_MIN=$(( ( $(date +%s) - LAST_EPOCH ) / 60 ))
+    [ "$AGE_MIN" -ge 0 ] 2>/dev/null || AGE_MIN=0
+    if [ "$AGE_MIN" -lt "$STALE_WARN_MIN" ]; then
+      ok "${AGE_MIN} 分钟前还有动静（${LAST_TS}）"
+    else
+      warn "已经 ${AGE_MIN} 分钟没有任何新日志（最后一行是 ${LAST_TS}）"
+      hint "两种可能，先分清是哪一种："
+      hint "  1) 电脑刚睡醒 / 一直没人发消息 ⇒ 正常，去飞书发一句话，再跑一次自检"
+      hint "  2) 长连接静默失联 ⇒ 进程还活着、不报错，但消息再也进不来（已知上游 bug）"
+      hint "判据：发一句话之后日志还是不动，就是第 2 种"
+      hint "手动拉起来：launchctl kickstart -k gui/\$(id -u)/${LABEL}"
+    fi
+  fi
+  # 看门狗自愈过几次也值得说一句：偶尔一次是设计行为，频繁就是网络环境有问题。
+  SILENT_N="$(grep -c "长连接已静默" "$LOG" 2>/dev/null || echo 0)"
+  if [ "${SILENT_N:-0}" -gt 3 ] 2>/dev/null; then
+    warn "它自己因为「很久没动静」重启过 ${SILENT_N} 次 —— 这条网络上连接不太稳"
+    hint "每次重启之间的消息都是丢的。换个网络（比如换成手机热点）再观察一天"
+    hint "换了网络还这样，就把这个窗口截图发给管理员"
+  fi
+else
+  warn "还没有日志，没法判断上次有动静是什么时候"
+  hint "看上面 [2] 那项，按那里的 → 做；服务跑起来之后这里就有数了"
+fi
+# STALENESS-CHECK-END
+echo
+
+# ── 11. IT 策略 ──────────────────────────────────────────────────────
+# 存在这个文件说明管理员固定了某些值 —— 用户改自己的 config.toml 也不生效。
+# 不显示的话用户会对着 config.toml 里的 mode 纳闷「我都改了怎么还是只读」。
+say "[11] IT 策略"
+if [ -f "$POLICY_FILE" ]; then
+  P_MODE="$(sed -n 's/^mode *= *"\(.*\)"/\1/p' "$POLICY_FILE" 2>/dev/null | head -1)"
+  if [ -n "$P_MODE" ]; then
+    ok "由 IT 固定：mode=${P_MODE}"
+    hint "这台机器的权限由管理员统一管，你自己在飞书里点「权限」也提不上去"
+    hint "要放开就找管理员，别自己改文件（改了不生效）"
+  else
+    ok "有 IT 策略文件，但没固定权限档"
+  fi
+  hint "策略文件：${POLICY_FILE}"
+else
+  ok "没有 IT 策略，权限按你自己的设置走"
+  hint "想换档就在飞书里和机器人说「菜单」，点「权限」"
+fi
+echo
+
+# ── 结论 ─────────────────────────────────────────────────────────────
+say "=================================================="
+if [ "$FAILED" -eq 0 ]; then
+  printf '%s   都正常。去飞书找你的机器人发句话试试。%s\n' "$GREEN" "$NC"
+else
+  printf '%s   有 %d 项不对，照上面的 → 处理。%s\n' "$RED" "$FAILED" "$NC"
+fi
+echo
+# 把 [0] 的三行再说一遍：截图往往只截到最后一屏，而远程支持第一句就要问这三个。
+echo "   转给别人的时候，这三行最有用（和最上面 [0] 一样）："
+echo "       版本：${MY_BUILD:-查不出} ${LATEST_BUILD:+（最新是 ${LATEST_BUILD}）}"
+# 🔴 别写成 `${APP_ID_HEAD:0:12}${APP_ID_HEAD:-没写}`：`:-` 只在变量为空时才顶替，
+# 有值的时候它会把**整串** app_id 接在截断那一段后面（刚实测打出了完整 17 位）。
+if [ -n "$APP_ID_HEAD" ]; then
+  echo "       机器人：${APP_ID_HEAD:0:12}…（后面几位不显示）"
+else
+  echo "       机器人：没写"
+fi
+echo "       这一屏跑的时间：$(date '+%Y-%m-%d %H:%M:%S')"
+if [ "$FAILED" -ne 0 ]; then
+  echo
+  echo "   还是不行就把这个窗口整屏截图发给管理员。"
+  echo "   他要日志的话再自己打开看一眼：open -e $LOG"
+  echo "   （里面有你的用户名和文件路径，发出去之前自己确认一下）"
+fi
+say "=================================================="
+echo
+echo "   要卸载（离职 / 换机 / 不想用了）："
+echo "       双击 feishu-agent-uninstall-mac.command"
+echo "   它会先列出要删什么再问你，并安全擦除配置里的 App Secret。"
+echo "   飞书那边的自建应用要你自己去 open.feishu.cn 停用 —— 脚本删不掉云端的东西。"
+echo
+printf '按回车关闭… '
+read -r _ </dev/tty 2>/dev/null || true
