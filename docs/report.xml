@@ -13,7 +13,7 @@
 <h1 seq="auto">功能状态</h1>
 <table><thead><tr><th background-color="light-gray"><p>功能</p></th><th background-color="light-gray"><p>用法</p></th><th background-color="light-gray"><p>状态</p></th></tr></thead><tbody>
 <tr><td><p>新建会话</p></td><td><p>/newsession claude|codex 项目 [模型]，或卡片流程。模型别名：sonnet / opus / haiku，sol / luna</p></td><td><p>已完成，实测通过</p></td></tr>
-<tr><td><p>群进展推送</p></td><td><p>需要人介入：等待 20 秒后必推；做完一轮：稳定 45 秒后推送，同一会话 10 分钟最多一次，附最后回复；失败：立即推。群里发起的对话不重复推。每分钟最多 6 条。配置开关 [notify] group</p></td><td><p>已完成；「做完一轮」实测通过，<span text-color="red">「需要人介入」仅单元测试覆盖</span></p></td></tr>
+<tr><td><p>群进展推送</p></td><td><p>需要人介入：等待 20 秒后必推；做完一轮：稳定 45 秒后推送，同一会话 10 分钟最多一次，附最后回复；失败：立即推。群里发起的对话不重复推。每分钟最多 6 条。配置开关 [notify] group</p></td><td><p>已完成；「做完一轮」「需要人介入」均实测通过</p></td></tr>
 <tr><td><p>CEO 编排</p></td><td><p>/ceo 群、/ceo 任务、/ceo 状态、/ceo 停、/ceo 继续、/ceo 退出；CEO 群内直接发文字即下任务，等待拍板时直接回复即答复</p></td><td><p>已完成，实测通过</p></td></tr>
 <tr><td><p>会话总览等原有功能</p></td><td><p>发「会话」</p></td><td><p>正常</p></td></tr>
 </tbody></table>
@@ -46,7 +46,7 @@
 <tr><td><p>会话总览</p></td><td><p>通过</p></td></tr>
 <tr><td><p>绑定群「做完一轮」推送</p></td><td><p>通过，附最后回复</p></td></tr>
 <tr><td><p>群内转发对话与权限确认</p></td><td><p>通过，且该轮未重复推送</p></td></tr>
-<tr><td><p>「需要人介入」推送</p></td><td><p><span text-color="red">未实测，仅单元测试覆盖</span></p></td></tr>
+<tr><td><p>「需要人介入」推送</p></td><td><p>通过（07:28）：本机 Claude 会话卡在写文件确认，约 20 秒后绑定群收到「🟡 在等你处理，它卡在：Write …」；测试后已取消该操作，未写入文件</p></td></tr>
 <tr><td><p>通过屏幕操作飞书界面测试</p></td><td><p><span text-color="red">未完成：电脑处于锁屏，无法操作屏幕。以上实测均用林森身份发送真实飞书消息完成</span></p></td></tr>
 </tbody></table>
 <h1 seq="auto">关键决策</h1>
@@ -66,6 +66,6 @@
 <li><span text-color="red">留有测试用的群和会话：「CEO 编排测试」「群推送测试」及若干探测会话，可自行清理。</span></li>
 <li><span text-color="red">把已有群绑定到会话目前没有界面入口，本次是改配置文件完成的。</span></li>
 <li><span text-color="red">早先部分模型曾返回网关 403，如遇模型不可用可换别名。</span></li>
-<li><span text-color="red">屏幕操作的飞书界面测试待电脑解锁后补做；「需要人介入」推送待实测。</span></li>
+<li><span text-color="red">屏幕操作的飞书界面测试待电脑解锁后补做（电脑一直锁屏）；其余实测已用林森身份的真实飞书消息完成。</span></li>
 </ul>
 
