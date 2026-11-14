@@ -34,7 +34,7 @@ logger = logging.getLogger("feishu-bridge.ceo")
 
 MAX_SUBTASKS = 4
 MAX_ROUNDS = 3
-RESULT_CHARS = 3000
+RESULT_CHARS = 8000
 REPORT_CHARS = 6000
 
 CLAUDE_MODELS = ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5")
