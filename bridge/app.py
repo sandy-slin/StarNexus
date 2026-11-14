@@ -655,6 +655,16 @@ class Bridge:
             self.group_pusher = GroupPusher(enabled=settings.notify_group)
         except Exception:  # noqa: BLE001
             logger.exception("群进展推送没起来，绑定群里不会主动推进展")
+        # CEO 编排（bridge/fleet/ceo.py）：独立功能，只用总控现成的开会话 / 发指令。起不来不影响别的。
+        self.ceo = None
+        try:
+            self.ceo = self._build_ceo(home)
+            if self.ceo is not None:
+                stale = self.ceo.recover()
+                if stale:
+                    logger.info("CEO：%d 个任务被重启打断，等「/ceo 继续」", stale)
+        except Exception:  # noqa: BLE001
+            logger.exception("CEO 编排没起来，/ceo 先用不了")
         # 第 12 轮：常驻菜单自愈。装机那一刻缺权限写不成菜单的，桥起来后自己补；成功一次永不再写
         # （2026-11-06 同事装完没有悬浮菜单：菜单只在装机时写一次，之后没人再写）。
         self.menu_heal = None
@@ -1052,6 +1062,10 @@ class Bridge:
                 # 那就什么都没打断。
                 if await self._handle_command(scope, chat_id, text):
                     return
+
+            # CEO 群里的话交给 CEO（等拍板时就是答复）。独立功能，不碰会话绑定那条路。
+            if await self._maybe_ceo_text(scope, chat_id, text):
+                return
 
             # 选好了「新建会话」的工具和项目 ⇒ 这一句是新会话的第一句
             if await self._maybe_start_new_session(scope, chat_id, text):
@@ -2127,6 +2141,9 @@ class Bridge:
             await self._fleet_overview(chat_id)
             return True
         if await self._handle_newsession_command(scope, chat_id, text):
+            return True
+        if command == "/ceo":
+            await self._handle_ceo_command(scope, chat_id, text)
             return True
         if command in CANCEL_COMMANDS or _is_cancel_word(text):
             # 绑过的群里「退出」= 解绑（只关转发，群留着）。不然下一句又按绑定接回去，退出是假的。
@@ -3895,6 +3912,100 @@ class Bridge:
             return sessions.get(scope).workspace if sessions is not None else ""
         except Exception:  # noqa: BLE001
             return ""
+
+    # ---------- CEO 编排 ----------
+
+    def _build_ceo(self, home: str):
+        """CEO 本体。大脑用 Claude（无工具、结构化输出），认证键和总控的 Claude 同一份。"""
+        control = getattr(self, "fleet", None)
+        if control is None:
+            return None
+        from .fleet.ceo import ClaudeBrain, MissionStore, Orchestrator
+
+        adapter = None
+        try:
+            adapter = control.fleet.adapter("claude")
+        except Exception:  # noqa: BLE001
+            adapter = None
+
+        def brain_env() -> dict:
+            if adapter is not None and hasattr(adapter, "_send_env"):
+                return adapter._send_env("")
+            return dict(os.environ)
+
+        def brain_settings() -> dict:
+            if adapter is not None and hasattr(adapter, "_auth"):
+                return dict(adapter._auth()[1])
+            return {}
+
+        def projects() -> list:
+            policy = self.policy
+            dirs = workspace_mod.recent_repos(policy, "", 8)
+            return [(workspace_mod.short_name(d, policy), d) for d in dirs]
+
+        def approval_dir(tool: str, key: str) -> str:
+            return self._fleet_approval_dir(tool, key, self.policy) if tool == "claude" else ""
+
+        return Orchestrator(
+            MissionStore(os.path.join(home, "ceo_missions.json")),
+            ClaudeBrain(env=brain_env, settings=brain_settings),
+            control,
+            self._say,
+            policy=lambda: self.policy,
+            projects=projects,
+            approval_dir=approval_dir,
+            timeout=lambda: float(getattr(self.policy, "turn_timeout_sec", 600) or 600),
+        )
+
+    async def _handle_ceo_command(self, scope: str, chat_id: str, text: str) -> None:
+        from .fleet.ceo import CEO_HELP, parse_command
+
+        ceo = getattr(self, "ceo", None)
+        if ceo is None:
+            self._say(chat_id, "CEO 编排现在用不了（会话总控没起来）。")
+            return
+        action, arg = parse_command(text)
+        in_group = str(scope or "").startswith("group:")
+        if action == "help":
+            self._say(chat_id, CEO_HELP)
+            return
+        if action == "mark":
+            if not in_group:
+                self._say(chat_id, "CEO 群要在群里设：先建一个群、把机器人拉进去，再在群里发「/ceo 群」。")
+                return
+            binds = getattr(self, "chat_binds", None)
+            bound = binds.of_chat(chat_id) if binds is not None else None
+            if bound is not None and getattr(bound, "on", True):
+                self._say(chat_id, "这个群已经绑了一个会话，不能同时当 CEO 群。换一个群，或先在这里发「退出」解绑。")
+                return
+            ceo.mark_chat(chat_id)
+            self._say(chat_id, "🧭 这个群现在是 **CEO 群**。直接说任务就行，CEO 会拆分、派给各个会话、汇总，"
+                               "要你拍板时在这里问你。发「/ceo 状态」看进度，「/ceo 退出」取消。")
+            return
+        if action == "unmark":
+            gone = ceo.unmark_chat(chat_id)
+            self._say(chat_id, "好，这个群不再是 CEO 群。" if gone else "这个群本来就不是 CEO 群。")
+            return
+        if action == "status":
+            self._say(chat_id, ceo.status_text(chat_id))
+            return
+        if action == "stop":
+            self._say(chat_id, await asyncio.to_thread(ceo.cancel, chat_id))
+            return
+        if action == "resume":
+            self._say(chat_id, await asyncio.to_thread(ceo.resume, chat_id))
+            return
+        ok, msg = await asyncio.to_thread(ceo.start, chat_id, arg)
+        if not ok:
+            self._say(chat_id, msg)
+
+    async def _maybe_ceo_text(self, scope: str, chat_id: str, text: str) -> bool:
+        ceo = getattr(self, "ceo", None)
+        if ceo is None or not str(scope or "").startswith("group:"):
+            return False
+        if not ceo.is_ceo_chat(chat_id):
+            return False
+        return bool(await asyncio.to_thread(ceo.handle_text, chat_id, text))
 
     async def _handle_newsession_command(self, scope: str, chat_id: str, text: str) -> bool:
         """`/newsession [工具] [项目]`、「新建会话」。不是这条 ⇒ False。"""
