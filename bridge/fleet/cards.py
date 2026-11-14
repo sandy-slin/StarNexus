@@ -964,7 +964,7 @@ def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[
             elements.append(_md("\n".join(
                 "⚠️ " + escape_card(short_title(_safe_clean(clean, n), NOTE_CHARS), keep_format=True)
                 for n in view.notes[:6]), small=True))
-        elements.append(_button("🔄 刷新", fleet_value("refresh")))
+        elements.append(_row([_button("🔄 刷新", fleet_value("refresh")), do_button("newsession")]))
         return _card("🖥 电脑上的会话", "blue", elements)
 
     if not expand:

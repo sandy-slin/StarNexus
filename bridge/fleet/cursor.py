@@ -1147,6 +1147,50 @@ class CursorAdapter(Adapter):
         return self._to_action(meta.id, result)
 
     def _to_action(self, chat_id: str, result: RunResult) -> ActionResult:
+        return self._to_action_impl(chat_id, result)
+
+    # ---------- start：手机上新建会话 ----------
+
+    def start(self, cwd: str, text: str, timeout: float = 600, mode: Any = "readonly") -> ActionResult:
+        """在 `cwd` 新开一个命令行对话：和 `build_argv` 同一套旗标，只是不带 `--resume`。
+
+        🔴 control.start 一律传 readonly（`--mode ask`）。新对话的 id 从结果 JSON 的 `session_id` 拿；
+        拿不到 ⇒ 当没开成。⚠️ 本机没装 cursor-agent，这条路没在真机上跑过（按 `--resume` 那条的形状推断）。
+        """
+        text = (text or "").strip()
+        if not text:
+            return ActionResult(False, "要说的话是空的。", "")
+        if len(text) > MAX_SEND_CHARS:
+            return ActionResult(False, f"一次最多发 {MAX_SEND_CHARS} 个字，这条太长了。", "")
+        if not cwd or not os.path.isdir(cwd):
+            return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
+        binary = self.agent_bin()
+        if not binary:
+            return ActionResult(False, WHY_NO_BIN, "")
+        flags = MODE_FLAGS.get(mode if isinstance(mode, str) else "readonly", MODE_FLAGS["readonly"])
+        argv = [binary, "-p", "--output-format", "json", "--trust", "--workspace", cwd, *flags, "--", text]
+        spawned: list = []
+
+        def on_spawn(pid: int) -> None:
+            spawned.append(pid)
+            self.jobs.register_spawned(pid, self.tool, "")
+
+        try:
+            result = self.runner.run(argv, timeout=float(timeout), cwd=cwd, on_spawn=on_spawn)
+        except Exception as exc:
+            result = RunResult(returncode=-1, error=friendly_error(exc, "没能启动 cursor-agent"))
+        finally:
+            for pid in spawned:
+                self.jobs.forget(pid)
+        data = parse_result(result.stdout) or {}
+        sid = data.get("session_id") or data.get("chatId") or ""
+        sid = sid if isinstance(sid, str) and valid_id(sid) else ""
+        out = self._to_action_impl(sid, result)
+        if not sid:
+            return ActionResult(False, out.text if not out.ok else "Cursor 回了，但没给出新对话的编号，没法接着聊。", "")
+        return ActionResult(out.ok, out.text, sid, delivered=bool(spawned))
+
+    def _to_action_impl(self, chat_id: str, result: RunResult) -> ActionResult:
         if result.error:
             return ActionResult(False, result.error, chat_id)
         if result.timed_out:

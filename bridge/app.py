@@ -206,7 +206,9 @@ def _is_cancel_word(text: str) -> bool:
 
 
 def _is_fleet_word(text: str) -> bool:
-    return (text or "").strip() in FLEET_WORDS | DIAG_WORDS | UPDATE_WORDS or _is_cancel_word(text)
+    from .fleet.newsession import WORDS as _NEW_WORDS
+
+    return (text or "").strip() in FLEET_WORDS | DIAG_WORDS | UPDATE_WORDS | _NEW_WORDS or _is_cancel_word(text)
 
 
 def _redact_text(text: str) -> str:
@@ -416,7 +418,7 @@ def _toast_for(text: str) -> str:
         "/mode": "看看权限", "/model": "看看模型", "/dirs": "看看有哪些项目",
         "/status": "看看现在状态", "/stop": "正在停", "/new": "开个新话题",
         "/menu": "打开菜单", "/help": "打开帮助", "/history": "调出最近问过的话", "/sessions": "看看电脑上的会话",
-        "/诊断": "看看运行状态",
+        "/诊断": "看看运行状态", "/newsession": "选一下用哪个",
     }
     if cmd in named:
         return f"收到，{named[cmd]}"
@@ -1040,6 +1042,10 @@ class Bridge:
                 # 那就什么都没打断。
                 if await self._handle_command(scope, chat_id, text):
                     return
+
+            # 选好了「新建会话」的工具和项目 ⇒ 这一句是新会话的第一句
+            if await self._maybe_start_new_session(scope, chat_id, text):
+                return
 
             # 点过 [接着聊] ⇒ 这一条发到电脑上那个会话，不走自己的 claude
             if await self._maybe_send_to_fleet(scope, chat_id, text):
@@ -1781,6 +1787,9 @@ class Bridge:
             # 第 33 轮「↩︎ 接着上次」：只带一个序号，要换回哪个会话记在服务端
             if value.get("act") == "cont":
                 return self._on_continue_click(event, clicker, value)
+            # 「➕ 新建会话」那两张卡：只带工具名 / 服务端序号，目录不在卡上
+            if value.get("act") == "new":
+                return self._on_new_click(event, clicker, value)
 
             # 点击时**重新**查白名单：卡片可能在群里被别人看到，
             # 而白名单在这期间可能已经变了。比"签发时查过"更严。
@@ -2107,6 +2116,8 @@ class Bridge:
         if command in FLEET_COMMANDS or stripped in FLEET_WORDS:
             await self._fleet_overview(chat_id)
             return True
+        if await self._handle_newsession_command(scope, chat_id, text):
+            return True
         if command in CANCEL_COMMANDS or _is_cancel_word(text):
             # 绑过的群里「退出」= 解绑（只关转发，群留着）。不然下一句又按绑定接回去，退出是假的。
             if self._group_bind_quit(scope, chat_id):
@@ -2119,6 +2130,7 @@ class Bridge:
             dropped = self._drop_held(scope)
             # 重启前在对话模式、重启后还没说话就点了旧的「退出对话」⇒ 照实说断了（第 11 轮）
             restarted = self._forget_restart_talk(scope)
+            new_armed = self._newsession_state().disarm(scope)
             # 🔴 记下「他说了退出」。有一句还在飞时，回复到了之后不许再把对话模式挂回来
             # （2026-11-04 审查：原来 /cancel 回「没有要取消的」，几秒后模式自己回来了）。
             flying = getattr(self, "_fleet_inflight", {}).get(scope)
@@ -2145,6 +2157,8 @@ class Bridge:
                                    "之后你说的话不会再发给它。")
             elif dropped:
                 self._say(chat_id, "好，你刚才说的那几句没发过去。")
+            elif new_armed:
+                self._say(chat_id, "好，不新建会话了。")
             elif command in CANCEL_COMMANDS or _cancel_core(text) == _CANCEL_WORD_ALWAYS:
                 self._say(chat_id, "没有要取消的。直接说要干什么就行。")
             else:
@@ -3841,7 +3855,224 @@ class Bridge:
                                      self._talk_buttons(target.tool, target.id))
         return toast("info", "收到，说吧", "进对话模式")
 
+    # ---------- 手机上「➕ 新建会话」（bridge/fleet/newsession.py） ----------
+
+    def _newsession_state(self):
+        state = getattr(self, "_new_sessions", None)
+        if state is None:
+            from .fleet.newsession import NewSessionState
+
+            state = self._new_sessions = NewSessionState()
+        return state
+
+    def _in_background(self, fn, *args) -> None:
+        """丢进线程池跑，立刻返回（卡片回调 3 秒纪律）。没起循环就同步跑。"""
+        loop = getattr(self, "_loop", None)
+        if loop is None or not hasattr(loop, "call_soon_threadsafe"):
+            fn(*args)
+            return
+        loop.call_soon_threadsafe(lambda: loop.run_in_executor(None, fn, *args))
+
+    def _new_current_dir(self, scope: str) -> str:
+        sessions = getattr(self, "sessions", None)
+        try:
+            return sessions.get(scope).workspace if sessions is not None else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _handle_newsession_command(self, scope: str, chat_id: str, text: str) -> bool:
+        """`/newsession [工具] [项目]`、「新建会话」。不是这条 ⇒ False。"""
+        from .fleet.newsession import COMMANDS, TOOL_ALIASES, WORDS
+
+        stripped = (text or "").strip()
+        parts = stripped.split()
+        command = parts[0].lower() if parts else ""
+        if command not in COMMANDS and stripped not in WORDS:
+            return False
+        args = parts[1:] if command in COMMANDS else []
+        state = self._newsession_state()
+        if args and args[0].lower() in ("cancel", "取消"):
+            had = state.disarm(scope)
+            self._say_with_buttons(chat_id, "好，不建了。" if had else "现在没有在新建的会话。",
+                                   [_do_button("sessions")])
+            return True
+        if getattr(self, "fleet", None) is None:
+            self._say(chat_id, "会话总控这次没起来，重启一下服务再试。")
+            return True
+        if not args:
+            self._send_new_tool_card(chat_id)
+            return True
+        tool = TOOL_ALIASES.get(args[0].lower())
+        if tool is None:
+            self._say(chat_id, "认不出要用哪个，能用的是 claude / codex / cursor。")
+            return True
+        if len(args) == 1:
+            await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool)
+            return True
+        found = workspace_mod.resolve_request(self.policy, self._new_current_dir(scope), " ".join(args[1:]))
+        if not found.ok or not found.workspace:
+            self._say(chat_id, found.reply.replace("/cd ", f"/newsession {tool} "))
+            return True
+        self._arm_new_session(scope, chat_id, tool, found.workspace)
+        return True
+
+    def _send_new_tool_card(self, chat_id: str) -> None:
+        from .fleet.newsession import build_tool_card
+
+        sender = getattr(getattr(self, "replier", None), "send_card", None)
+        if sender is None or not sender(chat_id, build_tool_card(_do_button("newcancel"))):
+            self._say(chat_id, "选工具的卡片发不出去。也可以直接发：/newsession claude（或 codex、cursor）")
+
+    def _send_new_dir_card(self, scope: str, chat_id: str, tool: str) -> None:
+        from .fleet.newsession import MAX_DIRS, build_dir_card
+
+        policy = self.policy
+        dirs = workspace_mod.recent_repos(policy, self._new_current_dir(scope), MAX_DIRS)
+        if not dirs:
+            self._say(chat_id, "没找到手机能用的项目目录。要放开得在电脑上改这个助手的设置。")
+            return
+        nonce = self._newsession_state().offer(scope, tool, dirs)
+        labels = [_redact_text(workspace_mod.short_name(d, policy)) for d in dirs]
+        card = build_dir_card(tool, labels, nonce, _do_button("newcancel"))
+        sender = getattr(getattr(self, "replier", None), "send_card", None)
+        if sender is None or not sender(chat_id, card):
+            self._say(chat_id, f"选项目的卡片发不出去。也可以直接发：/newsession {tool} 项目名")
+
+    def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str) -> None:
+        from .fleet.newsession import permission_line
+        from .fleet.scan import TOOL_LABELS
+
+        policy = self.policy
+        self._newsession_state().arm(scope, tool, cwd)
+        logger.info("新建会话 选好 tool=%s scope=%s", tool, scope[:16])
+        short = _redact_text(workspace_mod.short_name(cwd, policy))
+        mode = MODE_LABELS.get(policy.mode, policy.mode)
+        self._say_with_buttons(
+            chat_id,
+            f"好，在「{short}」新开一个 **{TOOL_LABELS.get(tool, tool)}** 会话。\n"
+            f"{permission_line(tool, mode)}\n"
+            "**下一句话就是它的第一句**，直接打字发过来（10 分钟内有效）。开好之后就进对话模式，接着说都发给它。",
+            [_do_button("newcancel")],
+        )
+
     # ---------- 对话模式：那一次权限确认 ----------
+
+    def _on_new_click(self, event, clicker: str, value: dict):
+        """「➕ 新建会话」卡上的按钮。闸门：主人 + 白名单形状 + 服务端记的序号（目录不在卡上）。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.newsession import resolve_click
+
+        def toast(kind: str, content: str, result: str):
+            logger.info("新建会话 点击 op=%s 结果=%s", str(value.get("op") or "")[:8], result)
+            return P2CardActionTriggerResponse({"toast": {"type": kind, "content": content}})
+
+        if clicker not in self.settings.owner_open_ids:
+            return toast("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN], "拒绝:不是主人")
+        click = resolve_click(value)
+        if click is None:
+            return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED], "拒绝:形状不对")
+        chat_id, scope = self._click_scope(event, clicker)
+        if not chat_id:
+            return toast("error", "找不到要回复的对话，直接发「新建会话」就好", "拒绝:找不到chat")
+        if not scope:
+            self._unknown_chat_notice(chat_id)
+            return toast("error", "服务刚重启过，先在这个聊天里发一句「新建会话」", "拒绝:scope对不上")
+        if click["op"] == "tool":
+            self._in_background(self._send_new_dir_card, scope, chat_id, click["tool"])
+            return toast("info", "收到，选一下项目", "已排队:选项目")
+        tool, cwd = self._newsession_state().take(scope, click["n"], click["i"])
+        if tool is None:
+            return toast("error", cwd, "拒绝:序号对不上")
+        if not self.policy.resolve_workspace(cwd):
+            return toast("error", "这个项目现在不在手机能用的目录里了", "拒绝:目录越界")
+        self._in_background(self._arm_new_session, scope, chat_id, tool, cwd)
+        return toast("info", "好，说第一句吧", "已选好")
+
+    async def _maybe_start_new_session(self, scope: str, chat_id: str, text: str) -> bool:
+        """选好了工具和项目 ⇒ 这一句是新会话的第一句。开成了就进对话模式。没在新建 ⇒ False。"""
+        from .fleet.newsession import INFLIGHT_ID
+        from .fleet.scan import TOOL_LABELS
+
+        state = self._newsession_state()
+        armed, expired = state.peek(scope)
+        if armed is None:
+            if expired:
+                self._say_with_buttons(chat_id, "刚才选的「新建会话」超过 10 分钟了，这句就按平常处理。"
+                                                "要新建的话再点一次。", [_do_button("newsession")])
+            return False
+        control = getattr(self, "fleet", None)
+        if control is None:
+            state.disarm(scope)
+            return False
+        inflight = self._fleet_inflight
+        if scope in inflight:
+            self._say(chat_id, "上一条还在发，等它回来再说。")
+            return True
+        if scope in getattr(self, "_paused", {}):
+            self._say_with_buttons(chat_id, f"⏸ 这个对话已暂停：{self._paused[scope]}\n确认没问题的话点「继续」。",
+                                   [_do_button("resume", primary=True), _do_button("newcancel")])
+            return True
+        policy = self.policy
+        reviewer = getattr(self, "reviewer", None)
+        if reviewer is not None:
+            decision = reviewer.review_request(ReviewContext(text=text, source="human", mode=policy.mode))
+            if decision.verdict is Verdict.DENY:
+                self._say(chat_id, f"⛔️ {decision.reason}")
+                return True
+        tool, cwd = armed["tool"], armed["cwd"]
+        state.disarm(scope)
+        label = TOOL_LABELS.get(tool, tool)
+        inflight[scope] = (tool, INFLIGHT_ID)
+        logger.info("新建会话 发出 tool=%s 字数=%d", tool, len(text))
+        self._say(chat_id, f"📨 正在新开 {label} 会话，等它回…")
+        settings = getattr(self, "settings", None)
+        wait_card = _FleetWaitCard(
+            self.replier, chat_id, f"新的 {label} 会话", can_stop=False,
+            first_delay=getattr(settings, "progress_first_notice_sec", 90),
+            escalate_sec=getattr(settings, "progress_escalate_sec", 0),
+            limit_sec=float(getattr(policy, "turn_timeout_sec", 600) or 600),
+        )
+        wait_stop = asyncio.Event()
+        wait_task = asyncio.create_task(wait_card.run(wait_stop))
+        result = None
+        try:
+            approval_dir = self._fleet_approval_dir(tool, "new-" + scope, policy) if tool == "claude" else ""
+            result = await asyncio.to_thread(
+                control.start, tool, cwd, text, policy=policy, approval_dir=approval_dir,
+                timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
+            )
+        finally:
+            inflight.pop(scope, None)
+            wait_stop.set()
+            try:
+                await wait_task
+                await wait_card.finish(result)
+            except Exception:  # noqa: BLE001
+                logger.debug("等待卡收尾失败", exc_info=True)
+        logger.info("新建会话 结果 ok=%s tool=%s 会话=%s", result.ok, tool, str(result.session_id)[:8] or "-")
+        if not result.session_id:
+            self._say_with_buttons(chat_id, f"❌ 没开成：{result.text}",
+                                   [_do_button("newsession", "➕ 再试一次"), _do_button("sessions")])
+            return True
+        # 🔴 新会话是主人自己从手机开的，权限说明在选项目时已经给过 ⇒ 记成确认（和建群那条同一套记法），
+        # 之后会话改名 / 换项目 / 在电脑上打开，照旧会再问。
+        self._grant_by_open_click(scope, tool, result.session_id)
+        target = control.set_pending(scope, tool, result.session_id)
+        self._sync_talk_marker(scope)
+        from .fleet.cards import TALKING_PREFIX, TALKING_SUFFIX
+        from .reply import normalize as _md_normalize
+
+        tail = f"\n\n{TALKING_PREFIX} {target.label} {TALKING_SUFFIX}"
+        if result.ok:
+            body = _md_normalize(result.text or "")
+            self.replier.send(chat_id, f"🆕 {target.label} 回复：\n\n{body}{tail}")
+        else:
+            self._say(chat_id, f"⚠️ 会话已经开了，但这一句没正常回完：{result.text}{tail}")
+        self._send_buttons(chat_id, self._talk_buttons(target.tool, target.id))
+        return True
 
     def _relay_ident(self, tool: str, sid: str) -> str:
         """会话现在的身份指纹（名字 + 目录）。确认绑在它上面 —— 改了名、换了项目就重新问。"""

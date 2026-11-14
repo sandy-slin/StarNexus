@@ -78,6 +78,7 @@ QUICK_QUESTIONS = tuple((_QUESTION_TEXT[key], label) for key, label in _QUICK_LA
 # 而且早就在 `fleet.actions.DO_COMMANDS` 的按钮白名单里（同一套判据）。
 CONTROLS = (
     ("/sessions", "🖥 看看会话"),
+    ("/newsession", "➕ 新建会话"),
     ("/history", "↑ 最近问过"),
     ("/mode", "🔑 权限"),
     ("/model", "🧠 模型"),
@@ -94,7 +95,7 @@ CONTROLS = (
 # 判据：悬浮栏上真有人点过的才露出来（数据见上面两段注释）。
 # 「换项目」点得不多也露着：别的卡、帮助都叫他「点📂 换项目」，而它不在悬浮栏里 ——
 # 再收进面板就从 3 下变 4 下（tests/test_r17_taps.py 的那套算法）。
-_PINNED_CONTROLS = ("/sessions", "/history", "/mode", "/model", "/dirs", "/stop")
+_PINNED_CONTROLS = ("/sessions", "/newsession", "/history", "/mode", "/model", "/dirs", "/stop")
 _PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
 
 # 折叠面板标题右边的小箭头。和 `fleet.cards.PANEL_ICON` 同一个（主会话 2026-11-08 真发过、
@@ -142,6 +143,7 @@ HELP = """**我在你的电脑上干活，结果发回这里。**
 
 **电脑上的其他会话**
 点「🖥 会话」（或发「会话」两个字）— 看电脑上开着的 Claude / Codex / Cursor 会话，点一个看最近几条
+点「➕ 新建会话」（或发「新建会话」）— 选 Claude / Codex / Cursor 和项目，在电脑上新开一个会话，之后直接在这里接着聊
 点 [接着聊] 会给这个会话建一个群，点「进群说话」进去直接打字就行：每一句都进电脑上那个会话，它的回复发回群里
 · 群里第一句会说清它用哪套权限（电脑上开着的 Claude 用电脑那套，多半不问就改；Codex / Cursor 只读）
 · 会话在电脑上改了名、换了项目或关了终端，会再问你一次

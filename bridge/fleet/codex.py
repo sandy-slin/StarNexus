@@ -866,6 +866,65 @@ class CodexAdapter(Adapter):
             return ActionResult(True, "Codex 跑完了，但没有文字回复。", tid)
         return ActionResult(True, reply, tid)
 
+    # ---------- start：手机上新建会话 ----------
+
+    def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "readonly") -> ActionResult:
+        """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
+
+        🔴 和 send 同一条红线：手机上发进 Codex 一律按只读（control.start 传 readonly）。
+        新会话的 id 从 `thread.started` 事件里拿；拿不到就当没开成（没法接着聊）。
+        """
+        text = str(text or "").strip()
+        if not text or text == "-":
+            return ActionResult(False, "要发的话是空的。", "")
+        if not cwd or not os.path.isdir(cwd):
+            return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
+        codex = self._codex()
+        sandbox = SANDBOX_BY_MODE.get(mode or "readonly", SANDBOX_BY_MODE["readonly"]) or SANDBOX_BY_MODE["readonly"]
+        argv = [codex, "exec", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"', "--", text]
+        spawned: list = []
+        timer_box: list = []
+        fired = threading.Event()
+
+        def on_spawn(pid: int) -> None:
+            spawned.append(pid)
+            self.jobs.register_spawned(pid, self.tool, "")
+
+            def soft_stop() -> None:
+                fired.set()
+                self.jobs.signal(pid, _signal.SIGINT)
+
+            timer = threading.Timer(max(1.0, float(timeout)), soft_stop)
+            timer.daemon = True
+            timer_box.append(timer)
+            timer.start()
+
+        try:
+            res = self.runner.run(argv, timeout=max(1.0, float(timeout)) + STOP_GRACE_SEC, cwd=cwd,
+                                  env=self._env(codex), input_text=None, on_spawn=on_spawn)
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, "没能启动 Codex"), "")
+        finally:
+            for timer in timer_box:
+                timer.cancel()
+            for pid in spawned:
+                self.jobs.forget(pid)
+        if res.error:
+            return ActionResult(False, res.error if res.error.startswith("没能启动") else "没能启动 Codex：" + res.error, "")
+        tid = thread_id_from_exec_output(res.stdout)
+        reply, failure = parse_exec_output(res.stdout)
+        if not tid:
+            err_lines = (res.stderr or "").strip().splitlines()
+            detail = short_title(failure or (err_lines[-1] if err_lines else ""), 120)
+            return ActionResult(False, "Codex 没开成新会话" + (f"：{detail}" if detail else "。"), "")
+        if res.timed_out or (fired.is_set() and not (res.returncode == 0 and reply)):
+            return ActionResult(False, "Codex 太久没回完，已经让它停下了。会话已经开了，可以接着说。", tid, delivered=True)
+        if res.returncode != 0 or (failure and not reply):
+            self._note_turn_failed(tid)
+            detail = short_title(failure or "", 120)
+            return ActionResult(False, "Codex 没回成功" + (f"：{detail}" if detail else "。"), tid, delivered=True)
+        return ActionResult(True, reply or "Codex 跑完了，但没有文字回复。", tid, delivered=True)
+
     # ---------- relay：进会话聊天 ----------
 
     @property
@@ -1161,3 +1220,19 @@ def parse_exec_output(stdout: str) -> tuple:
         elif kind == "error":
             failure = str(ev.get("message") or "出错了")
     return reply, failure
+
+
+def thread_id_from_exec_output(stdout: str) -> str:
+    """`codex exec --json` 第一条 `thread.started` 里的 thread_id；没有 / 形状不对 ⇒ 空串。"""
+    for raw in (stdout or "").splitlines():
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "thread.started":
+            tid = ev.get("thread_id")
+            return tid.lower() if is_thread_id(tid) else ""
+    return ""

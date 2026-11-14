@@ -1144,6 +1144,62 @@ class ClaudeAdapter(Adapter):
             argv += ["--disallowed-tools", str(tool)]
         return argv
 
+    # ---------- start：手机上新建会话 ----------
+
+    def start(self, cwd: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
+              approval_dir: str = "") -> ActionResult:
+        """在 `cwd` 新开一个会话，第一句是 `text`。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
+        只是把 `--resume <id>` 换成 `--session-id <新 uuid>`：id 由我们先定好，起进程前就能登记，
+        这样「停下」和占用判断从第一秒起就认得它。
+        """
+        import uuid
+
+        text = str(text or "").strip()
+        if not text:
+            return ActionResult(False, "要发的内容是空的。", "")
+        policy = self._get_policy(policy)
+        if policy is None:
+            return ActionResult(False, WHY_SEND_NO_POLICY, "")
+        if not cwd or not os.path.isdir(cwd):
+            return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
+        try:
+            inside = policy.resolve_workspace(cwd)
+        except Exception:
+            inside = None
+        if not inside:
+            return ActionResult(False, "这个项目不在手机能用的目录里，先不开。点「📂 换项目」看现在能用哪些。", "")
+        hook = self._hook()
+        if getattr(policy, "mode", "readonly") != "readonly" and not (hook and approval_dir):
+            return ActionResult(False, WHY_SEND_NO_HOOK, "")
+        sid = str(uuid.uuid4())
+        argv = self._send_argv(sid, text, policy, hook)
+        at = argv.index("--resume")
+        argv[at:at + 2] = ["--session-id", sid]
+        env = self._send_env(approval_dir if hook else "")
+        spawned: list = []
+
+        def on_spawn(pid: int) -> None:
+            spawned.append(pid)
+            self.jobs.register_spawned(pid, TOOL, sid)
+
+        try:
+            result = self.runner.run(argv, timeout=float(timeout or DEFAULT_SEND_TIMEOUT), cwd=inside,
+                                     env=env, on_spawn=on_spawn)
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, "没能启动 claude"), "")
+        finally:
+            for pid in spawned:
+                self.jobs.forget(pid)
+            self._last_own_write[sid] = self._now()
+        out = _send_result(sid, result)
+        if not spawned:
+            return ActionResult(out.ok, out.text, "" if not out.ok else out.session_id)
+        got = out.session_id or sid
+        if not out.ok and not self._jsonl_path(got):
+            # 进程起来了但会话记录没落盘（比如没登录就退出）⇒ 没有能接着聊的会话
+            return ActionResult(False, out.text, "")
+        return ActionResult(out.ok, out.text, got, delivered=True)
+
     # ---------- stop ----------
 
     def stop(self, id: str) -> ActionResult:

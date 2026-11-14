@@ -49,6 +49,9 @@ DO_COMMANDS = {
     # 诊断卡。纯显示、且内容走 status.HEALTH_FIELDS 白名单 ⇒ 点错了最坏只是多发一张卡。
     "diag": "/诊断",
     "history": "/history",  # 「↑ 最近问过」卡（只显示，不改任何设置）
+    # 「➕ 新建会话」：只打开选工具卡；真正开会话要再点工具、点项目、再说一句话（fleet/newsession.py）
+    "newsession": "/newsession",
+    "newcancel": "/newsession cancel",  # 不建了：只清掉选到一半的新建会话，不碰对话模式
 }
 
 # 这几个只是「看」，不看是哪个聊天也能做；其余的要对准是哪个聊天（退出 / 停 / 新话题 / 继续）。
@@ -69,6 +72,8 @@ DEFAULT_LABELS = {
     "help": "❓ 帮助",
     "diag": "🩺 运行诊断",
     "history": "↑ 最近问过",
+    "newsession": "➕ 新建会话",
+    "newcancel": "✖️ 不建了",
 }
 
 # 点了之后的 toast。不许露内部命令（同 app._toast_for 的红字）。
@@ -86,6 +91,8 @@ TOASTS = {
     "help": "收到，打开帮助",
     "diag": "收到，看看运行状态",
     "history": "收到，调出最近问过的话",
+    "newsession": "收到，选一下用哪个",
+    "newcancel": "好，不建了",
 }
 
 MAX_BUTTONS_CARD_BYTES = 8 * 1024

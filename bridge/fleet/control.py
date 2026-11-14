@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .model import ActionResult, Session, friendly_error
+from .model import ActionResult, Session, friendly_error, short_title
 from .scan import TOOL_LABELS, Fleet, Overview
 
 logger = logging.getLogger("feishu-bridge.fleet")
@@ -235,6 +235,41 @@ class FleetControl:
         except Exception as exc:
             # 不带前缀：app.py 那边已经套了「❌ 没发进去：」，再加一层就是「没发进去：没发出去：」
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
+
+    def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
+              timeout: float = 600) -> ActionResult:
+        """手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
+
+        闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
+        🔴 Codex / Cursor **一律只读**（理由见 send 里的红字）。开成了就记进 `_known`，
+        之后的 [停下] / 确认卡 / 对话模式都认得它。
+        """
+        adapter = self.fleet.adapter(tool)
+        if adapter is None or not hasattr(adapter, "start"):
+            return ActionResult(False, WHY_NO_ADAPTER, "")
+        if policy is None or not hasattr(policy, "resolve_workspace"):
+            return ActionResult(False, "手机发消息的权限档位没配好，先不开。", "")
+        resolved = policy.resolve_workspace(cwd) if cwd else None
+        if not resolved:
+            return ActionResult(False, WHY_OUTSIDE_WORKSPACE, "")
+        try:
+            if tool == "claude":
+                result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir)
+            else:
+                result = adapter.start(resolved, text, timeout=timeout, mode="readonly")
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, log_as=f"新建会话失败 tool={tool}"), "")
+        if result.session_id:
+            try:
+                sess = adapter.find(result.session_id)
+            except Exception:  # noqa: BLE001
+                sess = None
+            if sess is None:
+                sess = Session(tool=tool, surface="cli", id=result.session_id, title=short_title(text, 40),
+                               cwd=resolved, status="idle", owner="none", updated_at=self._now(),
+                               can_send=True)
+            self._remember(sess)
+        return result
 
     def _claude_relay_ready(self, adapter: Any, sid: str) -> tuple:
         """这条 Claude 会话该不该走 relay → (走不走, 不走时要不要告诉用户为什么)。

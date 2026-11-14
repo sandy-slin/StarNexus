@@ -466,6 +466,31 @@ def list_dirs(policy: Policy, current: str) -> str:
     return "\n".join(lines)
 
 
+def recent_repos(policy: Policy, current: str, limit: int = 8) -> list[str]:
+    """「新建会话」选项目卡用：当前项目在第一个，后面是白名单内最近动过的仓库（都过了 resolve_workspace）。"""
+    def mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    out: list[str] = []
+    here = policy.resolve_workspace(current) if current else None
+    if here and os.path.isdir(here):
+        out.append(here)
+    repos = sorted(_scan(policy, want_git_only=True), key=mtime, reverse=True)
+    for path in repos:
+        if len(out) >= max(int(limit), 1):
+            break
+        if path not in out and policy.resolve_workspace(path):
+            out.append(path)
+    return out
+
+
+def short_name(path: str, policy: Policy) -> str:
+    return _short(path, policy)
+
+
 def handle(
     policy: Policy,
     store: WorkspaceStore,
