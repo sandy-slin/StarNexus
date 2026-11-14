@@ -434,17 +434,17 @@ if command -v claude >/dev/null 2>&1; then
     else
       warn "claude 跑了但输出不对劲"
       hint "在终端手敲一次看看：claude -p 'hi'"
-      hint "它那边也不对就去 https://chat.auto-link.com.cn/oneclick/ 重新配一次"
+      hint "它那边也不对就去 https://chat.auto-link.com.cn/ai/ 重新配一次"
     fi
   else
     bad "claude 跑不通"
     hint "先确认 Claude Code 自己能用：claude -p 'hi'"
-    hint "没配好的话去 https://chat.auto-link.com.cn/oneclick/"
+    hint "没配好的话去 https://chat.auto-link.com.cn/ai/"
   fi
   rm -f /tmp/.cfa_probe
 else
   bad "没找到 claude 命令"
-  hint "装一下：https://chat.auto-link.com.cn/oneclick/"
+  hint "装一下：https://chat.auto-link.com.cn/ai/"
 fi
 echo
 
