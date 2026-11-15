@@ -3397,12 +3397,12 @@ class Bridge:
             # 退回老路：单聊里的对话模式，权限确认照旧
             if not self._relay_granted(scope, tool, sid):
                 self._ask_relay_consent(chat_id, scope, tool, sid)
-                return
+                return None
             target = control.set_pending(scope, tool, sid)
             self._sync_talk_marker(scope)
             self._say_with_buttons(chat_id, self._enter_talk_text(target, scope),
                                    self._talk_buttons(target.tool, target.id))
-            return
+            return None
 
         bound = result.bound
         group_scope = bound.scope
@@ -3458,6 +3458,7 @@ class Bridge:
             )
         else:
             self._ask_relay_consent(bound.chat_id, group_scope, tool, sid)
+        return bound
 
     async def _group_enter_button(self, group_chat_id: str):
         """建好（或复用）群之后那个「点一下就跳进群」的按钮。拿不到 ⇒ None（这排少一个按钮）。
@@ -4031,7 +4032,7 @@ class Bridge:
             return True
         tool = TOOL_ALIASES.get(args[0].lower())
         if tool is None:
-            self._say(chat_id, "认不出要用哪个，能用的是 claude / codex / cursor。")
+            self._say(chat_id, "认不出要用哪个，能用的是 claude / codex。")
             return True
         if len(args) == 1:
             await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool)
@@ -4047,8 +4048,14 @@ class Bridge:
             return True
         found = workspace_mod.resolve_request(self.policy, self._new_current_dir(scope), " ".join(rest))
         if not found.ok or not found.workspace:
-            self._say(chat_id, found.reply.replace("/cd ", f"/newsession {tool} "))
-            return True
+            if found.outcome == workspace_mod.Outcome.MISSING:
+                created = workspace_mod.create_missing_workspace(self.policy, " ".join(rest))
+                if created.ok:
+                    found = created
+                else:
+                    self._say(chat_id, created.reply or found.reply.replace("/cd ", f"/newsession {tool} "))
+            if not found.ok or not found.workspace:
+                return True
         self._arm_new_session(scope, chat_id, tool, found.workspace, model)
         return True
 
@@ -4057,7 +4064,7 @@ class Bridge:
 
         sender = getattr(getattr(self, "replier", None), "send_card", None)
         if sender is None or not sender(chat_id, build_tool_card(_do_button("newcancel"))):
-            self._say(chat_id, "选工具的卡片发不出去。也可以直接发：/newsession claude（或 codex、cursor）")
+            self._say(chat_id, "选工具的卡片发不出去。也可以直接发：/newsession claude（或 codex）")
 
     def _send_new_dir_card(self, scope: str, chat_id: str, tool: str, model: str = "") -> None:
         from .fleet.newsession import MAX_DIRS, build_dir_card
@@ -4212,19 +4219,22 @@ class Bridge:
             return True
         # 🔴 新会话是主人自己从手机开的，权限说明在选项目时已经给过 ⇒ 记成确认（和建群那条同一套记法），
         # 之后会话改名 / 换项目 / 在电脑上打开，照旧会再问。
-        self._grant_by_open_click(scope, tool, result.session_id)
-        target = control.set_pending(scope, tool, result.session_id)
-        self._sync_talk_marker(scope)
+        clicker = scope[3:] if scope.startswith("dm:") else ""
+        group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id)
+        target_scope = group_bound.scope if group_bound is not None else scope
+        target_chat_id = group_bound.chat_id if group_bound is not None else chat_id
+        target = control.set_pending(target_scope, tool, result.session_id)
+        self._sync_talk_marker(target_scope)
         from .fleet.cards import TALKING_PREFIX, TALKING_SUFFIX
         from .reply import normalize as _md_normalize
 
         tail = f"\n\n{TALKING_PREFIX} {target.label} {TALKING_SUFFIX}"
         if result.ok:
             body = _md_normalize(result.text or "")
-            self.replier.send(chat_id, f"🆕 {target.label} 回复：\n\n{body}{tail}")
+            self.replier.send(target_chat_id, f"🆕 {target.label} 回复：\n\n{body}{tail}")
         else:
-            self._say(chat_id, f"⚠️ 会话已经开了，但这一句没正常回完：{result.text}{tail}")
-        self._send_buttons(chat_id, self._talk_buttons(target.tool, target.id))
+            self._say(target_chat_id, f"⚠️ 会话已经开了，但这一句没正常回完：{result.text}{tail}")
+        self._send_buttons(target_chat_id, self._talk_buttons(target.tool, target.id))
         return True
 
     def _relay_ident(self, tool: str, sid: str) -> str:
@@ -4530,7 +4540,7 @@ class Bridge:
 
         - Claude 电脑上开着 ⇒ 话送进那个会话，用**它在电脑上那套权限**（多半不问就改）
         - Claude 电脑上关着 ⇒ 后台接着跑，用**手机这边的档位**（`_runs_in_background`，F 那套）
-        - Codex / Cursor ⇒ 一律按**只读**发（`control.send` 的红字：它们没有审批钩子）
+        - Codex ⇒ 一律按**只读**发（`control.send` 的红字：它没有审批钩子）
         写死一句「按电脑上那套」在后两种情况都是错的，而且错在「以为它能改」那个方向反了也不安全。
         """
         sess = None
@@ -4538,7 +4548,7 @@ class Bridge:
             sess = self.fleet.cached(tool, sid)
         except Exception:  # noqa: BLE001
             sess = None
-        if tool in ("codex", "cursor"):
+        if tool == "codex":
             return "· 从手机发过去的话按**只读**处理：它只看、只回答，不改你的文件\n"
         if sess is not None and self._runs_in_background(sess):
             return "· 电脑上这个会话现在关着，会在后台接着跑，权限按手机这边的档位\n"
@@ -4634,7 +4644,7 @@ class Bridge:
     def _bound_label(self, bound) -> str:
         """群里那几句提到「这个群直达谁」时用的名字。
 
-        🔴 优先用**会话本身**（`session_label`）：`Bound.name` 是群名，带着「Claude · 」前缀、
+        🔴 优先用**会话本身**（`session_label`）：`Bound.name` 是群名，带着「Claude·」前缀、
         还被截到群名上限 ⇒ 原来拼出「Claude「Claude · 198 litellm 5x…」」（2026-11-06 体验侦察）。
         拿不到会话（重启后还没扫到）才退回 `bound.label`（那边也剥了前缀）。
         """

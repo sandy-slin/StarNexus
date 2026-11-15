@@ -107,7 +107,7 @@ class Bound:
         """
         head = TOOL_LABELS.get(self.tool, self.tool)
         name = self.name or ""
-        prefix = f"{head} · "
+        prefix = f"{head}·"
         if head and name.startswith(prefix):
             name = name[len(prefix):].strip()
         name = name or self.id[:SHORT_ID_CHARS]
@@ -147,7 +147,7 @@ def group_name(tool: str, title: str, sid: str = "", *, taken: Iterable[str] = (
         safe = ""
     head = TOOL_LABELS.get(tool, tool) or "会话"
     tail = safe or f"会话 {str(sid or '')[:SHORT_ID_CHARS]}".strip()
-    name = short_title(f"{head} · {tail}", limit)
+    name = short_title(f"{head}·{tail}", limit)
     used = {str(t) for t in (taken or ())}
     if name not in used:
         return name

@@ -4,10 +4,17 @@ from types import SimpleNamespace
 from unittest import mock
 
 from bridge import app as app_mod
-from bridge.fleet.newsession import NewSessionState, pick_model
+from bridge.fleet.newsession import COMMANDS, START_TOOLS, NewSessionState, pick_model
+from bridge.fleet.chatbind import group_name
+from bridge.policy import Policy
+from bridge.workspace import Outcome, create_missing_workspace
 
 
 class PickModelTest(unittest.TestCase):
+    def test_short_command_and_visible_tools(self):
+        self.assertIn("/ns", COMMANDS)
+        self.assertEqual(START_TOOLS, ("claude", "codex"))
+
     def test_aliases(self):
         self.assertEqual(pick_model("claude", "opus"), "claude-opus-5-5")
         self.assertEqual(pick_model("claude", "Sonnet"), "claude-sonnet-5-5")
@@ -99,12 +106,39 @@ class StartPassesModelTest(unittest.TestCase):
         bridge._sync_talk_marker = lambda scope: None
         bridge._send_buttons = lambda *a: None
         bridge._talk_buttons = lambda *a: []
+        bridge._open_session_group = mock.AsyncMock(return_value=None)
         bridge._newsession_state().arm("dm:x", "codex", "/tmp", "gpt-6-luna")
         with mock.patch.object(app_mod, "_FleetWaitCard", FakeWaitCard):
             handled = asyncio.run(bridge._maybe_start_new_session("dm:x", "oc", "你好"))
         self.assertTrue(handled)
         self.assertEqual(calls[0][0], "codex")
         self.assertEqual(calls[0][3]["model"], "gpt-6-luna")
+        bridge._open_session_group.assert_awaited_once_with("oc", "dm:x", "x", "codex", "s-new")
+
+
+class MissingWorkspaceTest(unittest.TestCase):
+    def test_creates_one_missing_child_inside_allowed_root(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            policy = Policy("trusted", (root,), root, "", 60, "trusted")
+            target = root + "/new-session"
+            result = create_missing_workspace(policy, target)
+            self.assertEqual(result.outcome, Outcome.OK)
+            self.assertTrue(__import__("os").path.isdir(target))
+
+    def test_rejects_outside_without_creating(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            policy = Policy("trusted", (root,), root, "", 60, "trusted")
+            target = outside + "/should-not-exist"
+            result = create_missing_workspace(policy, target)
+            self.assertEqual(result.outcome, Outcome.OUTSIDE)
+            self.assertFalse(__import__("os").path.exists(target))
+
+
+class GroupNameTest(unittest.TestCase):
+    def test_uses_compact_tool_title_format(self):
+        self.assertEqual(group_name("codex", "修登录", "abcdef"), "Codex·修登录")
 
 
 if __name__ == "__main__":

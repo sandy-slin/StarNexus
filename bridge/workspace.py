@@ -385,6 +385,35 @@ def resolve_request(policy: Policy, current: str, raw: str) -> CdResult:
     return _verify(policy, candidates[0], raw)
 
 
+def create_missing_workspace(policy: Policy, raw: str) -> CdResult:
+    """为新会话创建一个缺失的、位于白名单内的末级目录。
+
+    只允许创建一级目录，且父目录必须已存在并可写；普通 /cd 不调用此入口。
+    """
+    raw = (raw or "").strip().strip("'\\\"")
+    if not _looks_like_path(raw):
+        return CdResult(Outcome.MISSING, "")
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return CdResult(Outcome.OUTSIDE, "这个新会话目录必须写完整路径。")
+    target = os.path.realpath(expanded)
+    parent = os.path.dirname(target)
+    if policy.resolve_workspace(parent) is None:
+        return _verify(policy, target, raw)
+    if os.path.exists(target):
+        return _verify(policy, target, raw)
+    if not os.path.isdir(parent) or not _readable_dir(parent) or not os.access(parent, os.W_OK):
+        return CdResult(Outcome.NO_ACCESS, f"这个目录的上一级我写不进去：{_short(parent, policy)}")
+    try:
+        os.mkdir(target, 0o755)
+    except FileExistsError:
+        return _verify(policy, target, raw)
+    except OSError as exc:
+        logger.warning("新会话目录创建失败 path=%s error=%s", target, exc)
+        return CdResult(Outcome.NO_ACCESS, f"没能新建这个目录：{_short(target, policy)}")
+    return CdResult(Outcome.OK, f"已新建目录：{_short(target, policy)}", workspace=target)
+
+
 def _verify(policy: Policy, candidate: str, raw: str) -> CdResult:
     """收敛 + 存在性检查。越界的回话里**不能泄露**那个路径存不存在。"""
     resolved = policy.resolve_workspace(candidate)

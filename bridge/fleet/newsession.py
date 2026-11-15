@@ -1,15 +1,15 @@
-"""手机上「➕ 新建会话」：在电脑上新开一个 Claude / Codex / Cursor 会话，之后就在飞书里接着聊。
+"""手机上「➕ 新建会话」：在电脑上新开一个 Claude / Codex 会话，之后就在飞书里接着聊。
 
 ## 流程（三步，全是按钮）
 
-1. 点「➕ 新建会话」（或发「新建会话」/ `/newsession`）⇒ 选工具卡：Claude / Codex / Cursor。
+1. 点「➕ 新建会话」（或发「新建会话」/ `/newsession` / `/ns`）⇒ 选工具卡：Claude / Codex。
 2. 点一个工具 ⇒ 选项目卡：当前项目 + 白名单里最近动过的仓库（`workspace.recent_repos`）。
 3. 点一个项目 ⇒ **下一句话**就是新会话的第一句。开好之后自动进对话模式，后面每句走现有的
-   `control.send(relay=True)` 管道（Claude 按手机档位 + 审批钩子；Codex / Cursor 一律只读）。
+   `control.send(relay=True)` 管道（Claude 按手机档位 + 审批钩子；Codex 一律只读）。
 
 ## 回调值（白名单，同 `actions.resolve_do_click` 的思路）
 
-- `{"act": "new", "op": "tool", "tool": <claude|codex|cursor>}`
+- `{"act": "new", "op": "tool", "tool": <claude|codex>}`
 - `{"act": "new", "op": "dir", "n": <服务端发的序号>, "i": <第几个>}`
 
 🔴 value 来自飞书、理论上能伪造 ⇒ **目录不放进卡片**，卡上只带序号；要开在哪个目录记在服务端
@@ -35,12 +35,11 @@ MAX_DIRS = 8
 # 新会话那一句在飞时 `_fleet_inflight` 里的占位 id（真 id 要等它回来才知道）
 INFLIGHT_ID = "(new)"
 
-COMMANDS = frozenset({"/newsession", "/新建会话"})
+COMMANDS = frozenset({"/newsession", "/ns", "/新建会话"})
 WORDS = frozenset({"新建会话", "新会话", "开新会话"})
 
-START_TOOLS = ("claude", "codex", "cursor")
-TOOL_ALIASES = {"claude": "claude", "cc": "claude", "codex": "codex", "cx": "codex",
-                "cursor": "cursor", "cursor-agent": "cursor"}
+START_TOOLS = ("claude", "codex")
+TOOL_ALIASES = {"claude": "claude", "cc": "claude", "codex": "codex", "cx": "codex"}
 MODEL_ALIASES = {
     "claude": {"sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5",
                "claude-sonnet-5-5": "claude-sonnet-5-5", "claude-opus-5-5": "claude-opus-5-5",
@@ -62,7 +61,6 @@ def model_hint(tool: str) -> str:
 TOOL_HINTS = {
     "claude": "按手机这边的权限干活",
     "codex": "只读：能看、能回答，不改文件",
-    "cursor": "只读：能看、能回答，不改文件",
 }
 
 
