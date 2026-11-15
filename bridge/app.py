@@ -4540,7 +4540,7 @@ class Bridge:
 
         - Claude 电脑上开着 ⇒ 话送进那个会话，用**它在电脑上那套权限**（多半不问就改）
         - Claude 电脑上关着 ⇒ 后台接着跑，用**手机这边的档位**（`_runs_in_background`，F 那套）
-        - Codex ⇒ 一律按**只读**发（`control.send` 的红字：它没有审批钩子）
+        - Codex ⇒ 跟随手机这边的权限档位（trusted 可写，write 限定工作区，readonly 只读）
         写死一句「按电脑上那套」在后两种情况都是错的，而且错在「以为它能改」那个方向反了也不安全。
         """
         sess = None
@@ -4549,7 +4549,8 @@ class Bridge:
         except Exception:  # noqa: BLE001
             sess = None
         if tool == "codex":
-            return "· 从手机发过去的话按**只读**处理：它只看、只回答，不改你的文件\n"
+            mode = MODE_LABELS.get(getattr(self.policy, "mode", "trusted"), "全授权")
+            return f"· 从手机发过去的话按**{mode}**权限处理\n"
         if sess is not None and self._runs_in_background(sess):
             return "· 电脑上这个会话现在关着，会在后台接着跑，权限按手机这边的档位\n"
         return "· 它按电脑上那套权限干活，多半不问就改；手机这边的「只读」管不到它\n"

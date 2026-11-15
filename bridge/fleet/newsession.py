@@ -60,7 +60,7 @@ def model_hint(tool: str) -> str:
 
 TOOL_HINTS = {
     "claude": "按手机这边的权限干活",
-    "codex": "只读：能看、能回答，不改文件",
+    "codex": "按手机这边的权限干活",
 }
 
 
@@ -211,4 +211,4 @@ def build_dir_card(tool: str, labels: list, nonce: str, cancel_button: dict) -> 
 def permission_line(tool: str, mode_label: str) -> str:
     if tool == "claude":
         return f"· 权限按手机这边的「{mode_label}」，和后台接着跑电脑上的会话一样"
-    return f"· {TOOL_LABELS.get(tool, tool)} 从手机上一律只读：能看、能回答，不改文件"
+    return f"· {TOOL_LABELS.get(tool, tool)} 按手机这边的「{mode_label}」权限干活"

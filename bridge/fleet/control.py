@@ -218,12 +218,8 @@ class FleetControl:
                     if why:
                         return ActionResult(False, why, sid)
                 return adapter.send(sid, text, timeout=timeout, policy=policy, approval_dir=approval_dir)
-            # 🔴 Codex / Cursor **一律按只读发**，不跟随手机上的档位。
-            # 2026-11-04 安全审查：它们没有审批钩子，红线（删家目录、改桥的配置、写 App 数据库）
-            # 和写边界都只在 Claude 那条路上生效。本机 ~/.codex/config.toml 是
-            # danger-full-access，全授权档原来**不压 sandbox** ⇒ 从手机发进 Codex 等于整机全开；
-            # Cursor 全授权会带 `--force`。在有等价的护栏之前，手机只能让它们看和回答。
-            # 工作目录也要和 Claude 一样过一遍白名单。
+            # Codex 跟随当前权限档位：普通 trusted 可写，write 限定工作区，readonly 才只读。
+            # 工作目录仍要和 Claude 一样过一遍白名单。
             cwd = self._cwd_of(tool, sid)
             if cwd and policy is not None and hasattr(policy, "resolve_workspace"):
                 if policy.resolve_workspace(cwd) is None:
@@ -231,7 +227,8 @@ class FleetControl:
             method = getattr(adapter, "relay", None) if relay else None
             if method is None:
                 method = adapter.send
-            return method(sid, text, timeout=timeout, mode="readonly")
+            mode = getattr(policy, "mode", "trusted") if policy is not None else "trusted"
+            return method(sid, text, timeout=timeout, mode=mode)
         except Exception as exc:
             # 不带前缀：app.py 那边已经套了「❌ 没发进去：」，再加一层就是「没发进去：没发出去：」
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
@@ -241,7 +238,7 @@ class FleetControl:
         """手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
 
         闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
-        🔴 Codex / Cursor **一律只读**（理由见 send 里的红字）。开成了就记进 `_known`，
+        Codex 跟随当前权限档位：trusted 可写，write 限定工作区，readonly 只读。开成了就记进 `_known`，
         之后的 [停下] / 确认卡 / 对话模式都认得它。
         """
         adapter = self.fleet.adapter(tool)
@@ -260,7 +257,8 @@ class FleetControl:
                 result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
                                        **extra)
             else:
-                result = adapter.start(resolved, text, timeout=timeout, mode="readonly", **extra)
+                result = adapter.start(resolved, text, timeout=timeout,
+                                       mode=getattr(policy, "mode", "trusted"), **extra)
         except Exception as exc:
             return ActionResult(False, friendly_error(exc, log_as=f"新建会话失败 tool={tool}"), "")
         if result.session_id:

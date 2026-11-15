@@ -36,6 +36,10 @@ class ControlOnPidTest(unittest.TestCase):
         self.control.start("codex", "/tmp", "hi", policy=self.policy, on_pid=got.append)
         self.assertEqual(got, [77])
 
+    def test_codex_start_follows_policy_mode(self):
+        self.control.start("codex", "/tmp", "hi", policy=self.policy)
+        self.assertEqual(self.codex.calls[0]["mode"], "trusted")
+
     def test_on_pid_not_forwarded_for_cursor(self):
         self.control.start("cursor", "/tmp", "hi", policy=self.policy, on_pid=lambda pid: None)
         self.assertNotIn("on_pid", self.cursor.calls[0])
