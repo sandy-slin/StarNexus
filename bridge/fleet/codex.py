@@ -120,10 +120,10 @@ _USER_NOISE_PREFIXES = (
 )
 _TEXT_PART_TYPES = ("input_text", "output_text", "text")
 
-# 手机上的档位 → `-c sandbox_mode=…`。用户 config.toml 常是 danger-full-access（本机就是），
-# 不压的话「只读」档从手机发进 Codex 等于全开。全授权 ⇒ 不覆盖，用用户自己的。
-# ⚠️ `-c` 覆盖是 `codex exec resume --help` 写明的用法，但没在真实会话上跑过。
-SANDBOX_BY_MODE = {"readonly": "read-only", "write": "workspace-write", "trusted": ""}
+# 手机上的档位 → `-c sandbox_mode=…`。明确给 trusted 一个工作区写入边界，
+# 避免依赖用户 Codex 配置，也避免无值时回退到只读。
+# `readonly` 只读；`write` / `trusted` 可写当前工作区，不能越过工作区边界。
+SANDBOX_BY_MODE = {"readonly": "read-only", "write": "workspace-write", "trusted": "workspace-write"}
 
 WHY_NOT_SEND_APP ="它正开在 Codex App 里，现在从手机发会失败。请在 App 里接着聊。"
 WHY_NOT_SEND_TERMINAL = "它正开在电脑的终端里，现在从手机发会失败。等那边关掉这个会话再发。"
@@ -881,7 +881,7 @@ class CodexAdapter(Adapter):
         if not cwd or not os.path.isdir(cwd):
             return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
         codex = self._codex()
-        sandbox = SANDBOX_BY_MODE.get(mode or "readonly", SANDBOX_BY_MODE["readonly"]) or SANDBOX_BY_MODE["readonly"]
+        sandbox = SANDBOX_BY_MODE.get(mode or "trusted", SANDBOX_BY_MODE["trusted"])
         argv = [codex, "exec", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"']
         if model:
             if not safe_model_name(model):

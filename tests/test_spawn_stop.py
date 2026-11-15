@@ -40,6 +40,7 @@ class ControlOnPidTest(unittest.TestCase):
         self.control.start("codex", "/tmp", "hi", policy=self.policy)
         self.assertEqual(self.codex.calls[0]["mode"], "trusted")
 
+
     def test_on_pid_not_forwarded_for_cursor(self):
         self.control.start("cursor", "/tmp", "hi", policy=self.policy, on_pid=lambda pid: None)
         self.assertNotIn("on_pid", self.cursor.calls[0])
@@ -48,6 +49,16 @@ class ControlOnPidTest(unittest.TestCase):
         res = self.control.signal_spawned("codex", 77)
         self.assertTrue(res.ok)
         self.assertFalse(self.control.signal_spawned("nope", 77).ok)
+
+
+class CodexSandboxModeTest(unittest.TestCase):
+    def test_trusted_is_workspace_write(self):
+        from bridge.fleet.codex import SANDBOX_BY_MODE
+
+        self.assertEqual(SANDBOX_BY_MODE["trusted"], "workspace-write")
+        self.assertEqual(SANDBOX_BY_MODE["write"], "workspace-write")
+        self.assertEqual(SANDBOX_BY_MODE["readonly"], "read-only")
+
 
 
 if __name__ == "__main__":
