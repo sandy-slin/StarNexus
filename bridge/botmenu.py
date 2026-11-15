@@ -79,6 +79,8 @@
 
 from __future__ import annotations
 
+import time
+
 # event_key 上限 30 字符。值直接用"等价的用户输入"，这样分派走现成的命令/消息流程，
 # 不新开一条处理路径 —— 新路径就是新的绕过闸门的机会。
 # 🔴 一共只能有 10 个节点（父 + 子拍平后算）。改之前先读文件头那段实测。
@@ -324,6 +326,17 @@ def validate_tree() -> list[str]:
 _BASE = "https://open.feishu.cn/open-apis"
 MENU_EVENT = "application.bot.menu_v6"
 CARD_CALLBACK = "card.action.trigger"
+
+
+def version_for_time(timestamp: float | None = None) -> str:
+    """Return a Feishu-compatible X.Y.Z version for the local clock.
+
+    Feishu accepts numeric SemVer components; ``%H%M%S`` can start with zero
+    during the first ten minutes of an hour, which made the old version invalid.
+    """
+    stamp = time.localtime(timestamp) if timestamp is not None else time.localtime()
+    third = int(time.strftime("%H%M%S", stamp))
+    return f"1.{time.strftime('%Y%m%d', stamp)}.{third}"
 
 
 def _reg():
@@ -672,7 +685,7 @@ if __name__ == "__main__":  # pragma: no cover - 安装器入口
         raise SystemExit(2)
     with open(sys.argv[1], "rb") as handle:
         feishu = tomllib.load(handle).get("feishu", {})
-    _version = time.strftime("1.%Y%m%d.%H%M%S")
+    _version = version_for_time()
     _lines: list[str] = []
     for line in setup(
         feishu.get("app_id", ""),

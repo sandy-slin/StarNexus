@@ -258,7 +258,7 @@ class MenuHeal:
         if is_done(self.state_path, self.app_id):
             self._done = True
             return True
-        version = time.strftime("1.%Y%m%d.%H%M%S", time.localtime(self._clock()))
+        version = bm.version_for_time(self._clock())
         # 措辞不再写「装机时没配上」：菜单改了形状（指纹变了）也走这里，那时装机是好的。
         pub = bm.publish(self.app_id, token, version, "补上或更新常驻菜单", http=call)
         if pub.get("code"):
