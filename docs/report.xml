@@ -1,5 +1,5 @@
 <title>Her Remote · MacBook pro2 远程控制开发报告（2026-11-15）</title>
-<callout emoji="📌" background-color="light-blue"><p>结论：本机已运行 Her Remote，飞书机器人「Her remote · MacBook pro2」可控制本机 Claude 和 Codex。新增三项能力：新建会话（可选模型）、绑定群推送重要进展、CEO 编排（独立功能）。自动化测试 58 条全部通过，飞书端到端实测通过。红色字为需要林森事后关注的事项。Cursor 已按要求移出范围。</p></callout>
+<callout emoji="📌" background-color="light-blue"><p>结论：本机已运行 Her Remote，飞书机器人「Her remote · MacBook pro2」可控制本机 Claude 和 Codex。新增三项能力：新建会话（可选模型）、绑定群推送重要进展、CEO 编排（独立功能）。自动化测试 64 条全部通过，飞书端到端实测通过。红色字为需要林森事后关注的事项。Cursor 已按要求移出范围。</p></callout>
 <h1 seq="auto">两个安装文件哪个新</h1>
 <p>较新的是 feishu-agent-mac-20261113-e9dd47bc-dirty-1038f472.command：导入时间更晚，且与本机正在运行的版本号一致。本机代码已用 git 管理，仓库在 /Users/LinSen/work/remote_control（未推送到远端）。</p>
 <h1 seq="auto">整体架构</h1>
@@ -26,9 +26,9 @@
 <li>已绑定会话的群不能再设为 CEO 群，避免与原功能冲突。</li>
 </ol>
 <h1 seq="auto">测试结果</h1>
-<h2 seq="auto">自动化测试：58 条全部通过</h2>
+<h2 seq="auto">自动化测试：64 条全部通过</h2>
 <table><thead><tr><th background-color="light-gray"><p>测试文件</p></th><th background-color="light-gray"><p>条数</p></th><th background-color="light-gray"><p>覆盖内容</p></th></tr></thead><tbody>
-<tr><td><p>test_ceo</p></td><td><p>19</p></td><td><p>拆分、分派、复盘、拍板、轮数上限、持久化与中断恢复</p></td></tr>
+<tr><td><p>test_ceo</p></td><td><p>25</p></td><td><p>拆分、分派、复盘、拍板、轮数上限、持久化与中断恢复；异常复核结果（未知决定、坏格式追加指令、轮数上限时请人拍板后继续）</p></td></tr>
 <tr><td><p>test_ceo_wiring</p></td><td><p>12</p></td><td><p>CEO 命令接入、群内文字路由、与已绑定群互斥</p></td></tr>
 <tr><td><p>test_grouppush</p></td><td><p>13</p></td><td><p>需要人介入/做完/失败三类推送、去重、限流</p></td></tr>
 <tr><td><p>test_grouppush_wiring</p></td><td><p>4</p></td><td><p>推送接入服务主流程、群内发起不重复推</p></td></tr>
@@ -59,8 +59,12 @@
 <tr><td><p>点总览卡片「➕ 新建会话」、选择卡片「Codex」按钮</p></td><td><p><span text-color="red">屏幕操作点击后电脑端没有收到点击（同一页面的「退出对话」按钮能点中）。同一功能用输入命令已走通，按钮处理逻辑有自动化测试覆盖；建议林森在手机上点一次确认</span></p></td></tr>
 <tr><td><p>CEO 群输入「/ceo 状态」（群「CEO 编排测试」）</p></td><td><p>通过（11:38）：弹出 CEO 状态卡片，显示 2 个子任务和「已叫停 · 第 0 轮」</p></td></tr>
 <tr><td><p>绑定群推送的屏幕查看</p></td><td><p>通过：消息列表可见 11:28「Codex · her remote」群收到「做完一轮」推送、07:28「群推送测试」群收到「在等你处理」推送</p></td></tr>
-<tr><td><p>屏幕上在 CEO 群新派一个任务</p></td><td><p><span text-color="red">未做：11:45 林森正在使用飞书，为避免误发停止屏幕操作。CEO 拆任务、人来拍板、汇总结果、叫停已用真实飞书消息端到端测过</span></p></td></tr>
+<tr><td><p>屏幕上在 CEO 群新派一个任务</p></td><td><p>通过（11:47）：屏幕粘贴「/ceo 只读：用一个 Codex 会话数一下 tests 目录下有几个 .py 文件」，CEO 拆成 1 个 Codex 子任务，11:48 交付「8 个文件」及文件名，与实际一致</p></td></tr>
 </tbody></table>
+<h2 seq="auto">11-15 晚间加固（CEO 复核）</h2>
+<ul>
+<li>CEO 用会话评审自身测试缺口，发现复核结果异常时可能绕过轮数上限。已修：未知决定按「有追加指令则继续、否则交付」处理并受轮数上限约束；追加指令编号容错；交付时使用正式报告；修复「到上限后人拍板再继续」时的卡死。新增 6 条测试，19:01 部署后再次真实派任务验证通过（统计 bridge/fleet 共 18 个 .py，与实际一致）。</li>
+</ul>
 <h1 seq="auto">关键决策</h1>
 <ul>
 <li>新功能都做成独立模块，原有功能代码只加接入点，互不影响。</li>
