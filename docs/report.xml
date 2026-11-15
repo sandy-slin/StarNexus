@@ -47,7 +47,17 @@
 <tr><td><p>绑定群「做完一轮」推送</p></td><td><p>通过，附最后回复</p></td></tr>
 <tr><td><p>群内转发对话与权限确认</p></td><td><p>通过，且该轮未重复推送</p></td></tr>
 <tr><td><p>「需要人介入」推送</p></td><td><p>通过（07:28）：本机 Claude 会话卡在写文件确认，约 20 秒后绑定群收到「🟡 在等你处理，它卡在：Write …」；测试后已取消该操作，未写入文件</p></td></tr>
-<tr><td><p>通过屏幕操作飞书界面测试</p></td><td><p><span text-color="red">未完成：电脑处于锁屏，无法操作屏幕。以上实测均用林森身份发送真实飞书消息完成</span></p></td></tr>
+</tbody></table>
+<h2 seq="auto">屏幕操作飞书界面实测（11-15，私聊 Her remote · MacBook pro2）</h2>
+<table><thead><tr><th background-color="light-gray"><p>场景</p></th><th background-color="light-gray"><p>结果</p></th></tr></thead><tbody>
+<tr><td><p>输入 /newsession codex remote_control luna，再发第一句话</p></td><td><p>通过（11:11）：Codex 回复「UI-CODEX-OK remote_control」，模型 gpt-6-luna，只读</p></td></tr>
+<tr><td><p>点卡片「🚪 退出对话」（Codex）</p></td><td><p>通过（11:13）：回复「好，退出了…」</p></td></tr>
+<tr><td><p>输入 /newsession claude remote_control haiku，再发第一句话</p></td><td><p>通过（11:15）：Claude 回复「UI-CLAUDE-OK remote_control」，模型 claude-haiku-5-5</p></td></tr>
+<tr><td><p>点卡片「🚪 退出对话」（Claude）</p></td><td><p>通过（11:16）</p></td></tr>
+<tr><td><p>点底部菜单「🖥 会话」</p></td><td><p>通过（11:16）：弹出「🖥 电脑上的会话」总览，两个新会话都在列表里</p></td></tr>
+<tr><td><p>输入「新建会话」</p></td><td><p>通过（11:18）：弹出选择卡片（Claude / Codex / 不建了）</p></td></tr>
+<tr><td><p>点总览卡片「➕ 新建会话」、选择卡片「Codex」按钮</p></td><td><p><span text-color="red">屏幕操作点击后电脑端没有收到点击（同一页面的「退出对话」按钮能点中）。同一功能用输入命令已走通，按钮处理逻辑有自动化测试覆盖；建议林森在手机上点一次确认</span></p></td></tr>
+<tr><td><p>CEO 群、绑定群推送的屏幕查看</p></td><td><p><span text-color="red">待补：11:20 后电脑截屏再次报「音频/视频捕捉失败」（屏幕未锁）。这两项已用真实飞书消息实测通过（见上表）</span></p></td></tr>
 </tbody></table>
 <h1 seq="auto">关键决策</h1>
 <ul>
@@ -66,6 +76,6 @@
 <li><span text-color="red">留有测试用的群和会话：「CEO 编排测试」「群推送测试」及若干探测会话，可自行清理。</span></li>
 <li><span text-color="red">把已有群绑定到会话目前没有界面入口，本次是改配置文件完成的。</span></li>
 <li><span text-color="red">早先部分模型曾返回网关 403，如遇模型不可用可换别名。</span></li>
-<li><span text-color="red">屏幕操作的飞书界面测试待电脑解锁后补做（电脑一直锁屏）；其余实测已用林森身份的真实飞书消息完成。</span></li>
+<li><span text-color="red">屏幕操作实测：新建会话、退出对话、会话总览、打字新建已通过；卡片上「新建会话」「Codex」按钮屏幕操作点不中，请在手机上点一次确认；电脑截屏服务不稳定（锁屏或截屏失败时无法操作）。</span></li>
 </ul>
 
