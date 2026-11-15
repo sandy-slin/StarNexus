@@ -145,6 +145,72 @@ class CeoTest(unittest.TestCase):
         self.assertEqual({s["tool"]: s["state"] for s in subs}, {"claude": "done", "codex": "failed"})
         self.assertIn("没做成", brain.prompts[-1])
 
+    def test_unknown_decision_with_followups_respects_round_limit(self):
+        control = FakeControl()
+        loop = {"summary": "再来", "decision": "wait", "followups": [{"n": 2, "instruction": "再看"}]}
+        brain = FakeBrain(PLAN, [loop] * 10)
+        o = self.orch(brain, control)
+        _, mid = o.start("oc_ceo", "做个功能")
+        m = o.store.missions[mid]
+        self.assertEqual(m["state"], "done")
+        self.assertEqual(m["round"], ceo.MAX_ROUNDS)
+        self.assertEqual(len(control.sends), ceo.MAX_ROUNDS - 1)
+
+    def test_unknown_decision_without_followups_delivers_report(self):
+        brain = FakeBrain(PLAN, [{"summary": "摘要", "decision": None, "report": "正式报告"}])
+        o = self.orch(brain, FakeControl())
+        _, mid = o.start("oc_ceo", "做个功能")
+        m = o.store.missions[mid]
+        self.assertEqual(m["state"], "done")
+        self.assertEqual(m["report"], "正式报告")
+        self.assertIn("交付", [e[1] for e in m["events"]])
+
+    def test_followups_tolerate_bad_entries(self):
+        control = FakeControl()
+        brain = FakeBrain(PLAN, [
+            {"summary": "改", "decision": "continue",
+             "followups": [None, "x", {"n": "1", "instruction": "按评审修"}, {"n": 9, "instruction": "无"},
+                           {"n": 2, "instruction": "  "}]},
+            {"summary": "好了", "decision": "finish", "report": "交付"},
+        ])
+        o = self.orch(brain, control)
+        _, mid = o.start("oc_ceo", "做个功能")
+        self.assertEqual(o.store.missions[mid]["state"], "done")
+        self.assertEqual([(t, x) for t, _, x, _ in control.sends], [("claude", "按评审修")])
+
+    def test_continue_without_followups_uses_report(self):
+        brain = FakeBrain(PLAN, [{"summary": "摘要", "decision": "continue", "followups": [], "report": "正式报告"}])
+        o = self.orch(brain, FakeControl())
+        _, mid = o.start("oc_ceo", "做个功能")
+        m = o.store.missions[mid]
+        self.assertEqual(m["report"], "正式报告")
+        self.assertIn("正式报告", self.texts())
+        self.assertIn("交付", [e[1] for e in m["events"]])
+
+    def test_question_at_round_limit_asks_human_and_extends_limit(self):
+        control = FakeControl()
+        loop = {"summary": "再来", "decision": "continue", "followups": [{"n": 2, "instruction": "再看"}]}
+        last = {"summary": "要取舍", "decision": "continue", "question": "A 还是 B？",
+                "followups": [{"n": 2, "instruction": "再看"}]}
+        brain = FakeBrain(PLAN, [loop] * (ceo.MAX_ROUNDS - 1) + [last])
+        o = self.orch(brain, control)
+        _, mid = o.start("oc_ceo", "做个功能")
+        m = o.store.missions[mid]
+        self.assertEqual(m["state"], "waiting_human")
+        self.assertEqual(m["round"], ceo.MAX_ROUNDS)
+        brain.reviews = [loop, {"summary": "好了", "decision": "finish", "report": "按 A 交付"}]
+        self.assertTrue(o.handle_text("oc_ceo", "选 A"))
+        self.assertEqual(m["limit"], ceo.MAX_ROUNDS * 2)
+        self.assertEqual(m["state"], "done")
+        self.assertEqual(m["round"], ceo.MAX_ROUNDS + 2)
+        self.assertIn("按 A 交付", self.texts())
+
+    def test_blank_text_ignored(self):
+        o = self.orch(FakeBrain(PLAN, []), FakeControl())
+        o.store.ceo_chats = getattr(o.store, "ceo_chats", None)
+        self.assertFalse(o.handle_text("oc_ceo", ""))
+        self.assertFalse(o.handle_text("oc_ceo", "   "))
+
     def test_plan_failure(self):
         o = self.orch(FakeBrain(ceo.BrainError("超时"), []), FakeControl())
         _, mid = o.start("oc_ceo", "做个功能")

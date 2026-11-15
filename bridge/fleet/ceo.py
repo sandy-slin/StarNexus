@@ -308,6 +308,7 @@ class Orchestrator:
         text = str(text or "").strip()
         if not text or not self.is_ceo_chat(chat_id):
             return False
+        resume = None
         with self.store.lock:
             m = self.store.active(chat_id)
             if m is None:
@@ -320,15 +321,16 @@ class Orchestrator:
                     m["limit"] = m["round"] + MAX_ROUNDS
                 self._event(m, "董事长答复")
                 self.store.save()
-                mid = m["id"]
-                self.say(chat_id, "👌 收到你的决定，CEO 接着安排。")
-                self.spawn(lambda: self._safe_run(mid))
-                return True
+                resume = m["id"]
             else:
                 m["human"].append(text)
                 self.store.save()
                 self.say(chat_id, "📝 记下了，CEO 下一次复核时会带上这句。")
                 return True
+        if resume is not None:
+            self.say(chat_id, "👌 收到你的决定，CEO 接着安排。")
+            self.spawn(lambda: self._safe_run(resume))
+            return True
         ok, msg = self.start(chat_id, text)
         if not ok:
             self.say(chat_id, msg)
@@ -462,6 +464,8 @@ class Orchestrator:
                 return
             decision = review.get("decision")
             summary = _clip(review.get("summary"), 800)
+            if decision not in ("continue", "ask_human", "finish"):
+                decision = "continue" if review.get("followups") else "finish"
             if decision == "continue" and m["round"] >= m["limit"]:
                 decision = "finish" if not review.get("question") else "ask_human"
             if decision == "ask_human":
@@ -487,8 +491,14 @@ class Orchestrator:
             followups = review.get("followups") or []
             picked = 0
             with self.store.lock:
-                for f in followups:
-                    sub = next((s for s in m["subtasks"] if s["n"] == f.get("n")), None)
+                for f in followups if isinstance(followups, list) else []:
+                    if not isinstance(f, dict):
+                        continue
+                    try:
+                        n = int(f.get("n"))
+                    except (TypeError, ValueError):
+                        continue
+                    sub = next((s for s in m["subtasks"] if s["n"] == n), None)
                     instr = str(f.get("instruction") or "").strip()
                     if sub is None or not instr:
                         continue
@@ -498,11 +508,14 @@ class Orchestrator:
                 self._event(m, f"第 {m['round']} 轮追加 {picked} 条指令")
                 self.store.save()
             if not picked:
+                report = _clip(review.get("report") or summary, REPORT_CHARS)
                 with self.store.lock:
                     m["state"] = "done"
-                    m["report"] = summary
+                    m["report"] = report
+                    self._event(m, "交付")
                     self.store.save()
-                self.say(chat, f"🏁 **CEO 交付总结果**\n\n{summary}\n\n" + self._roster(m))
+                self.say(chat, f"🏁 **CEO 交付总结果**：{short(m['goal'], 60)}\n\n{report}\n\n"
+                               + self._roster(m))
                 return
             self.say(chat, f"🧭 **CEO 第 {m['round']} 轮复核**\n{summary}\n继续给 {picked} 个子任务追加指令。")
 
