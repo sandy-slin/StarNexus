@@ -599,6 +599,59 @@ def rename_group(binds: ChatBinds, client: Any, bound: Bound, title: str = "",
     return RenameResult(RENAMED, want)
 
 
+def sn_prefixed(name: str) -> str:
+    """旧群名补上 `SN·` 前缀（FC-15）。`Codex · 修登录` ⇒ `SN·Codex·修登录`；已经有前缀的原样返回。"""
+    raw = str(name or "").strip()
+    if raw.startswith(GROUP_PREFIX_SN + "·"):
+        return raw
+    parts = [p.strip() for p in raw.split("·") if p.strip()]
+    return short_title("·".join([GROUP_PREFIX_SN] + (parts or [raw])), MAX_NAME_CHARS)
+
+
+def migrate_sn_prefix(binds: ChatBinds, client: Any) -> list:
+    """给还没有 `SN·` 前缀的会话群补上前缀，飞书里搜「SN·」能列出全部会话群（FC-15）。
+
+    和 `rename_group` 同一条底线：只改**我们起的、没人动过**的群名（飞书上的现名 == 记下的名字）；
+    读不出现名、主人自己改过的一律不碰。可以反复跑：有前缀的跳过。返回 [(chat_id, 结果, 新名)]。
+    """
+    getter = getattr(client, "name_of", None)
+    setter = getattr(client, "rename", None)
+    if getter is None or setter is None:
+        return []
+    out: list = []
+    for bound in binds.all():
+        if not getattr(bound, "on", True) or not bound.name:
+            continue
+        if bound.name.startswith(GROUP_PREFIX_SN + "·"):
+            continue
+        try:
+            current, _code, _msg = getter(bound.chat_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("前缀迁移 读群名失败 chat=%s", str(bound.chat_id)[:12])
+            out.append((bound.chat_id, NO_RENAME, ""))
+            continue
+        if not current:
+            out.append((bound.chat_id, NO_RENAME, ""))
+            continue
+        if _clean_name(current) != _clean_name(bound.name):
+            out.append((bound.chat_id, KEPT_OWN, current))
+            continue
+        want = sn_prefixed(current)
+        try:
+            ok, code, msg = setter(bound.chat_id, want)
+        except Exception:  # noqa: BLE001
+            logger.exception("前缀迁移 改群名失败 chat=%s", str(bound.chat_id)[:12])
+            out.append((bound.chat_id, NO_RENAME, current))
+            continue
+        if not ok:
+            logger.info("前缀迁移 没改成 code=%s msg=%s", code, str(msg)[:80])
+            out.append((bound.chat_id, NO_RENAME, current))
+            continue
+        binds.set_name(bound.chat_id, want)
+        out.append((bound.chat_id, RENAMED, want))
+    return out
+
+
 def _group_alive(client: Any, chat_id: str) -> bool:
     """群还在吗。查不出来 ⇒ **当它还在**（宁可少建一个，也别每次读失败都多一个群）。"""
     checker = getattr(client, "exists", None)

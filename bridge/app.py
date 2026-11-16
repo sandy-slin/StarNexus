@@ -6167,6 +6167,8 @@ class Bridge:
         threading.Thread(target=self._notify_waiting_loop, daemon=True, name="notify-waiting").start()
         # 常驻菜单自愈（第 12 轮）：启动 1 分钟后查标记，没配好就写 + 发版；成功就退出线程。
         threading.Thread(target=self._menu_heal_loop, daemon=True, name="menu-heal").start()
+        # FC-15：旧会话群补上 `SN·` 前缀，飞书里搜「SN·」能列出全部会话群。只改我们起的、没人动过的群名。
+        threading.Thread(target=self._migrate_group_prefix, daemon=True, name="sn-prefix").start()
         threading.Thread(target=self._selfupdate_loop, daemon=True, name="selfupdate").start()
         # 第 32 轮：上次被重启打断的那一轮，等长连接连上后接着做（`bridge/inflight.py`）。
         # 钩子上面已经装好；连上之前不续 —— 续了也发不出「我让它接着做」和结果。
@@ -6404,6 +6406,20 @@ class Bridge:
             self._say(chat_id, "重启后接着做的时候出错了。要继续就直接说一句，或者重新发一次你的要求。")
 
     # ---------- 会话进入「等你」⇒ 主动推卡（第 7 轮，判断在 bridge/fleet/notify.py） ----------
+
+    def _migrate_group_prefix(self) -> None:
+        binds = getattr(self, "chat_binds", None)
+        client = getattr(self, "group_client", None)
+        if binds is None or client is None:
+            return
+        try:
+            from .fleet.chatbind import RENAMED, migrate_sn_prefix
+
+            results = migrate_sn_prefix(binds, client)
+            done = [r for r in results if r[1] == RENAMED]
+            logger.info("群名前缀 SN· 迁移：改了 %d 个 / 看了 %d 个", len(done), len(results))
+        except Exception:  # noqa: BLE001 —— 改群名失败不影响别的
+            logger.exception("群名前缀 SN· 迁移失败，下次启动再试")
 
     def _menu_heal_loop(self) -> None:
         """跑在自己的 daemon 线程里。节奏、标记、失败不发版都在 bridge/menu_heal.py。"""
