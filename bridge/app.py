@@ -332,7 +332,9 @@ class _FleetWaitCard:
         self._progress = progress
         self._chat_id = chat_id
         self._label = label
-        self._can_stop = bool(can_stop)
+        # 可以是布尔，也可以是函数：发之前会话闲着（停不了），桥起了 exec resume 之后就能停，
+        # 所以每次刷新都现问一次，别用发之前那张快照
+        self._can_stop = can_stop
         self._first_delay = max(float(first_delay or 0), 0.0)
         self._escalate_sec = max(float(escalate_sec or 0), 0.0)
         self._limit_sec = max(float(limit_sec or 0), 0.0)  # 最多等多久（到点就不再等、也不补推）
@@ -342,6 +344,14 @@ class _FleetWaitCard:
         self._started = time.monotonic()
         self._stage = "sent"
         self._opened = False
+
+    def _stoppable(self) -> bool:
+        if callable(self._can_stop):
+            try:
+                return bool(self._can_stop())
+            except Exception:  # noqa: BLE001 —— 判不出就不放按钮
+                return False
+        return bool(self._can_stop)
 
     def _stage_line(self) -> str:
         """§5.2 发送三步，一行写清走到哪了：✅ 走过的，⏳ 正在等的，⚪ 还没到的，✍️ 正在回。"""
@@ -381,9 +391,10 @@ class _FleetWaitCard:
         return text
 
     async def _show(self, text: str, with_stop: bool) -> None:
-        if self._broken or text == self._last_text:
+        key = text + ("\x00stop" if with_stop else "")
+        if self._broken or key == self._last_text:
             return
-        self._last_text = text
+        self._last_text = key
         try:
             if self._message_id is None:
                 self._message_id = await asyncio.to_thread(
@@ -402,7 +413,7 @@ class _FleetWaitCard:
         """§5.2：一发出就贴这张卡（代替原来那句「📨 发给…了，等它回…」），之后三步都改这一张。
         发不出去返回 False，调用方照旧发那句文字。"""
         self._opened = True
-        await self._show(self._render(0), self._can_stop)
+        await self._show(self._render(0), self._stoppable())
         if self._message_id is None:
             self._opened = False
             self._broken = getattr(self._replier, "send_status_card", None) is None
@@ -425,7 +436,7 @@ class _FleetWaitCard:
                 except Exception:  # noqa: BLE001 —— 进展读坏了只少几行
                     logger.debug("读这一轮进展失败", exc_info=True)
             elapsed = int(time.monotonic() - self._started)
-            await self._show(self._render(elapsed, extra), self._can_stop)
+            await self._show(self._render(elapsed, extra), self._stoppable())
             early = self._opened and elapsed < self._first_delay
             try:
                 await asyncio.wait_for(stop.wait(), timeout=_STAGE_POLL_SEC if early else _STATUS_REFRESH_SEC)
@@ -3322,7 +3333,8 @@ class Bridge:
         settings = getattr(self, "settings", None)
         wait_card = _FleetWaitCard(
             self.replier, chat_id, target.label,
-            can_stop=bool(getattr(known, "can_stop", False)),
+            can_stop=lambda: bool(getattr(known, "can_stop", False)) or self._fleet_stoppable(
+                control, target.tool, target.id),
             first_delay=getattr(settings, "progress_first_notice_sec", 90),
             escalate_sec=getattr(settings, "progress_escalate_sec", 0),
             limit_sec=float(getattr(policy, "turn_timeout_sec", 600) or 600),
@@ -6139,6 +6151,17 @@ class Bridge:
             return
         self._say_later(chat_id, "服务刚重启过，我还认不出这个聊天。在这里先发一句「会话」，再点刚才那个按钮就行。")
 
+    @staticmethod
+    def _fleet_stoppable(control, tool: str, sid: str) -> bool:
+        """桥自己正给这个会话跑着进程 ⇒ 能停（FC-11）。"""
+        method = getattr(control, "stoppable", None)
+        if method is None:
+            return False
+        try:
+            return bool(method(tool, sid))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _talk_buttons(self, tool: str, sid: str) -> list:
         """对话模式里每条回复下面那排：[退出对话] [停下]（能停才放）[换个会话]。"""
         from .fleet.actions import do_button
@@ -6151,7 +6174,7 @@ class Bridge:
                 sess = control.cached(tool, sid)
             except Exception:  # noqa: BLE001
                 sess = None
-        if sess is not None and getattr(sess, "can_stop", False):
+        if (sess is not None and getattr(sess, "can_stop", False)) or self._fleet_stoppable(control, tool, sid):
             buttons.append(do_button("stop"))
         buttons.append(do_button("sessions", "🔀 换个会话"))
         return buttons

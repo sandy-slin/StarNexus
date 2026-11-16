@@ -184,3 +184,62 @@ class SendStageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WaitCardStopTest(unittest.TestCase):
+    def test_stop_button_appears_once_bridge_owns_the_turn(self):
+        stops = []
+
+        class Rec(FakeReplier):
+            def send_status_card(self, chat_id, text, with_stop=True):
+                stops.append(with_stop)
+                return super().send_status_card(chat_id, text, with_stop)
+
+            def patch_status_card(self, mid, text, with_stop=True):
+                stops.append(with_stop)
+                return super().patch_status_card(mid, text, with_stop)
+
+        owned = {"yes": False}
+        card = app_mod._FleetWaitCard(Rec(), "oc", "Codex", can_stop=lambda: owned["yes"], first_delay=90)
+
+        async def go():
+            original = app_mod._STAGE_POLL_SEC
+            app_mod._STAGE_POLL_SEC = 0.01
+            try:
+                await card.open()
+                owned["yes"] = True
+                stop = asyncio.Event()
+                task = asyncio.create_task(card.run(stop))
+                await asyncio.sleep(0.05)
+                stop.set()
+                await task
+            finally:
+                app_mod._STAGE_POLL_SEC = original
+
+        asyncio.run(go())
+        self.assertFalse(stops[0])
+        self.assertTrue(stops[-1])
+
+    def test_control_stoppable_follows_bridge_jobs(self):
+        from bridge.fleet.control import FleetControl
+        from bridge.fleet.model import FleetJobs
+
+        jobs = FleetJobs()
+
+        class Adapter:
+            pass
+
+        adapter = Adapter()
+        adapter.jobs = jobs
+
+        class Fleet:
+            def adapter(self, tool):
+                return adapter
+
+        control = FleetControl.__new__(FleetControl)
+        control.fleet = Fleet()
+        sid = "01a1df76-0000-7000-8000-000000000000"
+        self.assertFalse(control.stoppable("codex", sid))
+        import os
+        jobs.register_spawned(os.getpid(), "codex", sid)
+        self.assertTrue(control.stoppable("codex", sid))

@@ -115,6 +115,15 @@ class FleetControl:
         with self._lock:
             return self._known.get((tool, sid))
 
+    def stoppable(self, tool: str, sid: str) -> bool:
+        """桥自己给这个会话起的进程还在 ⇒ 停得了（不看发之前那张快照）。"""
+        adapter = self.fleet.adapter(tool)
+        jobs = getattr(adapter, "jobs", None)
+        if jobs is None or not sid:
+            return False
+        key = str(sid)
+        return bool(jobs.jobs(tool=tool, session_id=key) or jobs.jobs(tool=tool, session_id=key.lower()))
+
     def _remember(self, sess: Session) -> None:
         with self._lock:
             self._known[sess.key] = sess
