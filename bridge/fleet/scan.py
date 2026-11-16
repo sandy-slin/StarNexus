@@ -20,7 +20,7 @@ from .model import Session, friendly_error
 
 logger = logging.getLogger("feishu-bridge.fleet")
 
-TOOL_LABELS = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor"}
+TOOL_LABELS = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor", "opencode": "opencode"}
 DEFAULT_TIMEOUT_SEC = 1.2  # 本机实测三家各自 50~270ms；留余量但总览要 < 1.5 秒
 # 每家读多少个历史会话（在跑 / 等你的另算，全读）。第 28 轮从 6 提到 30：总览「还有 N 个，点开看全部」
 # 要真能列出来，读 6 个时 Codex / Cursor 那组点开也只有 6 行。本机实测三家读 30 个各 70~200ms，

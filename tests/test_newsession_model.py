@@ -13,7 +13,7 @@ from bridge.workspace import Outcome, create_missing_workspace
 class PickModelTest(unittest.TestCase):
     def test_short_command_and_visible_tools(self):
         self.assertIn("/ns", COMMANDS)
-        self.assertEqual(START_TOOLS, ("claude", "codex"))
+        self.assertEqual(START_TOOLS, ("claude", "codex", "opencode"))
 
     def test_aliases(self):
         self.assertEqual(pick_model("claude", "opus"), "claude-opus-5-5")

@@ -21,8 +21,8 @@ from typing import Callable, Optional
 
 logger = logging.getLogger("feishu-bridge.catalog")
 
-TOOLS = ("claude", "codex")
-LABELS = {"claude": "Claude", "codex": "Codex"}
+TOOLS = ("claude", "codex", "opencode")
+LABELS = {"claude": "Claude", "codex": "Codex", "opencode": "opencode"}
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORTS = ("low", "medium", "high", "xhigh")
 EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "很高", "max": "最高", "ultra": "极限",
@@ -30,6 +30,8 @@ EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "很高"
 FALLBACK = {
     "claude": ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-opus-5"),
     "codex": ("gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-5.5"),
+    # opencode 的模型是 `provider/model` 全名，列表由它自己的 `opencode models` 给；这里只放两三个常见的兜底。
+    "opencode": ("cpa-gui/gpt-5.6-luna",),
 }
 MAX_LIST = 12
 CACHE_SEC = 60.0
@@ -91,6 +93,8 @@ class Catalog:
         got = self.info(tool, name) if name else None
         if got is not None:
             return got.efforts
+        if tool == "opencode":
+            return ()
         return CLAUDE_EFFORTS if tool == "claude" else DEFAULT_EFFORTS
 
     def has(self, tool: str, name: str) -> bool:
@@ -101,7 +105,33 @@ class Catalog:
             return self._read_claude()
         if tool == "codex":
             return self._read_codex()
+        if tool == "opencode":
+            return self._read_opencode()
         return ()
+
+    def _read_opencode(self) -> tuple:
+        """opencode 的模型：`~/.config/opencode/opencode.json` 的 provider.*.models（provider/model 全名）。
+
+        默认用的那个（`fleet/opencode.DEFAULT_MODEL`，实测快的）排第一；opencode 没有 effort。
+        """
+        path = os.path.expanduser("~/.config/opencode/opencode.json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        names: list = []
+        for provider, body in ((data.get("provider") or {}) if isinstance(data, dict) else {}).items():
+            for model in ((body or {}).get("models") or {}) if isinstance(body, dict) else {}:
+                full = f"{provider}/{model}"
+                if safe_name(full):
+                    names.append(full)
+        try:
+            from .opencode import DEFAULT_MODEL
+        except Exception:  # noqa: BLE001
+            DEFAULT_MODEL = ""
+        if DEFAULT_MODEL in names:
+            names.remove(DEFAULT_MODEL)
+        if DEFAULT_MODEL and safe_name(DEFAULT_MODEL):
+            names.insert(0, DEFAULT_MODEL)
+        return tuple(ModelInfo(n, ()) for n in names[:MAX_LIST])
 
     def _read_claude(self) -> tuple:
         with open(self._claude, encoding="utf-8") as handle:

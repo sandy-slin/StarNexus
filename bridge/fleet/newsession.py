@@ -38,8 +38,9 @@ INFLIGHT_ID = "(new)"
 COMMANDS = frozenset({"/newsession", "/ns", "/新建会话"})
 WORDS = frozenset({"新建会话", "新会话", "开新会话"})
 
-START_TOOLS = ("claude", "codex")
-TOOL_ALIASES = {"claude": "claude", "cc": "claude", "codex": "codex", "cx": "codex"}
+START_TOOLS = ("claude", "codex", "opencode")
+TOOL_ALIASES = {"claude": "claude", "cc": "claude", "codex": "codex", "cx": "codex", "opencode": "opencode",
+                "oc": "opencode"}
 MODEL_ALIASES = {
     "claude": {"sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5",
                "claude-sonnet-5-5": "claude-sonnet-5-5", "claude-opus-5-5": "claude-opus-5-5",
@@ -76,6 +77,7 @@ def model_hint(tool: str) -> str:
 TOOL_HINTS = {
     "claude": "和终端一样按当前权限干活",
     "codex": "和终端一样按当前权限干活",
+    "opencode": "第三个工具（试用）：按当前权限自动批准，模型用它自己的默认",
 }
 
 
@@ -191,16 +193,17 @@ def _card(title: str, elements: list) -> str:
     )
 
 
-def build_tool_card(cancel_button: dict) -> str:
-    """第一步：用哪个工具开。"""
+def build_tool_card(cancel_button: dict, tools: Optional[tuple] = None) -> str:
+    """第一步：用哪个工具开。`tools`：这台电脑上真接上了的（默认全部）。"""
     from .actions import button_rows
 
-    lines = [f"· **{TOOL_LABELS[t]}** — {TOOL_HINTS[t]}" for t in START_TOOLS]
+    shown = tuple(t for t in START_TOOLS if tools is None or t in tools)
+    lines = [f"· **{TOOL_LABELS[t]}** — {TOOL_HINTS[t]}" for t in shown]
     elements: list = [
         {"tag": "markdown", "content": "在电脑上新开一个会话，用哪个？\n" + "\n".join(lines)},
     ]
     elements.extend(button_rows([_button(TOOL_LABELS[t], tool_value(t), primary=(t == "claude"))
-                                 for t in START_TOOLS]))
+                                 for t in shown]))
     elements.extend(button_rows([cancel_button]))
     return _card("➕ 新建会话", elements)
 

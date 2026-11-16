@@ -2976,7 +2976,9 @@ class Bridge:
                 bound = binds.of_chat(chat_id)
             except Exception:  # noqa: BLE001
                 bound = None
-        if bound is None or bound.tool not in ("claude", "codex"):
+        from .fleet.model import can as _can
+
+        if bound is None or not _can(bound.tool, "start"):
             self._say(chat_id, "这个命令要在会话群里用：复制会话 /fork、归档 /archive、重命名 /rename 新名字。")
             return
         word = text.strip()
@@ -4391,7 +4393,7 @@ class Bridge:
             return True
         tool = TOOL_ALIASES.get(args[0].lower())
         if tool is None:
-            self._say(chat_id, "认不出要用哪个，能用的是 claude / codex。")
+            self._say(chat_id, "认不出要用哪个，能用的是 claude / codex / opencode。")
             return True
         if len(args) == 1:
             await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool)
@@ -4453,7 +4455,9 @@ class Bridge:
         from .fleet.newsession import build_tool_card
 
         sender = getattr(getattr(self, "replier", None), "send_card", None)
-        if sender is None or not sender(chat_id, build_tool_card(_do_button("newcancel"))):
+        control = getattr(self, "fleet", None)
+        tools = tuple(getattr(getattr(control, "fleet", None), "adapters", {}) or ()) or None
+        if sender is None or not sender(chat_id, build_tool_card(_do_button("newcancel"), tools)):
             self._say(chat_id, "选工具的卡片发不出去。也可以直接发：/newsession claude（或 codex）")
 
     def _send_new_dir_card(self, scope: str, chat_id: str, tool: str, model: str = "", effort: str = "") -> None:
@@ -5673,8 +5677,10 @@ class Bridge:
         """这一轮该用的模型 / effort：会话覆盖 > 工具默认 > 工具自己的配置。"""
         from .fleet.catalog import Choice
 
+        from .fleet.model import can
+
         mp = getattr(self, "model_prefs", None)
-        if mp is None or tool not in ("claude", "codex"):
+        if mp is None or not can(tool, "model"):
             return Choice()
         try:
             return mp.effective(tool, sid)
@@ -5691,7 +5697,9 @@ class Bridge:
             bound = binds.of_chat(chat_id)
         except Exception:  # noqa: BLE001
             return None
-        if bound is None or bound.tool not in ("claude", "codex"):
+        from .fleet.model import can
+
+        if bound is None or not can(bound.tool, "model"):
             return None
         return bound.tool, bound.id, bound.name or bound.tool
 

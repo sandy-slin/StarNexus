@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -265,7 +266,9 @@ class FleetControl:
             if method is None:
                 method = adapter.send
             mode = getattr(policy, "mode", "trusted") if policy is not None else "trusted"
-            extra = _model_kw(model, effort) if tool == "codex" else {}
+            from .model import can
+
+            extra = _model_kw(model, effort if can(tool, "effort") else "") if tool in ("codex", "opencode") else {}
             if tool == "codex" and approval_dir:
                 extra["approval_dir"] = approval_dir
             return method(sid, text, timeout=timeout, mode=mode, **extra)
@@ -291,10 +294,12 @@ class FleetControl:
         if not resolved:
             return ActionResult(False, WHY_OUTSIDE_WORKSPACE, "")
         try:
-            extra = _model_kw(model, effort) if tool in ("claude", "codex") else {}
-            if on_pid is not None and tool in ("claude", "codex"):
+            from .model import can
+
+            extra = _model_kw(model, effort if can(tool, "effort") else "") if can(tool, "model") else {}
+            if on_pid is not None and can(tool, "start"):
                 extra["on_pid"] = on_pid
-            if fork_from and tool in ("claude", "codex"):
+            if fork_from and can(tool, "fork"):
                 extra["fork_from"] = fork_from
             if tool == "claude":
                 result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
@@ -396,6 +401,13 @@ def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings:
     }
     # 2026-11-16 林森决定：Cursor 移出目标（首批只做 Claude 和 Codex）。代码保留，默认不进总览；
     # 要临时看 Cursor 会话就在服务环境里设 CARHER_FLEET_CURSOR=1。
+    try:
+        from .opencode import OpencodeAdapter
+
+        if OpencodeAdapter().binary or shutil.which("opencode") or os.path.exists(os.path.expanduser("~/.local/bin/opencode")):
+            adapters["opencode"] = OpencodeAdapter(jobs=jobs)
+    except Exception:  # noqa: BLE001 —— 第三个工具起不来不影响 Claude / Codex
+        logger.exception("opencode 接入没起来")
     if os.environ.get("CARHER_FLEET_CURSOR") == "1":
         adapters["cursor"] = CursorAdapter(jobs=jobs, mode=lambda: getattr(policy(), "mode", "readonly"))
     return FleetControl(Fleet(adapters))

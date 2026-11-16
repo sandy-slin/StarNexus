@@ -30,7 +30,21 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 logger = logging.getLogger("feishu-bridge.fleet")
 
-TOOLS = ("claude", "codex", "cursor")
+TOOLS = ("claude", "codex", "cursor", "opencode")
+
+# 每个工具声明自己支持什么（产品定义 §5.9「能力声明」）。菜单、卡片、新建会话按这张表显示或隐藏，
+# 不再到处写 `tool in ("claude", "codex")`。新加工具：写一个 adapter + 在这里加一行。
+CAPS = {
+    "claude": frozenset({"start", "send", "stop", "fork", "model", "effort", "approval", "progress", "choices"}),
+    "codex": frozenset({"start", "send", "stop", "fork", "archive", "model", "effort", "approval", "progress",
+                        "choices"}),
+    "opencode": frozenset({"start", "send", "stop", "fork", "model", "choices"}),
+    "cursor": frozenset({"send"}),
+}
+
+
+def can(tool: str, capability: str) -> bool:
+    return capability in CAPS.get(str(tool or ""), frozenset())
 SURFACES = ("cli", "app", "bridge")
 STATUSES = ("running", "idle", "waiting", "stopped", "unknown")
 OWNERS = ("none", "terminal", "app", "bridge", "unknown")
