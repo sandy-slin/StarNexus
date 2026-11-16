@@ -3030,7 +3030,8 @@ class Bridge:
         await asyncio.to_thread(self._mark_session_done, chat_id, True)
         tail = res.text if res is not None and res.ok else "Claude 没有归档命令：总览里不再列它，在群里再说一句就会重新出现。"
         logger.info("会话管理 归档 tool=%s 会话=%s 工具归档=%s", bound.tool, bound.id[:8], bool(res and res.ok))
-        self._say(chat_id, f"🗄 已归档这个会话，群名加了 ✅。{tail}群保留着，聊天记录都在。")
+        self._say(chat_id, f"🗄 已归档这个会话，群名加了 ✅。{tail}群保留着，聊天记录都在。"
+                           "不需要这个群了可以自己解散（你是群主：群设置 › 解散群），机器人不会替你解散。")
 
     def _session_rename(self, chat_id: str, bound, name: str) -> None:
         from .fleet.chatbind import GROUP_PREFIX_SN, MAX_NAME_CHARS, _clean_name
