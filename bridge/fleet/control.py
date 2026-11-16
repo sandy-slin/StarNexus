@@ -83,6 +83,12 @@ class FleetControl:
             self.last = view
         return view
 
+    def running(self) -> list:
+        """最近一次扫描里正在跑的会话（私聊「停下」选哪个用，FC-11/12）。手机自己起的排前面，再按更新时间。"""
+        with self._lock:
+            items = [s for s in self._known.values() if getattr(s, "status", "") == "running"]
+        return sorted(items, key=lambda s: (not getattr(s, "can_stop", False), -float(getattr(s, "updated_at", 0) or 0)))
+
     def known_keys(self) -> set:
         with self._lock:
             return set(self._known)

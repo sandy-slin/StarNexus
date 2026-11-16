@@ -532,6 +532,9 @@ def _late_minutes(create_time, now: float | None = None) -> int:
     return int(round(lag / 60))
 
 
+STOP_REMIND_SEC = 600
+
+
 class Bridge:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -2472,6 +2475,8 @@ class Bridge:
             if event is not None and not event.is_set():
                 event.set()
                 self._say(chat_id, "好，正在停…")
+            elif str(scope).startswith("dm:") and await self._offer_stop_choices(chat_id):
+                pass
             elif had_pending:
                 self._say(chat_id, "停了。刚才等你确认的那一步也取消了，卡片按钮已失效。")
             else:
@@ -2950,6 +2955,61 @@ class Bridge:
             return None
         target = control.peek_pending(scope)
         return (target.tool, target.id) if target is not None else None
+
+    async def _offer_stop_choices(self, chat_id: str) -> bool:
+        """私聊「停下」，手边没有在跑的 ⇒ 列出电脑上正在跑的会话，选一个停（FC-11/12）。没有 ⇒ False。
+
+        能停的（手机发起的那一轮）给「⏹ 停下」；停不了的（终端 / App 里跑的）照实说原因，
+        给「👀 看看它」，不发任何信号 —— 从外面打断会把整个终端会话关掉。
+        """
+        control = getattr(self, "fleet", None)
+        if control is None:
+            return False
+        try:
+            await asyncio.to_thread(control.overview)
+        except Exception:  # noqa: BLE001 —— 扫不出来就按上次扫描的判
+            logger.debug("停下 扫描失败，用上次扫描", exc_info=True)
+        running = control.running()[:6]
+        if not running:
+            return False
+        from .fleet.actions import do_button, fleet_button
+        from .fleet.cards import session_label
+
+        lines = ["电脑上有这些会话正在跑，点要停的那个："]
+        buttons = []
+        for sess in running:
+            label = session_label(sess, _redact_text)
+            if getattr(sess, "can_stop", False):
+                lines.append(f"- {label}：手机发起的这一轮，可以直接停，会话保留")
+                buttons.append(fleet_button("stop", sess.tool, sess.id, f"⏹ 停 {label}"[:28]))
+            else:
+                why = getattr(sess, "why_not_stop", "") or "它在电脑上跑，这里停不了"
+                lines.append(f"- {label}：{_redact_text(why)}")
+                buttons.append(fleet_button("remind", sess.tool, sess.id, f"⏰ 提醒我到电脑上停 {label}"[:30]))
+                buttons.append(fleet_button("open", sess.tool, sess.id, f"👀 看看 {label}"[:28]))
+        buttons.append(do_button("sessions", "🖥 回到总览"))
+        logger.info("停下 私聊列出在跑的会话 数量=%d 能停=%d", len(running),
+                    sum(1 for s in running if getattr(s, "can_stop", False)))
+        self._say_with_buttons(chat_id, "\n".join(lines), buttons)
+        return True
+
+    async def _remind_stop_later(self, chat_id: str, tool: str, sid: str, delay: float = 0.0) -> None:
+        """停不了的那一轮（终端 / App 里跑的）：过一会儿还在跑 ⇒ 私聊提醒到电脑上停（FC-12 的替代方法）。"""
+        from .fleet.actions import fleet_button
+        from .fleet.cards import session_label
+
+        await asyncio.sleep(delay or STOP_REMIND_SEC)
+        control = getattr(self, "fleet", None)
+        if control is None:
+            return
+        sess, _why = await asyncio.to_thread(control.refresh, tool, sid)
+        if sess is None or getattr(sess, "status", "") != "running":
+            logger.info("停下提醒 不用提醒了：已经不在跑 tool=%s 会话=%s", tool, sid[:8])
+            return
+        label = session_label(sess, _redact_text)
+        where = "Codex App" if getattr(sess, "owner", "") == "app" else "电脑上的终端"
+        self._say_with_buttons(chat_id, f"⏰ {label}还在跑。要停的话到{where}里停（终端按 Esc，App 点停止）。",
+                               [fleet_button("open", tool, sid, "👀 看看它现在")])
 
     async def _fleet_stop(self, chat_id: str, tool: str, sid: str) -> None:
         result = await asyncio.to_thread(self.fleet.stop, tool, sid)
@@ -4026,6 +4086,9 @@ class Bridge:
         if op == "stop":
             later(self._fleet_stop(chat_id, tool, sid))
             return toast("info", "收到，正在停", "已排队:停")
+        if op == "remind":
+            later(self._remind_stop_later(chat_id, tool, sid))
+            return toast("info", f"好，{STOP_REMIND_SEC // 60} 分钟后还在跑就提醒你", "已排队:提醒")
         # op == "send"：进对话模式。
         # 单聊里点、而且能建群 ⇒ 给这个会话建（或复用）一个群，之后在那个群里说的话直达它。
         # 建群要调飞书接口（慢）⇒ 丢后台；能不能建由 `group_client` 定，没开权限时它是 None，走老路。

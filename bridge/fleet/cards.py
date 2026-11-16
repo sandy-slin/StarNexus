@@ -29,7 +29,7 @@ from .scan import TOOL_LABELS, Overview
 # `more`：总览上「还有 N 个没列出来」那个按钮（第 28 轮）⇒ 原地换卡、把这一组全列出来。只带 tool，不带 id。
 # `settle` / `unsettle`：详情卡上「✓ 结束」和结束后那张卡上的「撤销」（第 33 轮，`fleet/settled.py`）。
 # `snooze`：「等你」推送卡上「1 小时后再提醒」（第 33 轮）。只有它可以多带一个 `q`（它在问什么的指纹）。
-OPS = ("open", "send", "go", "stop", "refresh", "more", "settle", "unsettle", "snooze")
+OPS = ("open", "send", "go", "stop", "refresh", "more", "settle", "unsettle", "snooze", "remind")
 _SIG_MAX = 16
 RELAY_OPS = ("talk", "no")  # 进对话模式那张确认卡：确认 / 算了
 MAX_CARD_BYTES = 20 * 1024

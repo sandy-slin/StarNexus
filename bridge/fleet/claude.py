@@ -136,6 +136,7 @@ WHY_RELAY_NO_NAME = "这个会话没有名字，送不进去。在电脑上那�
 WHY_RELAY_OLD_VERSION = "这个会话的 Claude 版本还不支持从别处送消息进去。在电脑上和它说吧。"
 WHY_RELAY_SUSPENDED = "它在电脑上被挂起了（按过 Ctrl-Z），送进去不会有人理。到电脑上敲 fg 让它继续。"
 
+STOPPED_BY_OWNER = "这一轮已按你的要求停下。会话还在，直接说下一句就能接着聊。"
 WHY_STOP_TERMINAL = "终端里的会话只能在终端里停，从外面停会直接关掉整个会话。"
 # 和 WHY_SEND_APP 在详情卡上紧挨着出现 ⇒ 不再重复「这是 App 里的会话」，只说停的那一步
 WHY_STOP_APP = "要停它，也只能在 App 里点停止。"
@@ -1010,6 +1011,8 @@ class ClaudeAdapter(Adapter):
                 self.jobs.forget(pid)
             self._last_own_write[sid] = self._now()
         out = _send_result(sid, result)
+        if self.jobs.take_stopped(TOOL, sid) and not out.ok:
+            out = ActionResult(False, STOPPED_BY_OWNER, sid)
         if spawned:
             out = ActionResult(out.ok, out.text, out.session_id, delivered=True)
         return out

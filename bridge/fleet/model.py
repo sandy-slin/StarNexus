@@ -646,6 +646,19 @@ class FleetJobs:
         self._kill = kill
         self._lock = threading.Lock()
         self._jobs: dict = {}
+        self._stopped: set = set()
+
+    def mark_stopped(self, tool: str, session_id: str) -> None:
+        with self._lock:
+            self._stopped.add((str(tool), str(session_id)))
+
+    def take_stopped(self, tool: str, session_id: str) -> bool:
+        """这一轮是不是被手机上的「停下」打断的（读一次就清）。"""
+        with self._lock:
+            key = (str(tool), str(session_id))
+            hit = key in self._stopped
+            self._stopped.discard(key)
+            return hit
 
     def _current_lstart(self, pid: int) -> str:
         try:
@@ -736,7 +749,8 @@ class FleetJobs:
             return ActionResult(False, "手机上没有在给它跑的任务，没有可停的。", session_id)
         results = [self.signal(j.pid, sig) for j in jobs]
         if any(r.ok for r in results):
-            return ActionResult(True, "已经让它停下了。", session_id)
+            self.mark_stopped(tool, session_id)
+            return ActionResult(True, "已经让它停下了。这一轮不再继续，会话还在，可以接着说。", session_id)
         return ActionResult(False, results[-1].text, session_id)
 
 

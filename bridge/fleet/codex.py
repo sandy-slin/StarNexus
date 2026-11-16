@@ -149,6 +149,7 @@ WHY_NOT_SEND_ARCHIVED = "这个会话已经归档了，先在 Codex 里取消归
 WHY_NOT_STOP_APP = "它开在 Codex App 里，只能在 App 里停。"
 WHY_NOT_STOP_TERMINAL = "它开在终端里，只能在终端里停；从外面停会直接关掉整个会话。"
 WHY_NOT_STOP_IDLE = "它现在没有在跑从手机上发的任务，没有可停的。"
+STOPPED_BY_OWNER = "这一轮已按你的要求停下。会话还在，直接说下一句就能接着聊。"
 
 # relay 的拒绝话术（每条都要有「能做到的替代」）
 WHY_RELAY_BAD_ID = "会话编号不对，发不了。"
@@ -898,6 +899,8 @@ class CodexAdapter(Adapter):
         if res.error:
             # SubprocessRunner 的 error 自己就以「没能启动 …」开头 ⇒ 别再套一层
             return ActionResult(False, res.error if res.error.startswith("没能启动") else "没能启动 Codex：" + res.error, tid)
+        if self.jobs.take_stopped(self.tool, tid) and not (res.returncode == 0 and reply):
+            return ActionResult(False, STOPPED_BY_OWNER, tid, delivered=True)
         if res.timed_out or (fired.is_set() and not (res.returncode == 0 and reply)):
             return ActionResult(False, "Codex 太久没回完，已经让它停下了。", tid)
         blob = (res.stderr or "") + "\n" + (failure or "")
