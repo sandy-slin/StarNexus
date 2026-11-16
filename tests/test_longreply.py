@@ -104,3 +104,36 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExportTest(unittest.TestCase):
+    def test_transcript_markdown(self):
+        msgs = [SimpleNamespace(role="user", text="修登录"), SimpleNamespace(role="assistant", text="好了"),
+                SimpleNamespace(role="user", text="再测一次"), SimpleNamespace(role="assistant", text="通过")]
+        md = longreply.transcript_markdown("Codex「x」", msgs)
+        self.assertIn("## 第 2 轮", md)
+        self.assertIn("**你**：", md)
+        self.assertIn("通过", md)
+
+    def test_export_posts_link(self):
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        bound = SimpleNamespace(tool="codex", id="sid1", name="SN·Codex·x")
+        msgs = [SimpleNamespace(role="user", text="hi"), SimpleNamespace(role="assistant", text="yo")]
+        adapter = SimpleNamespace(read=lambda sid, n=0: msgs)
+        bridge.chat_binds = SimpleNamespace(of_chat=lambda c: bound)
+        bridge.fleet = SimpleNamespace(fleet=SimpleNamespace(adapter=lambda t: adapter), cached=lambda t, s: None)
+        bridge.settings = SimpleNamespace(app_id="a", app_secret="s", owner_open_ids=frozenset({"ou_me"}))
+        said = []
+        bridge._say = lambda chat, text: said.append(text)
+        with mock.patch("bridge.botmenu.tenant_token", return_value="t"), \
+                mock.patch.object(longreply, "publish", return_value="https://feishu.cn/docx/X") as pub:
+            self.assertEqual(bridge._export_session_doc("oc_g"), "https://feishu.cn/docx/X")
+        self.assertIn("**你**：", pub.call_args[0][3])
+        self.assertIn("https://feishu.cn/docx/X", said[0])
+
+    def test_status_card_has_export(self):
+        from bridge.fleet.statuscard import CardInfo, build_card, resolve_click
+
+        self.assertIn('"op": "export"', build_card(CardInfo(tool="codex", sid="s")))
+        self.assertEqual(resolve_click({"act": "sc", "op": "export"}) or resolve_click(
+            {"act": __import__("bridge.fleet.statuscard", fromlist=["ACT"]).ACT, "op": "export"}), "export")

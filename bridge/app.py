@@ -4708,6 +4708,43 @@ class Bridge:
                 logger.warning("长回复 转文档失败，改为分段发原文：%s", _redact_text(str(exc)))
         self.replier.send(chat_id, f"{label} 回复：\n\n{body}{tail}")
 
+    def _export_session_doc(self, chat_id: str) -> str:
+        """状态卡「📄 导出文档」（§6）：把这个会话的对话记录写成飞书文档，群里发链接。"""
+        from . import botmenu as bm
+        from .fleet import longreply
+        from .fleet.cards import session_label
+        from .redact import redact
+
+        binds = getattr(self, "chat_binds", None)
+        bound = binds.of_chat(chat_id) if binds is not None else None
+        control = getattr(self, "fleet", None)
+        adapter = control.fleet.adapter(bound.tool) if bound is not None and control is not None else None
+        if adapter is None:
+            self._say(chat_id, "这里不是会话群，没有可导出的会话。")
+            return "no_session"
+        try:
+            messages = adapter.read(bound.id, n=longreply.EXPORT_MESSAGES)
+        except Exception:  # noqa: BLE001
+            logger.exception("导出文档 读会话失败")
+            messages = []
+        if not messages:
+            self._say(chat_id, "读不到这个会话的对话记录，没导出。")
+            return "empty"
+        sess = control.cached(bound.tool, bound.id)
+        title = session_label(sess, _redact_text) if sess is not None else (bound.name or bound.tool)
+        body, _hits = redact(longreply.transcript_markdown(f"{title} · 对话记录", messages))
+        try:
+            token = bm.tenant_token(self.settings.app_id, self.settings.app_secret)
+            owner = next(iter(sorted(self.settings.owner_open_ids)), "")
+            url = longreply.publish(bm._http, token, f"{title} · 对话记录"[:60], body, owner)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("导出文档 失败：%s", _redact_text(str(exc)))
+            self._say(chat_id, "导出没成功（建文档失败），过一会儿再点一次。")
+            return "failed"
+        logger.info("导出文档 tool=%s 会话=%s 条数=%d", bound.tool, bound.id[:8], len(messages))
+        self._say(chat_id, f"📄 已导出这个会话的对话记录（{len(messages)} 条）：[打开文档]({url})")
+        return url
+
     def _publish_long_reply(self, label: str, body: str) -> str:
         from . import botmenu as bm
         from .fleet import longreply
@@ -5906,6 +5943,9 @@ class Bridge:
         if op == "refresh":
             self._in_background(self._refresh_status_card, chat_id, True)
             return toast("info", "正在刷新")
+        if op == "export":
+            self._in_background(self._export_session_doc, chat_id)
+            return toast("info", "正在导出，好了把链接发到群里")
         done = op == "done"
         self._in_background(self._mark_session_done, chat_id, done)
         if done:

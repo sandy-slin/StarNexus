@@ -104,6 +104,28 @@ def publish(http, token: str, title: str, markdown: str, owner_open_id: str = ""
     return DOC_HOST + doc_id
 
 
+EXPORT_MESSAGES = 200
+
+
+def transcript_markdown(title: str, messages: list) -> str:
+    """会话记录 ⇒ 导出文档的 Markdown：每一轮一个小节，「你」和「它」分开。"""
+    lines = [f"# {title}", ""]
+    turn = 0
+    for msg in messages:
+        role = getattr(msg, "role", "")
+        text = str(getattr(msg, "text", "") or "").strip()
+        if not text:
+            continue
+        if role == "user":
+            turn += 1
+            lines += [f"## 第 {turn} 轮", "", "**你**：", "", text, ""]
+        else:
+            lines += ["**它**：", "", text, ""]
+    if turn == 0 and len(lines) == 2:
+        lines.append("（这个会话还没有可导出的对话）")
+    return "\n".join(lines)
+
+
 def group_text(label: str, text: str, url: str) -> str:
     return (f"{label} 回复较长（{len(text)} 字），全文已放进飞书文档：\n[打开全文]({url})\n\n"
             f"**摘要**\n{summary(text)}")

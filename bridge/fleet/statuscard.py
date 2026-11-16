@@ -22,7 +22,7 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 ACT = "sc"
-OPS = ("refresh", "done", "reopen")
+OPS = ("refresh", "done", "reopen", "export")
 STATE_FILE = "status_cards.json"
 DONE_PREFIX = "✅"
 
@@ -121,6 +121,7 @@ def build_card(info: CardInfo) -> str:
         _button("⏹ 停下", {"act": "do", "op": "stop"}),
         _button("↩︎ 重新打开" if info.finished else "✅ 完成", value("reopen" if info.finished else "done")),
         _button("🔄 刷新", value("refresh")),
+        _button("📄 导出文档", value("export")),
         _button("🧬 复制会话", {"act": "do", "op": "fork"}),
         _button("🗄 归档", {"act": "do", "op": "archive"}),
     ]
