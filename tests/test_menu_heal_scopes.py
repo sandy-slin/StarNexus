@@ -60,6 +60,9 @@ class HealScopesTest(unittest.TestCase):
         self.assertIn("im:message:readonly", register.WANT_SCOPES)
         self.assertNotIn("im:message", register.WANT_SCOPES)
 
+    def test_urgent_scope_wanted(self):
+        self.assertIn("im:message.urgent:app_send", register.WANT_SCOPES)
+
 
 if __name__ == "__main__":
     unittest.main()

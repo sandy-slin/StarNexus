@@ -72,6 +72,9 @@ _BASE_SCOPES = (
     "docx:document.block:convert",
     "docx:document:write_only",
     "docs:permission.member:create",
+    # 5. FC-08 需要人介入 10 分钟没处理 ⇒ 应用内加急一次。2026-11-17 实测服务端原话：
+    #        [im:message.urgent, im:message.urgent:app_send]，挑只管应用内加急的那一项。
+    "im:message.urgent:app_send",
 )
 # 这台机器需要的全部权限面：单聊 3 项 + 建群清单里推荐开的那一项（去重、保序）。
 WANT_SCOPES = list(dict.fromkeys([*_BASE_SCOPES, *(need[2] for need in _GROUP_NEEDS)]))

@@ -446,7 +446,7 @@ class GroupSetup:
         return not code, code, str(out.get("msg") or "")
 
     def urgent(self, message_id: str, open_ids) -> tuple:
-        """应用内加急一条消息 → `(成功, code, msg)`。要 `im:message.urgent` 权限；没开就失败，调用方只记日志。"""
+        """应用内加急一条消息 → `(成功, code, msg)`。要 `im:message.urgent:app_send`（或 `im:message.urgent`）权限；没开就失败，调用方只记日志。"""
         mid = str(message_id or "")
         ids = sorted({str(i) for i in open_ids or () if str(i).startswith("ou_")})
         if not mid.startswith("om_") or not ids:
