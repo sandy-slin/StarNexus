@@ -602,8 +602,12 @@ def rename_group(binds: ChatBinds, client: Any, bound: Bound, title: str = "",
 def sn_prefixed(name: str) -> str:
     """旧群名补上 `SN·` 前缀（FC-15）。`Codex · 修登录` ⇒ `SN·Codex·修登录`；已经有前缀的原样返回。"""
     raw = str(name or "").strip()
-    if raw.startswith(GROUP_PREFIX_SN + "·"):
+    done = raw.startswith("✅")
+    core = raw[1:] if done else raw
+    if core.startswith(GROUP_PREFIX_SN + "·"):
         return raw
+    if done:
+        return "✅" + sn_prefixed(core)
     parts = [p.strip() for p in raw.split("·") if p.strip()]
     return short_title("·".join([GROUP_PREFIX_SN] + (parts or [raw])), MAX_NAME_CHARS)
 
@@ -622,7 +626,7 @@ def migrate_sn_prefix(binds: ChatBinds, client: Any) -> list:
     for bound in binds.all():
         if not getattr(bound, "on", True) or not bound.name:
             continue
-        if bound.name.startswith(GROUP_PREFIX_SN + "·"):
+        if bound.name.lstrip("✅").startswith(GROUP_PREFIX_SN + "·"):
             continue
         try:
             current, _code, _msg = getter(bound.chat_id)

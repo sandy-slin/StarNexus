@@ -11,6 +11,8 @@ class NameTest(unittest.TestCase):
         self.assertEqual(sn_prefixed("Codex · 修登录"), "SN·Codex·修登录")
         self.assertEqual(sn_prefixed("群推送测试"), "SN·群推送测试")
         self.assertEqual(sn_prefixed("SN·Codex·x"), "SN·Codex·x")
+        self.assertEqual(sn_prefixed("✅Codex · 甲"), "✅SN·Codex·甲")
+        self.assertEqual(sn_prefixed("✅SN·Codex·甲"), "✅SN·Codex·甲")
 
 
 class FakeClient:
