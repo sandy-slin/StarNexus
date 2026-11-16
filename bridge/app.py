@@ -3690,20 +3690,14 @@ class Bridge:
         talking = current is not None and (current.tool, current.id) == (bound.tool, bound.id) \
             and self._talk_ident_same(scope, bound.tool, bound.id)
         if not talking and not self._relay_granted(scope, bound.tool, bound.id):
+            # 🔴 2026-11-17 用户要求去掉「确认，开始说话」这张多余的卡：能走到这里的只有主人
+            # （非主人的消息在入口就被丢弃），群又是为这个会话建的 ⇒ 主人在群里说话本身就是确认。
+            # 直接按现在的样子记下确认并发过去；会话改名 / 换项目 / 关掉时只提示一句，不再挡着。
             changed = self._talk_changed_why(scope, bound.tool, bound.id)
-            logger.info("群绑定 还没确认权限 tool=%s 会话=%s 变了=%s", bound.tool, bound.id[:8], bool(changed))
-            control.clear_pending(scope)
-            # 🔴 这句**先记着，不丢**（2026-11-06 体验侦察：原来丢掉、要他「再说一次」，单手打字最贵）。
-            # 不直接发：他打这句的时候还没看过权限说明。卡上会引用原话、明说「点确认后会发过去」，
-            # 他点确认的那一下就包括了这句。点「算了」/ 说取消 / 隔太久 ⇒ 不发，并照实说。
-            self._hold_for_consent(scope, bound.tool, bound.id, text)
+            logger.info("群绑定 主人发言即确认 tool=%s 会话=%s 变了=%s", bound.tool, bound.id[:8], bool(changed))
+            self._grant_by_open_click(scope, bound.tool, bound.id)
             if changed:
-                self._say(chat_id, f"{changed}，这条先没发。点下面那张卡再确认一次，确认之后会把它发过去。")
-            else:
-                self._say(chat_id, f"这个群直达{self._bound_label(bound)}，但还没确认过权限，这条先没发。"
-                                   "点下面那张卡确认之后，会把它发过去，不用再打一遍。")
-            self._ask_relay_consent(chat_id, scope, bound.tool, bound.id)
-            return True
+                self._say(chat_id, f"提示：{changed}。这条照常发过去了。")
         control.set_pending(scope, bound.tool, bound.id)
         return False
 
