@@ -69,6 +69,8 @@ logger = logging.getLogger("feishu-bridge")
 # 状态卡刷新间隔。飞书对同一用户发消息 5 QPS，单卡片实体操作上限 10 次/秒 ——
 # 15 秒一次远在限额内，同时足够让用户感觉"它在动"。
 _STATUS_REFRESH_SEC = 15
+_STAGE_POLL_SEC = 3
+_STAGE_RANK = {"sent": 0, "delivered": 1, "replying": 2}
 ACK_DELAY_SEC = 1.0   # 晚这么久再贴「在办」：秒回的命令不闪（第 19 轮，见 docs/iteration/r19-ack.md）
 MENU_DEBOUNCE_SEC = 3.0   # 同一个常驻菜单键多久内的重复只算一次（第 22 轮）
 LATE_NOTICE_SEC = 180   # 消息晚到超过这么久（秒）就在回复前说一句（第 22 轮，Mac 睡眠）
@@ -338,9 +340,38 @@ class _FleetWaitCard:
         self._last_text = ""
         self._broken = getattr(replier, "send_status_card", None) is None
         self._started = time.monotonic()
+        self._stage = "sent"
+        self._opened = False
+
+    def _stage_line(self) -> str:
+        """§5.2 发送三步，一行写清走到哪了：✅ 走过的，⏳ 正在等的，⚪ 还没到的，✍️ 正在回。"""
+        done = _STAGE_RANK[self._stage] + 1
+        marks = []
+        for index, name in enumerate(("已发送", "已送达", "正在回复"), 1):
+            if index <= done:
+                marks.append(f"✍️ {name}" if index == 3 else f"✅ {name}")
+            elif index == done + 1:
+                marks.append(f"⏳ {name}")
+            else:
+                marks.append(f"⚪ {name}")
+        return " → ".join(marks)
+
+    def _take(self, got) -> list:
+        """进展函数可以只回几行（老形状），也可以回 (阶段, 几行)。"""
+        if isinstance(got, tuple) and len(got) == 2:
+            stage, lines = got
+            if stage in ("delivered", "replying") and _STAGE_RANK[stage] > _STAGE_RANK[self._stage]:
+                self._stage = stage
+            return list(lines or [])
+        return list(got or [])
 
     def _render(self, elapsed: int, extra: list = ()) -> str:
+        if self._opened and elapsed < self._first_delay:
+            head = f"📨 发给{self._label}了\n{self._stage_line()}"
+            return head + ("\n" + "\n".join(extra) if extra else "")
         text = f"⏳ 已经发给{self._label} {_fmt_elapsed(elapsed)}，还在等它回"
+        if self._opened:
+            text += "\n" + self._stage_line()
         if extra:
             text += "\n" + "\n".join(extra)
         if self._escalate_sec and elapsed >= self._escalate_sec:
@@ -367,22 +398,37 @@ class _FleetWaitCard:
         if not ok:
             self._broken = True
 
+    async def open(self) -> bool:
+        """§5.2：一发出就贴这张卡（代替原来那句「📨 发给…了，等它回…」），之后三步都改这一张。
+        发不出去返回 False，调用方照旧发那句文字。"""
+        self._opened = True
+        await self._show(self._render(0), self._can_stop)
+        if self._message_id is None:
+            self._opened = False
+            self._broken = getattr(self._replier, "send_status_card", None) is None
+            self._last_text = ""
+            return False
+        return True
+
     async def run(self, stop: asyncio.Event) -> None:
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=self._first_delay)
-            return  # 第一张之前就回了：一张都不发
-        except asyncio.TimeoutError:
-            pass
+        if not self._opened:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self._first_delay)
+                return  # 第一张之前就回了：一张都不发
+            except asyncio.TimeoutError:
+                pass
         while not stop.is_set():
             extra: list = []
             if self._progress is not None:
                 try:
-                    extra = list(await asyncio.to_thread(self._progress) or [])
+                    extra = self._take(await asyncio.to_thread(self._progress))
                 except Exception:  # noqa: BLE001 —— 进展读坏了只少几行
                     logger.debug("读这一轮进展失败", exc_info=True)
-            await self._show(self._render(int(time.monotonic() - self._started), extra), self._can_stop)
+            elapsed = int(time.monotonic() - self._started)
+            await self._show(self._render(elapsed, extra), self._can_stop)
+            early = self._opened and elapsed < self._first_delay
             try:
-                await asyncio.wait_for(stop.wait(), timeout=_STATUS_REFRESH_SEC)
+                await asyncio.wait_for(stop.wait(), timeout=_STAGE_POLL_SEC if early else _STATUS_REFRESH_SEC)
             except asyncio.TimeoutError:
                 continue
 
@@ -3268,7 +3314,6 @@ class Bridge:
         logger.info("对话模式 发出 tool=%s 会话=%s 字数=%d", target.tool, str(target.id)[:8], len(text))
         sent_at = time.monotonic()
         inflight[scope] = (target.tool, target.id)
-        self._say(chat_id, f"📨 发给{target.label}了，等它回…")
         # 等的这段时间：一张原地刷新的等待卡（体验侦察 Top4，见 _FleetWaitCard）。能停才挂「停下」。
         try:
             known = control.cached(target.tool, target.id)
@@ -3283,6 +3328,13 @@ class Bridge:
             limit_sec=float(getattr(policy, "turn_timeout_sec", 600) or 600),
             progress=self._turn_progress(control, target.tool, target.id),
         )
+        try:
+            opened = await wait_card.open()
+        except Exception:  # noqa: BLE001 —— 卡片发不出就退回那句文字
+            logger.debug("发送进度卡失败", exc_info=True)
+            opened = False
+        if not opened:
+            self._say(chat_id, f"📨 发给{target.label}了，等它回…")
         wait_stop = asyncio.Event()
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
         result = None
@@ -4682,10 +4734,11 @@ class Bridge:
             return None
         start = {"path": start_path, "offset": mark(start_path)}
 
-        def read() -> list:
+        def read() -> tuple:
             path = control.record_path(tool, sid) or start["path"]
             offset = start["offset"] if path == start["path"] else 0
-            return read_progress(path, offset).lines(lambda t: redact(t)[0])
+            got = read_progress(path, offset)
+            return got.stage, got.lines(lambda t: redact(t)[0])
 
         return read
 

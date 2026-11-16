@@ -113,5 +113,74 @@ class WaitCardTest(unittest.TestCase):
         self.assertEqual(len(replier.sent), 1)
 
 
+class SendStageTest(unittest.TestCase):
+    def _write(self, rows):
+        import json, tempfile
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+        handle.close()
+        return handle.name
+
+    def test_codex_stages(self):
+        from bridge.fleet.progress import read_progress
+        path = self._write([])
+        self.assertEqual(read_progress(path, 0).stage, "sent")
+        path = self._write([{"type": "event_msg", "payload": {"type": "user_message"}}])
+        self.assertEqual(read_progress(path, 0).stage, "delivered")
+        path = self._write([{"type": "event_msg", "payload": {"type": "user_message"}},
+                            {"type": "response_item", "payload": {"type": "reasoning"}}])
+        self.assertEqual(read_progress(path, 0).stage, "replying")
+
+    def test_claude_stages(self):
+        from bridge.fleet.progress import read_progress
+        path = self._write([{"type": "user", "message": {"content": "你好"}}])
+        self.assertEqual(read_progress(path, 0).stage, "delivered")
+        path = self._write([{"type": "user", "message": {"content": [{"type": "tool_result"}]}}])
+        self.assertEqual(read_progress(path, 0).stage, "sent")
+        path = self._write([{"type": "user", "message": {"content": "你好"}},
+                            {"type": "assistant", "message": {"content": [{"type": "text", "text": "好"}]}}])
+        self.assertEqual(read_progress(path, 0).stage, "replying")
+
+    def test_card_opens_at_once_and_walks_three_steps_on_one_message(self):
+        replier = FakeReplier()
+        steps = iter([("delivered", []), ("replying", ["🔧 用了：跑命令×1"])])
+        card = app_mod._FleetWaitCard(replier, "oc", "Codex", can_stop=True, first_delay=90,
+                                      progress=lambda: next(steps, ("replying", ["🔧 用了：跑命令×1"])))
+
+        async def go():
+            self.assertTrue(await card.open())
+            stop = asyncio.Event()
+            original = app_mod._STAGE_POLL_SEC
+            app_mod._STAGE_POLL_SEC = 0.01
+            try:
+                task = asyncio.create_task(card.run(stop))
+                await asyncio.sleep(0.08)
+                stop.set()
+                await task
+            finally:
+                app_mod._STAGE_POLL_SEC = original
+
+        asyncio.run(go())
+        self.assertEqual(len(replier.sent), 1)
+        self.assertIn("✅ 已发送 → ⏳ 已送达 → ⚪ 正在回复", replier.sent[0])
+        self.assertTrue(any("✅ 已送达 → ⏳ 正在回复" in t for t in replier.patched))
+        self.assertTrue(any("✍️ 正在回复" in t and "跑命令×1" in t for t in replier.patched))
+
+    def test_stage_never_goes_back(self):
+        card = app_mod._FleetWaitCard(FakeReplier(), "oc", "Codex", can_stop=False, first_delay=0)
+        card._take(("replying", []))
+        card._take(("delivered", []))
+        self.assertEqual(card._stage, "replying")
+
+    def test_open_failure_falls_back(self):
+        class Broken(FakeReplier):
+            def send_status_card(self, chat_id, text, with_stop=True):
+                return None
+
+        card = app_mod._FleetWaitCard(Broken(), "oc", "Codex", can_stop=False, first_delay=0)
+        self.assertFalse(asyncio.run(card.open()))
+
+
 if __name__ == "__main__":
     unittest.main()

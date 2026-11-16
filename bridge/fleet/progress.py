@@ -31,6 +31,15 @@ class Progress:
     tools: dict = field(default_factory=dict)
     files: list = field(default_factory=list)
     last: str = ""
+    delivered: bool = False
+    replying: bool = False
+
+    @property
+    def stage(self) -> str:
+        """§5.2 发送三步：sent（已发送）→ delivered（会话记录里出现了这句）→ replying（它开始回了）。"""
+        if self.replying:
+            return "replying"
+        return "delivered" if self.delivered else "sent"
 
     def add_tool(self, name: str, detail: str = "") -> None:
         label = _TOOL_LABEL.get(name, name)
@@ -92,11 +101,45 @@ def _detail(inp) -> str:
     return ""
 
 
+_CODEX_REPLY_ITEMS = {"reasoning", "function_call", "custom_tool_call", "local_shell_call", "web_search_call"}
+_CODEX_REPLY_EVENTS = {"agent_message", "agent_reasoning", "exec_command_begin"}
+
+
+def _mark_stage(got: Progress, rec: dict) -> None:
+    kind = rec.get("type")
+    if rec.get("isSidechain"):
+        return
+    if kind == "user":
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str) or any(
+                isinstance(b, dict) and b.get("type") == "text" for b in (content if isinstance(content, list) else ())):
+            got.delivered = True
+        return
+    if kind == "assistant":
+        got.delivered = got.replying = True
+        return
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        return
+    sub = payload.get("type")
+    if kind == "event_msg":
+        if sub in ("user_message", "task_started"):
+            got.delivered = True
+        elif sub in _CODEX_REPLY_EVENTS:
+            got.delivered = got.replying = True
+    elif kind == "response_item":
+        if sub == "message" and payload.get("role") == "user":
+            got.delivered = True
+        elif (sub == "message" and payload.get("role") == "assistant") or sub in _CODEX_REPLY_ITEMS:
+            got.delivered = got.replying = True
+
+
 def read_progress(path: str, offset: int) -> Progress:
     got = Progress()
     if not path:
         return got
     for rec in _new_records(path, offset):
+        _mark_stage(got, rec)
         if rec.get("type") == "assistant" and not rec.get("isSidechain"):
             content = (rec.get("message") or {}).get("content")
             for block in content if isinstance(content, list) else ():
