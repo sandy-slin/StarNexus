@@ -53,6 +53,21 @@ def pick_model(tool: str, word: str) -> str:
     return MODEL_ALIASES.get(tool, {}).get(str(word or "").strip().lower(), "")
 
 
+EFFORT_ALIASES = {
+    "low": "low", "低": "low", "medium": "medium", "med": "medium", "中": "medium",
+    "high": "high", "高": "high", "xhigh": "xhigh", "很高": "xhigh",
+    "max": "max", "最高": "max", "ultra": "ultra", "极限": "ultra",
+}
+EFFORTS_BY_TOOL = {"claude": ("low", "medium", "high", "xhigh", "max"),
+                   "codex": ("low", "medium", "high", "xhigh", "max", "ultra")}
+
+
+def pick_effort(tool: str, word: str) -> str:
+    """`high` / `高` → 这家认的推理强度；认不出或这家不支持 ⇒ 空串。"""
+    effort = EFFORT_ALIASES.get(str(word or "").strip().lower(), "")
+    return effort if effort in EFFORTS_BY_TOOL.get(tool, ()) else ""
+
+
 def model_hint(tool: str) -> str:
     names = sorted({v for v in MODEL_ALIASES.get(tool, {}).values()})
     return " / ".join(names)
@@ -126,9 +141,9 @@ class NewSessionState:
             self._offers.pop(scope, None)
             return got["tool"], got["dirs"][index]
 
-    def arm(self, scope: str, tool: str, cwd: str, model: str = "") -> None:
+    def arm(self, scope: str, tool: str, cwd: str, model: str = "", effort: str = "") -> None:
         with self._lock:
-            self._armed[scope] = {"tool": tool, "cwd": cwd, "model": model,
+            self._armed[scope] = {"tool": tool, "cwd": cwd, "model": model, "effort": effort,
                                   "expires": self._now() + ARMED_TTL_SEC}
 
     def peek(self, scope: str) -> tuple:

@@ -4052,14 +4052,21 @@ class Bridge:
         if len(args) == 1:
             await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool)
             return True
-        from .fleet.newsession import pick_model
+        from .fleet.newsession import pick_effort, pick_model
 
         rest = args[1:]
-        model = pick_model(tool, rest[-1]) if rest else ""
-        if model:
-            rest = rest[:-1]
+        model, effort = "", ""
+        for _ in range(2):
+            if not rest:
+                break
+            if not effort and pick_effort(tool, rest[-1]):
+                effort = pick_effort(tool, rest[-1])
+                rest = rest[:-1]
+            elif not model and pick_model(tool, rest[-1]):
+                model = pick_model(tool, rest[-1])
+                rest = rest[:-1]
         if not rest:
-            await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool, model)
+            await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool, model, effort)
             return True
         found = workspace_mod.resolve_request(self.policy, self._new_current_dir(scope), " ".join(rest))
         if not found.ok or not found.workspace:
@@ -4071,7 +4078,7 @@ class Bridge:
                     self._say(chat_id, created.reply or found.reply.replace("/cd ", f"/newsession {tool} "))
             if not found.ok or not found.workspace:
                 return True
-        self._arm_new_session(scope, chat_id, tool, found.workspace, model)
+        self._arm_new_session(scope, chat_id, tool, found.workspace, model, effort)
         return True
 
     def _send_new_tool_card(self, chat_id: str) -> None:
@@ -4081,7 +4088,7 @@ class Bridge:
         if sender is None or not sender(chat_id, build_tool_card(_do_button("newcancel"))):
             self._say(chat_id, "选工具的卡片发不出去。也可以直接发：/newsession claude（或 codex）")
 
-    def _send_new_dir_card(self, scope: str, chat_id: str, tool: str, model: str = "") -> None:
+    def _send_new_dir_card(self, scope: str, chat_id: str, tool: str, model: str = "", effort: str = "") -> None:
         from .fleet.newsession import MAX_DIRS, build_dir_card
 
         policy = self.policy
@@ -4090,8 +4097,8 @@ class Bridge:
             self._say(chat_id, "没找到手机能用的项目目录。要放开得在电脑上改这个助手的设置。")
             return
         nonce = self._newsession_state().offer(scope, tool, dirs)
-        if model:
-            self._newsession_models()[scope] = (tool, model)
+        if model or effort:
+            self._newsession_models()[scope] = (tool, model, effort)
         else:
             self._newsession_models().pop(scope, None)
         labels = [_redact_text(workspace_mod.short_name(d, policy)) for d in dirs]
@@ -4106,25 +4113,34 @@ class Bridge:
             self._new_models = {}
         return self._new_models
 
-    def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str, model: str = "") -> None:
+    def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str, model: str = "",
+                         effort: str = "") -> None:
+        from .fleet.catalog import EFFORT_LABELS
         from .fleet.newsession import model_hint, permission_line
         from .fleet.scan import TOOL_LABELS
 
         policy = self.policy
         carried = self._newsession_models().pop(scope, None)
-        if not model and carried and carried[0] == tool:
-            model = carried[1]
-        self._newsession_state().arm(scope, tool, cwd, model)
-        logger.info("新建会话 选好 tool=%s model=%s scope=%s", tool, model or "-", scope[:16])
+        if carried and carried[0] == tool:
+            model = model or carried[1]
+            effort = effort or (carried[2] if len(carried) > 2 else "")
+        self._newsession_state().arm(scope, tool, cwd, model, effort)
+        logger.info("新建会话 选好 tool=%s model=%s effort=%s scope=%s", tool, model or "-", effort or "-", scope[:16])
         short = _redact_text(workspace_mod.short_name(cwd, policy))
         mode = MODE_LABELS.get(policy.mode, policy.mode)
+        base = self._effective_model(tool, "")
+        effort_text = f" / {EFFORT_LABELS.get(effort, effort)}" if effort else ""
+        if model:
+            model_line = f"模型：**{model}{effort_text}**\n"
+        else:
+            default_text = base.text() if (base.model or base.effort) else "工具默认"
+            model_line = (f"模型：默认（{default_text}）{effort_text}。要指定就发"
+                          f"「/ns {tool} 项目名 模型 [强度]」，可选 {model_hint(tool)}\n")
         self._say_with_buttons(
             chat_id,
             f"好，在「{short}」新开一个 **{TOOL_LABELS.get(tool, tool)}** 会话。\n"
             f"{permission_line(tool, mode)}\n"
-            + (f"模型：**{model}**\n" if model else
-               (f"模型：默认。要指定就发「/newsession {tool} 项目名 模型」，可选 {model_hint(tool)}\n"
-                if model_hint(tool) else ""))
+            + model_line
             + "**下一句话就是它的第一句**，直接打字发过来（10 分钟内有效）。开好之后就进对话模式，接着说都发给它。",
             [_do_button("newcancel")],
         )

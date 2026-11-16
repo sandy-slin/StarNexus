@@ -27,6 +27,21 @@ class PickModelTest(unittest.TestCase):
         self.assertEqual(pick_model("cursor", "opus"), "")
         self.assertEqual(pick_model("claude", "remote_control"), "")
 
+    def test_effort_aliases_per_tool(self):
+        from bridge.fleet.newsession import pick_effort
+
+        self.assertEqual(pick_effort("claude", "high"), "high")
+        self.assertEqual(pick_effort("claude", "高"), "high")
+        self.assertEqual(pick_effort("claude", "ultra"), "")
+        self.assertEqual(pick_effort("codex", "ultra"), "ultra")
+        self.assertEqual(pick_effort("codex", "remote_control"), "")
+
+    def test_state_keeps_effort(self):
+        state = NewSessionState()
+        state.arm("dm:x", "claude", "/tmp", "claude-opus-5-5", "high")
+        armed, _ = state.peek("dm:x")
+        self.assertEqual((armed["model"], armed["effort"]), ("claude-opus-5-5", "high"))
+
     def test_state_keeps_model(self):
         state = NewSessionState()
         state.arm("dm:x", "codex", "/tmp", "gpt-6-luna")
@@ -64,6 +79,19 @@ class ArmTest(unittest.TestCase):
         bridge._arm_new_session("dm:x", "claude", "claude", "/tmp")
         self.assertEqual(bridge._newsession_state().peek("dm:x")[0]["model"], "")
         self.assertIn("模型：默认", bridge.sent[-1])
+
+    def test_explicit_model_and_effort_shown(self):
+        bridge = make_bridge()
+        bridge._arm_new_session("dm:x", "oc", "claude", "/tmp", "claude-opus-5-5", "high")
+        armed = bridge._newsession_state().peek("dm:x")[0]
+        self.assertEqual((armed["model"], armed["effort"]), ("claude-opus-5-5", "high"))
+        self.assertIn("claude-opus-5-5 / 高", bridge.sent[-1])
+
+    def test_carried_effort_for_same_tool(self):
+        bridge = make_bridge()
+        bridge._newsession_models()["dm:x"] = ("claude", "claude-opus-5-5", "high")
+        bridge._arm_new_session("dm:x", "oc", "claude", "/tmp")
+        self.assertEqual(bridge._newsession_state().peek("dm:x")[0]["effort"], "high")
 
     def test_carried_model_only_for_same_tool(self):
         bridge = make_bridge()
