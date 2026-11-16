@@ -141,3 +141,16 @@ class GroupPushTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecisionContextTest(unittest.TestCase):
+    def test_waiting_push_has_status_ask_options_and_consequence(self):
+        from types import SimpleNamespace as NS
+
+        from bridge.fleet.grouppush import Push, build_push_text
+
+        pending = NS(questions=(), tool="Bash", summary="rm -rf build/")
+        sess = NS(tool="claude", id="s", pending=pending)
+        text = build_push_text(Push("waiting", "oc_g", sess), "Claude「x」", "proj", "打包前要清掉旧产物")
+        for word in ("需要人介入", "**现状**", "**卡在**", "**你可以**", "**不处理**"):
+            self.assertIn(word, text)

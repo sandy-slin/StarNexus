@@ -6352,6 +6352,9 @@ class Bridge:
             # 常驻菜单（输入框上面那一排）。订阅它不要求菜单已经配好 ——
             # 先接上，等菜单配上就直接能用，省掉"配完还得改代码重启"这一步。
             .register_p2_application_bot_menu_v6(self.on_bot_menu)
+            # 应用订阅了云文档评论事件（产品文档的评论会推过来），这里不处理它；
+            # 没注册时 SDK 每条都打一行 ERROR「processor not found」，把真错误淹掉。
+            .register_p2_drive_notice_comment_add_v1(lambda data: None)
             .build()
         )
         # 🔴 第 15 轮：重连窗口从 18~21 分钟压到半分钟内（`bridge/wsfast.py` 文件头有实测数据）。
@@ -6824,7 +6827,7 @@ class Bridge:
         for push in pushes:
             sess = push.sess
             last_reply = ""
-            if push.kind == "done":
+            if push.kind in ("done", "waiting", "failed"):
                 try:
                     _fresh, messages, _note = control.detail(sess.tool, sess.id, 4)
                     for msg in reversed(messages or []):

@@ -182,14 +182,23 @@ def build_push_text(push: Push, label: str, project: str, last_reply: str = "",
                     redact: Optional[Callable[[str], str]] = None) -> str:
     clean = redact or (lambda s: s)
     where = f"📁 {project}" if project else ""
+    # 需要人介入的推送要能「看完就能定」（文档评论 2026-11-16：人介入前先总结）：
+    # 现状（它最后说了什么）→ 卡在哪 / 为什么要你定 → 你能怎么做 → 不处理会怎样。
+    context = _clip(clean(last_reply), 240)
     if push.kind == "waiting":
         ask = _clip(clean(_pending_text(push.sess)), 300)
-        lines = [f"🟡 **{label}在等你处理**", where]
+        lines = [f"🟡 **需要人介入：{label}在等你处理**", where]
+        if context:
+            lines.append(f"**现状**：{context}")
         if ask:
-            lines.append(f"它卡在：{ask}")
-        lines.append("需要人介入：到电脑上处理那一步，或在群里回一句给它。")
+            lines.append(f"**卡在**：{ask}")
+        lines.append("**你可以**：在群里直接回一句（选项可以只回编号），或到电脑上处理那一步。")
+        lines.append("**不处理**：它会一直停在这一步，不会自己往下做；10 分钟后会再提醒一次。")
     elif push.kind == "failed":
-        lines = [f"❌ **{label}这一轮出错了**", where, "需要人看一下：在群里回一句让它重试，或到电脑上看。"]
+        lines = [f"❌ **需要人介入：{label}这一轮出错了**", where]
+        if context:
+            lines.append(f"**它最后说**：{context}")
+        lines.append("**你可以**：在群里回一句让它重试或换个做法，或到电脑上看完整报错。")
     else:
         lines = [f"✅ **{label}做完一轮，停下等下一步**", where]
         reply = _clip(clean(last_reply), EXCERPT_CHARS)
