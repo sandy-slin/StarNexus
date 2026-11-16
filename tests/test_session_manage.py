@@ -112,3 +112,23 @@ class DmScopeTest(unittest.TestCase):
         bridge.settings = SimpleNamespace(owner_open_ids=frozenset({"ou_me"}))
         bridge._chat_ids = {}
         self.assertEqual(bridge._owner_dm_scope(), "dm:ou_me")
+
+
+class CodexPickTest(unittest.TestCase):
+    def test_picks_newest_version(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        from bridge.fleet import codex as codex_mod
+
+        d = tempfile.mkdtemp()
+        old, new = os.path.join(d, "old"), os.path.join(d, "new")
+        for path, ver in ((old, "0.142.3"), (new, "0.167.0")):
+            with open(path, "w") as fh:
+                fh.write(f"#!/bin/sh\necho codex-cli {ver}\n")
+            os.chmod(path, 0o755)
+        ad = CodexAdapter(jobs=FleetJobs())
+        with mock.patch.object(codex_mod.shutil, "which", return_value=old), \
+                mock.patch.object(codex_mod.os.path, "expanduser", side_effect=lambda p: p.replace("~/.carher-npm-global/bin/codex", new)):
+            self.assertEqual(ad._codex(), new)

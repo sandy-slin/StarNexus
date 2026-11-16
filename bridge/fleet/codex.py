@@ -756,15 +756,39 @@ class CodexAdapter(Adapter):
             return []
 
     def _codex(self) -> str:
+        """用哪一个 codex：本机装了好几份时挑**版本最新**的那份。
+
+        🔴 2026-11-17 实测：后台服务的 PATH 里先找到 `~/.local/bin/codex`（0.142.3，没有 `exec fork`），
+        终端里用的是 `~/.carher-npm-global/bin/codex`（0.167）。两边版本不一样 ⇒ 终端能做的事手机做不了
+        （复制会话直接报参数错）。所以把已知安装位置都看一遍，按 `--version` 取最新，结果缓存。
+        """
         if self.codex_bin:
             return self.codex_bin
-        found = shutil.which("codex")
-        if found:
-            return found
-        for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex", os.path.expanduser("~/.local/bin/codex")):
-            if os.path.exists(cand):
-                return cand
-        return "codex"
+        cached = getattr(self, "_codex_pick", "")
+        if cached:
+            return cached
+        cands: list = []
+        for cand in (shutil.which("codex"), os.path.expanduser("~/.carher-npm-global/bin/codex"),
+                     "/opt/homebrew/bin/codex", "/usr/local/bin/codex", os.path.expanduser("~/.local/bin/codex"),
+                     os.path.expanduser("~/.npm-global/bin/codex")):
+            if cand and os.path.exists(cand) and cand not in cands:
+                cands.append(cand)
+        best, best_ver = "", ()
+        for cand in cands:
+            ver = _codex_version(cand, self._env_for_probe(cand))
+            if ver > best_ver or not best:
+                best, best_ver = cand, ver
+        pick = best or "codex"
+        logger.info("Codex 命令 选用=%s 版本=%s 候选=%d", pick, ".".join(map(str, best_ver)) or "?", len(cands))
+        self._codex_pick = pick
+        return pick
+
+    def _env_for_probe(self, codex: str) -> dict:
+        env = dict(os.environ)
+        extra = [os.path.dirname(codex), os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+        parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+        env["PATH"] = os.pathsep.join(parts + [p for p in extra if p and p not in parts])
+        return env
 
     def _guard(self) -> str:
         """审批钩子的调用命令；没装 ⇒ 空串（trusted 退回 workspace-write）。"""
@@ -978,7 +1002,9 @@ class CodexAdapter(Adapter):
         tid = thread_id_from_exec_output(res.stdout)
         reply, failure = parse_exec_output(res.stdout)
         if not tid:
-            err_lines = (res.stderr or "").strip().splitlines()
+            err_lines = [ln for ln in (res.stderr or "").strip().splitlines() if " WARN " not in ln]
+            logger.warning("Codex 没开成新会话 rc=%s fork=%s 参数=%s stderr尾=%s", res.returncode, bool(fork_from),
+                           [a for a in argv[1:] if not a.startswith("hooks.")][:12], " | ".join(err_lines[-4:])[:600])
             detail = short_title(failure or (err_lines[-1] if err_lines else ""), 120)
             return ActionResult(False, "Codex 没开成新会话" + (f"：{detail}" if detail else "。"), "")
         if res.timed_out or (fired.is_set() and not (res.returncode == 0 and reply)):
@@ -1238,6 +1264,18 @@ class CodexAdapter(Adapter):
         if owner == "terminal":
             return ActionResult(False, WHY_NOT_STOP_TERMINAL, tid)
         return ActionResult(False, WHY_NOT_STOP_IDLE, tid)
+
+
+def _codex_version(path: str, env: Optional[dict] = None) -> tuple:
+    """`codex --version` ⇒ (0, 167, 0)；读不出 ⇒ ()。"""
+    import subprocess
+
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10, env=env).stdout
+    except Exception:  # noqa: BLE001
+        return ()
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+    return tuple(int(x) for x in match.groups()) if match else ()
 
 
 def thread_id_from_lock(path: str) -> str:
