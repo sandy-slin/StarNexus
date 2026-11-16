@@ -657,6 +657,7 @@ class Bridge:
                 policy=lambda: self.policy,
                 bridge_home=self.runner.config_dir,
                 hook_settings=self._fleet_hook,
+                hook_path=self._hook_path,
             )
         except Exception:  # noqa: BLE001
             logger.exception("会话总控没起来，/sessions 先用不了")
@@ -1869,6 +1870,9 @@ class Bridge:
                      **self._settled("superseded")}
                 )
 
+            if str(scope).startswith("fleet:"):
+                return self._on_fleet_approval_click(value, scope, digest)
+
             if value.get("act") == "deny":
                 self.gate.clear(scope)
                 waiting = self._awaiting.pop(scope, None)
@@ -2893,7 +2897,12 @@ class Bridge:
         if gate is None:
             return ""
         scope = f"fleet:{tool}:{sid}"
-        gate.clear(scope)
+        keep = getattr(self, "_fleet_keep_grants", set())
+        if scope in keep:
+            # 批准后续跑：刚写下的 .ok 要留给钩子兑换，不能清
+            keep.discard(scope)
+        else:
+            gate.clear(scope)
         gate.set_trusted(scope, policy.mode == "trusted")
         gate.write_workspaces(scope, policy.workspaces)
         return gate.dir_for(scope)
@@ -3113,6 +3122,7 @@ class Bridge:
             if (result.text or "").startswith("这个项目不在手机能用的目录里"):
                 retry.insert(0, do_button("dirs"))
             self._say_with_buttons(chat_id, f"❌ 没发进去：{result.text}", retry)
+        self._fleet_ask_approval(scope, chat_id, target.tool, target.id, f"fleet:{target.tool}:{target.id}")
         return True
 
     # ---------- 单聊对话模式中重启（第 11 轮，复审第 5 条） ----------
@@ -4027,7 +4037,7 @@ class Bridge:
             return [(workspace_mod.short_name(d, policy), d) for d in dirs]
 
         def approval_dir(tool: str, key: str) -> str:
-            return self._fleet_approval_dir(tool, key, self.policy) if tool == "claude" else ""
+            return self._fleet_approval_dir(tool, key, self.policy) if tool in ("claude", "codex") else ""
 
         return Orchestrator(
             MissionStore(os.path.join(home, "ceo_missions.json")),
@@ -4296,7 +4306,8 @@ class Bridge:
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
         result = None
         try:
-            approval_dir = self._fleet_approval_dir(tool, "new-" + scope, policy) if tool == "claude" else ""
+            approval_dir = (self._fleet_approval_dir(tool, "new-" + scope, policy)
+                            if tool in ("claude", "codex") else "")
             base = self._effective_model(tool, "")
             start_model = armed.get("model", "") or base.model
             start_effort = armed.get("effort", "") or (base.effort if start_model == base.model else "")
@@ -4343,7 +4354,156 @@ class Bridge:
         else:
             self._say(target_chat_id, f"⚠️ 会话已经开了，但这一句没正常回完：{result.text}{tail}")
         self._send_buttons(target_chat_id, self._talk_buttons(target.tool, target.id))
+        if tool in ("claude", "codex"):
+            self._fleet_ask_approval(target_scope, target_chat_id, tool, result.session_id,
+                                     f"fleet:{tool}:new-{scope}")
         return True
+
+    # ---------- 会话里的审批卡（FC-06 / FC-13，§5.3） ----------
+    #
+    # 会话（Claude / Codex）跑到要批准的一步 ⇒ 钩子在 `fleet:<tool>:<sid>` 目录落待办 ⇒
+    # 这一轮结束后在会话所在的聊天里出审批卡并 @ 主人。点同意 ⇒ 写 .ok，所有卡都处理完后
+    # 按原会话续跑一轮（批准目录这一次不清，钩子兑换 .ok 放行）；点拒绝 ⇒ 清掉，不续跑。
+
+    FLEET_CONTINUE = {
+        "claude": "继续",
+        "codex": "主人已在飞书批准了刚才被拦下的那一步。请原样重新执行同一条命令（一个字都不要改），然后继续完成任务。",
+    }
+
+    def _fleet_continue_text(self, tool: str, commands: list) -> str:
+        """批准后续跑那一句。Codex 没有 defer，要把批过的命令原样告诉它重跑（钩子按指纹放行一次）。"""
+        base = self.FLEET_CONTINUE.get(tool, "继续")
+        if tool != "codex" or not commands:
+            return base
+        lines = "\n".join(f"- {c}" for c in commands[:5])
+        return base + "\n批准的命令（审批钩子这一次会放行，原样执行即可）：\n" + lines
+
+    def _fleet_ask_approval(self, chat_scope: str, chat_id: str, tool: str, sid: str,
+                            fleet_scope: str) -> int:
+        """这一轮留下的待批操作 ⇒ 在聊天里出审批卡并 @ 主人。返回发出的卡数。"""
+        gate = getattr(self, "gate", None)
+        if gate is None or not sid:
+            return 0
+        try:
+            pending = gate.take_pending(fleet_scope)
+        except Exception:  # noqa: BLE001
+            logger.exception("取会话待批操作失败")
+            return 0
+        if not pending:
+            return 0
+        if fleet_scope != f"fleet:{tool}:{sid}":
+            # 新建会话那一轮的批准目录按聊天分；续跑走会话自己的目录 ⇒ 待办挪过去
+            fleet_scope = self._move_fleet_pending(fleet_scope, f"fleet:{tool}:{sid}", pending)
+        if not hasattr(self, "_fleet_awaiting"):
+            self._fleet_awaiting = {}
+        commands = [str((item.get("tool_input") or {}).get("command") or "") for item in pending]
+        self._fleet_awaiting[fleet_scope] = {"chat_id": chat_id, "chat_scope": chat_scope,
+                                             "tool": tool, "sid": sid,
+                                             "commands": [c for c in commands if c]}
+        from .fleet.escalate import at_owner_line
+
+        owners = getattr(getattr(self, "settings", None), "owner_open_ids", None) or ()
+        at = at_owner_line(owners)
+        label = {"claude": "Claude", "codex": "Codex"}.get(tool, tool)
+        note = f"🔒 {label} 要做 {len(pending)} 步需要你批准的操作，下面审批卡点同意后它接着做。"
+        sender = getattr(self.replier, "send_md_id", None)
+        sent_note = False
+        if at and sender is not None:
+            try:
+                sent_note = bool(sender(chat_id, f"{at} {note}"))
+            except Exception:  # noqa: BLE001
+                sent_note = False
+        if not sent_note:
+            self._say(chat_id, note)
+        sent = 0
+        for item in pending:
+            action = describe_action(item.get("tool_name", "?"), item.get("tool_input", {}))
+            token = self.approvals.issue(fleet_scope, item["digest"],
+                                         {"digest": item["digest"], "scope": fleet_scope})
+            ok = self.replier.send_approval_card(
+                chat_id, f"{label} 要动手了，先问你一下", action,
+                {"act": "approve", **token.to_value()}, {"act": "deny", **token.to_value()},
+            )
+            logger.info("会话审批卡 scope=%s tool=%s digest=%s 送达=%s", fleet_scope[:24],
+                        item.get("tool_name", "?"), str(item.get("digest", ""))[:8], bool(ok))
+            sent += 1 if ok else 0
+        if not sent:
+            self._say(chat_id, "🔒 审批卡发不出去，这一步没做。你可以到电脑上处理，或者重新发一次要求。")
+            self._fleet_awaiting.pop(fleet_scope, None)
+            gate.clear(fleet_scope)
+        return sent
+
+    def _move_fleet_pending(self, src: str, dst: str, pending: list) -> str:
+        """把新建那一轮的待办（`.asked`）挪到会话自己的批准目录。挪不动就留在原处用原 scope。"""
+        gate = self.gate
+        try:
+            src_dir, dst_dir = gate.dir_for(src), gate.dir_for(dst)
+            for item in pending:
+                name = str(item["digest"]) + ".asked"
+                os.replace(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+            return dst
+        except OSError:
+            logger.exception("挪新会话的待批操作失败，按原目录处理")
+            return src
+
+    def _on_fleet_approval_click(self, value: dict, scope: str, digest: str):
+        """会话审批卡被点了（鉴权、令牌已在上层核过）。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        awaiting = getattr(self, "_fleet_awaiting", {})
+        waiting = awaiting.get(scope)
+        if value.get("act") == "deny":
+            self.gate.clear(scope)
+            awaiting.pop(scope, None)
+            logger.info("会话审批 拒绝 digest=%s scope=%s", str(digest)[:8], scope[:24])
+            if waiting:
+                self._say_later(waiting["chat_id"], "好，这一步不做。会话还在，可以接着跟它说。")
+            return P2CardActionTriggerResponse(
+                {"toast": {"type": "info", "content": "好，不做这一步"}, **self._settled("denied")})
+        if not self.gate.approve(scope, digest):
+            reason = getattr(self.gate, "last_block_reason", "")
+            done = not reason and self.gate.approved_recently(scope, digest)
+            logger.info("会话审批 同意没生效 digest=%s 原因=%s", str(digest)[:8],
+                        "红线" if reason else ("刚批过" if done else "没有未决项"))
+            if done:
+                return P2CardActionTriggerResponse(
+                    {"toast": {"type": "info", "content": "这一步已经批过了，正在做"},
+                     **self._settled("approved")})
+            content = (f"这一步不能做：{reason}" if reason
+                       else "这一步已经不在等批准了，重新发一次你的要求")
+            return P2CardActionTriggerResponse({"toast": {"type": "error", "content": content}})
+        logger.info("会话审批 同意已记下 digest=%s scope=%s", str(digest)[:8], scope[:24])
+        if waiting and not self._has_waiting_approval(scope) and self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._fleet_continue_after_approval(scope), self._loop)
+            toast = "好，继续"
+        elif waiting:
+            toast = "记下了，其余几张也点完它就接着做"
+        else:
+            toast = "同意记下了；那一轮接不上了，10 分钟内再发一次要求，这一步不会再问"
+        return P2CardActionTriggerResponse(
+            {"toast": {"type": "info", "content": toast}, **self._settled("approved")})
+
+    async def _fleet_continue_after_approval(self, scope: str) -> None:
+        """全部批完 ⇒ 让原会话接着跑一轮（这一次不清批准目录）。"""
+        waiting = getattr(self, "_fleet_awaiting", {}).pop(scope, None)
+        control = getattr(self, "fleet", None)
+        if waiting is None or control is None:
+            return
+        if not hasattr(self, "_fleet_keep_grants"):
+            self._fleet_keep_grants = set()
+        self._fleet_keep_grants.add(scope)
+        tool, sid = waiting["tool"], waiting["sid"]
+        try:
+            control.set_pending(waiting["chat_scope"], tool, sid)
+            await self._maybe_send_to_fleet(waiting["chat_scope"], waiting["chat_id"],
+                                            self._fleet_continue_text(tool, waiting.get("commands") or []))
+        except Exception:  # noqa: BLE001
+            logger.exception("会话批准后续跑失败 scope=%s", scope[:24])
+            self._say(waiting["chat_id"], "同意收到了，但接着跑的时候出错了。重新发一次你的要求。")
+        finally:
+            self._fleet_keep_grants.discard(scope)
 
     def _relay_ident(self, tool: str, sid: str) -> str:
         """会话现在的身份指纹（名字 + 目录）。确认绑在它上面 —— 改了名、换了项目就重新问。"""

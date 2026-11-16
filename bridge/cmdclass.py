@@ -1318,15 +1318,6 @@ _HOME_OR_ROOT = (
 )
 
 _NEVER_APPROVABLE = (
-    # 任意代码执行：绕开所有命令级判据
-    (re.compile(r"\b(python3?|node|ruby|perl|php|osascript|deno|bun)\b\s+(-c|-e|-r|--eval)"),
-     "用解释器跑内联代码等于绕过所有限制"),
-    (re.compile(r"\b(python3?|node|ruby|perl|sh|bash|zsh)\b[^|;&\n]*<<"),
-     "用 heredoc 喂脚本等于绕过所有限制"),
-    (re.compile(r"\|\s*(sh|bash|zsh|python3?|node)\b"),
-     "把输出管进解释器等于绕过所有限制"),
-    (re.compile(r"\beval\b|\bexec\b"),
-     "eval/exec 等于绕过所有限制"),
     # 不可逆且范围大
     # 🔴 只匹配**目标就是根或家目录本身**（`/`、`~`、`$HOME`、`/*`、`~/*`）。
     # 原来是 `.*(/|~|\$HOME)` —— 任何带 `/` 的 rm -rf 都中（`rm -rf build/`、`rm -rf /tmp/x`）。
@@ -1360,6 +1351,23 @@ _NEVER_APPROVABLE = (
         r"\bfind\s+" + _HOME_OR_ROOT + r"(?=\s)"
         r"[^;&|]*\s-(?:delete\b|exec(?:dir)?\s+rm\b|ok(?:dir)?\s+rm\b)"),
      "把根目录或家目录整个删掉"),
+)
+
+# 🔴 2026-11-17（FC-13，产品定义 §2 原则 1）：硬红线只剩「删家目录 / 根目录」。
+# 下面这些原来点同意也不许，现在改成**逐次审批**：任何档位都先出审批卡，点同意后执行。
+# 全授权档也不会直接放行它们（钩子在 TRUSTED 之前判）。
+_NEEDS_APPROVAL_CMDS = (
+    # 任意代码执行：绕开所有命令级判据
+    (re.compile(r"\b(python3?|node|ruby|perl|php|osascript|deno|bun)\b\s+(-c|-e|-r|--eval)"),
+     "用解释器跑内联代码"),
+    (re.compile(r"\b(python3?|node|ruby|perl|sh|bash|zsh)\b[^|;&\n]*<<"),
+     "用 heredoc 喂脚本"),
+    (re.compile(r"\|\s*(sh|bash|zsh|python3?|node)\b"),
+     "把输出管进解释器"),
+    (re.compile(r"\beval\b|\bexec\b"),
+     "eval/exec 执行拼出来的命令"),
+    (re.compile(r"(?:^|[;&|(]\s*)su\b(?!-)"),
+     "提权"),
     (re.compile(r"\bgit\s+push\b"),
      "把代码推到远端"),
     (re.compile(r"\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[a-z]*f"),
@@ -1588,9 +1596,27 @@ def base_is_rm(out: list[str]) -> bool:
 def never_approvable(command: str) -> str:
     """这条命令是不是"连点同意都不许做"。返回原因，空串表示可以批准。
 
-    给审批层用：`ApprovalGate.approve` 在写 `.ok` 之前问一次。
-    这样用户在手机上点错也不会造成不可逆损失。
+    2026-11-17 起只剩一类：删根目录 / 家目录（FC-13）。其余危险操作见 `approval_reason`。
     原文和规范化文本（见上面第 25 轮那段）各判一次，任一命中就算。
+    """
+    text = (command or "").strip()
+    if not text:
+        return ""
+    normalized = _normalized_for_red_lines(text)
+    for candidate in (text, normalized):
+        if not candidate:
+            continue
+        for pattern, reason in _NEVER_APPROVABLE:
+            if pattern.search(candidate):
+                return reason
+    return ""
+
+
+def approval_reason(command: str) -> str:
+    """这条命令要不要**逐次审批**（任何档位都先出卡）。返回原因，空串 = 不需要。
+
+    读凭据、git push、提权、丢弃改动、删线上资源、内联解释器等。全授权档也不直接放行。
+    判据和原来的红线一样（原文 + 规范化文本），只是从「拒绝」改成「先问」。
     """
     text = (command or "").strip()
     if not text:
@@ -1608,7 +1634,7 @@ def never_approvable(command: str) -> str:
     for candidate in (text, normalized):
         if not candidate:
             continue
-        for pattern, reason in _NEVER_APPROVABLE:
+        for pattern, reason in _NEEDS_APPROVAL_CMDS:
             if pattern.search(candidate):
                 return reason
     return ""

@@ -375,6 +375,6 @@ def migration_notice(migrated_from: str, now_mode: str) -> str:
     strong = "现在它不问就动手" if now_mode == "trusted" else "现在它能直接改文件"
     return (
         "🔑 这次升级把权限放开了：之前是「只看」，每一步都要你点同意；"
-        f"{strong}（删家目录、推代码、读密钥这些照旧挡着）。\n"
+        f"{strong}（删家目录照旧挡着；推代码、读凭据、提权会先问你）。\n"
         "想回到「只看」：点一下「🔑 权限」挑「只读」，立刻生效。"
     )

@@ -59,9 +59,6 @@ class Decision:
 # 能看到整句话而不只是工具名。
 HARD_DENY = (
     (r"\brm\s+-rf?\s+[/~]", "删根目录或家目录"),
-    (r"\bgit\s+push\b", "推代码到远端"),
-    (r"\bgit\s+reset\s+--hard\b", "丢弃本地改动"),
-    (r"\bkubectl\s+delete\b", "删 K8s 资源"),
     (r"\bshutdown\b|\breboot\b", "关机重启"),
     (r"\bdd\s+if=.*of=/dev/", "裸写磁盘"),
     (r":\(\)\s*\{.*\}\s*;?\s*:", "fork 炸弹"),
@@ -143,13 +140,9 @@ class Reviewer:
             if re.search(pattern, lowered):
                 return Decision(Verdict.DENY, f"不做这件事：{why}", rule=pattern)
 
-        for pattern in SECRET_PATHS:
-            if re.search(pattern, ctx.text, re.I):
-                return Decision(
-                    Verdict.DENY,
-                    "涉及凭据文件。读出来会被发到飞书，而飞书是外部系统。",
-                    rule=pattern,
-                )
+        # 🔴 2026-11-17（FC-13）：凭据、git push 这类不再在消息层整句拒绝——
+        # 真正要执行时由审批钩子出卡，点同意才做；凭据内容回飞书前过 redact.py。
+        secret = next((p for p in SECRET_PATHS if re.search(p, ctx.text, re.I)), "")
 
         for rule in self.custom_rules:
             try:
@@ -172,6 +165,10 @@ class Reviewer:
         for pattern, why in NEEDS_APPROVAL:
             if re.search(pattern, lowered):
                 return Decision(Verdict.ASK, f"这步要你点头：{why}", rule=pattern)
+
+        if secret:
+            return Decision(Verdict.ASK, "这步要你点头：涉及凭据文件，读之前会先弹卡问你，内容回到飞书会打码",
+                            rule=secret)
 
         return Decision(Verdict.ALLOW, "")
 

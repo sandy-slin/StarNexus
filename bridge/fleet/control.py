@@ -230,6 +230,8 @@ class FleetControl:
                 method = adapter.send
             mode = getattr(policy, "mode", "trusted") if policy is not None else "trusted"
             extra = _model_kw(model, effort) if tool == "codex" else {}
+            if tool == "codex" and approval_dir:
+                extra["approval_dir"] = approval_dir
             return method(sid, text, timeout=timeout, mode=mode, **extra)
         except Exception as exc:
             # 不带前缀：app.py 那边已经套了「❌ 没发进去：」，再加一层就是「没发进去：没发出去：」
@@ -259,6 +261,8 @@ class FleetControl:
                 result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
                                        **extra)
             else:
+                if tool == "codex" and approval_dir:
+                    extra["approval_dir"] = approval_dir
                 result = adapter.start(resolved, text, timeout=timeout,
                                        mode=getattr(policy, "mode", "trusted"), **extra)
         except Exception as exc:
@@ -327,7 +331,7 @@ class FleetControl:
 
 
 def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings: Any = None,
-                  jobs: Any = None) -> FleetControl:
+                  jobs: Any = None, hook_path: Any = None) -> FleetControl:
     """真实家目录下的三家 + 一份共用的 FleetJobs。"""
     from .claude import ClaudeAdapter
     from .codex import CodexAdapter
@@ -338,7 +342,7 @@ def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings:
     adapters = {
         "claude": ClaudeAdapter(bridge_home=bridge_home, jobs=jobs, policy=policy,
                                 hook_settings=hook_settings),
-        "codex": CodexAdapter(jobs=jobs),
+        "codex": CodexAdapter(jobs=jobs, hook_path=hook_path),
         "cursor": CursorAdapter(jobs=jobs, mode=lambda: getattr(policy(), "mode", "readonly")),
     }
     return FleetControl(Fleet(adapters))

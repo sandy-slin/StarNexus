@@ -120,10 +120,26 @@ _USER_NOISE_PREFIXES = (
 )
 _TEXT_PART_TYPES = ("input_text", "output_text", "text")
 
-# 当前权限档位 → `-c sandbox_mode=…`。手机入口和终端入口共用同一档位，
-# 明确给 trusted 一个工作区写入边界，避免依赖用户 Codex 配置。
-# `readonly` 只读；`write` / `trusted` 可写当前工作区，不能越过工作区边界。
-SANDBOX_BY_MODE = {"readonly": "read-only", "write": "workspace-write", "trusted": "workspace-write"}
+# 当前权限档位 → `-c sandbox_mode=…`。手机入口和终端入口共用同一档位。
+# `readonly` 只读；`write` 可写当前工作区。
+# 🔴 2026-11-17（FC-13，产品定义 §9 已拍板）：`trusted` = danger-full-access，和终端一样不受沙箱限制。
+# 边界改由审批钩子守（`guard_args`）：删家目录直接拒；改工作区以外、git push、读凭据、提权
+# 先在飞书出审批卡。钩子没装上时退回 workspace-write，不会比原来更松。
+SANDBOX_BY_MODE = {"readonly": "read-only", "write": "workspace-write", "trusted": "danger-full-access"}
+SANDBOX_FALLBACK_TRUSTED = "workspace-write"
+
+
+def guard_args(hook_command: str) -> list:
+    """trusted 档挂审批钩子的 codex 参数。
+
+    2026-11-17 实测（codex exec）：PreToolUse 钩子只有带 `--dangerously-bypass-hook-trust` 才生效；
+    `-c hooks.PreToolUse=[…]` 可以内联传；钩子输出 deny + 非空理由就能拦下命令，allow / ask 不支持。
+    """
+    import json as _json
+
+    hook = ("[{matcher=\".*\",hooks=[{type=\"command\",command=" + _json.dumps(hook_command)
+            + ",timeout=15}]}]")
+    return ["--dangerously-bypass-hook-trust", "-c", "hooks.PreToolUse=" + hook]
 
 WHY_NOT_SEND_APP ="它正开在 Codex App 里，现在从手机发会失败。请在 App 里接着聊。"
 WHY_NOT_SEND_TERMINAL = "它正开在电脑的终端里，现在从手机发会失败。等那边关掉这个会话再发。"
@@ -307,8 +323,11 @@ class CodexAdapter(Adapter):
         codex_bin: Optional[str] = None,
         lsof_bin: Optional[str] = None,
         lsof_timeout: float = LSOF_TIMEOUT_SEC,
+        hook_path: Any = None,
     ) -> None:
         super().__init__(jobs=jobs, runner=runner)
+        # 审批钩子脚本路径（可以是返回路径的函数）。trusted 档靠它守边界，见 `guard_args`。
+        self._hook_path = hook_path
         self._default_home = home is None
         # 默认跟 codex 自己一样：有 CODEX_HOME 用它，没有就是 ~/.codex
         self.home = os.path.abspath(os.path.expanduser(home or os.environ.get("CODEX_HOME") or "~/.codex"))
@@ -746,6 +765,29 @@ class CodexAdapter(Adapter):
                 return cand
         return "codex"
 
+    def _guard(self) -> str:
+        """审批钩子的调用命令；没装 ⇒ 空串（trusted 退回 workspace-write）。"""
+        path = self._hook_path() if callable(self._hook_path) else self._hook_path
+        if not path or not os.path.isfile(str(path)):
+            return ""
+        from ..osenv import hook_command
+
+        return hook_command(str(path))
+
+    def _sandbox_args(self, mode: Optional[str], approval_dir: str, env: dict) -> list:
+        """按档位拼 sandbox 参数；trusted 且钩子、批准目录都在 ⇒ 全权限 + 钩子。"""
+        sandbox = SANDBOX_BY_MODE.get(mode or "readonly", SANDBOX_BY_MODE["readonly"])
+        extra: list = []
+        if sandbox == "danger-full-access":
+            guard = self._guard() if approval_dir else ""
+            if guard:
+                extra = guard_args(guard)
+                env["CARHER_APPROVAL_DIR"] = approval_dir
+                env["CARHER_HOOK_FLAVOR"] = "codex"
+            else:
+                sandbox = SANDBOX_FALLBACK_TRUSTED
+        return ["-c", f'sandbox_mode="{sandbox}"'] + extra
+
     def _env(self, codex: str) -> dict:
         env = dict(os.environ)
         # codex 是 `#!/usr/bin/env node` 脚本；后台服务的 PATH 常常没有 node 所在目录
@@ -758,7 +800,7 @@ class CodexAdapter(Adapter):
         return env
 
     def send(self, id: str, text: str, timeout: float = 600, mode: Optional[str] = None,
-             model: str = "", effort: str = "") -> ActionResult:
+             model: str = "", effort: str = "", approval_dir: str = "") -> ActionResult:
         """没人占着才发：`codex exec resume --json --skip-git-repo-check [-c sandbox_mode=…] -- <id> <text>`。
 
         `mode`：当前权限档位。给了就按档位压 sandbox（见 SANDBOX_BY_MODE）；认不出 ⇒ 只读。
@@ -776,7 +818,8 @@ class CodexAdapter(Adapter):
             self._sending.add(tid)
         try:
             spawned: list = []
-            res = self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort)
+            res = self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort,
+                                    approval_dir=approval_dir)
             # 起过子进程 ⇒ 消息已经进了会话（不管后面超时 / 被停 / 报错）
             if spawned and not res.delivered:
                 res = ActionResult(res.ok, res.text, res.session_id, delivered=True)
@@ -788,7 +831,8 @@ class CodexAdapter(Adapter):
                 self._sending.discard(tid)
 
     def _send_locked(self, tid: str, text: str, timeout: float, mode: Optional[str] = None,
-                     spawned: Optional[list] = None, model: str = "", effort: str = "") -> ActionResult:
+                     spawned: Optional[list] = None, model: str = "", effort: str = "",
+                     approval_dir: str = "") -> ActionResult:
         row = self._row(tid)
         if row is None:
             return ActionResult(False, self.last_error or "没找到这个 Codex 会话。", tid)
@@ -806,10 +850,9 @@ class CodexAdapter(Adapter):
 
         codex = self._codex()
         argv = [codex, "exec", "resume", "--json", "--skip-git-repo-check"]
+        env = self._env(codex)
         if mode is not None:
-            sandbox = SANDBOX_BY_MODE.get(mode, SANDBOX_BY_MODE["readonly"])
-            if sandbox:
-                argv += ["-c", f'sandbox_mode="{sandbox}"']
+            argv += self._sandbox_args(mode, approval_dir, env)
         bad = _model_args(argv, model, effort)
         if bad:
             return ActionResult(False, bad, tid)
@@ -837,7 +880,7 @@ class CodexAdapter(Adapter):
                 argv,
                 timeout=max(1.0, float(timeout)) + STOP_GRACE_SEC,
                 cwd=cwd,
-                env=self._env(codex),
+                env=env,
                 input_text=None,  # stdin=DEVNULL，不关会卡在 Reading additional input from stdin
                 on_spawn=on_spawn,
             )
@@ -874,7 +917,7 @@ class CodexAdapter(Adapter):
 
     def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "trusted",
               model: str = "", on_pid: Optional[Callable[[int], None]] = None,
-              effort: str = "") -> ActionResult:
+              effort: str = "", approval_dir: str = "") -> ActionResult:
         """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
 
         手机入口和终端入口共用当前权限档位；默认 trusted，对应工作区内可写。
@@ -886,8 +929,9 @@ class CodexAdapter(Adapter):
         if not cwd or not os.path.isdir(cwd):
             return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
         codex = self._codex()
-        sandbox = SANDBOX_BY_MODE.get(mode or "trusted", SANDBOX_BY_MODE["trusted"])
-        argv = [codex, "exec", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"']
+        env = self._env(codex)
+        argv = [codex, "exec", "--json", "--skip-git-repo-check"]
+        argv += self._sandbox_args(mode or "trusted", approval_dir, env)
         bad = _model_args(argv, model, effort)
         if bad:
             return ActionResult(False, bad, "")
@@ -916,7 +960,7 @@ class CodexAdapter(Adapter):
 
         try:
             res = self.runner.run(argv, timeout=max(1.0, float(timeout)) + STOP_GRACE_SEC, cwd=cwd,
-                                  env=self._env(codex), input_text=None, on_spawn=on_spawn)
+                                  env=env, input_text=None, on_spawn=on_spawn)
         except Exception as exc:
             return ActionResult(False, friendly_error(exc, "没能启动 Codex"), "")
         finally:
@@ -1022,7 +1066,8 @@ class CodexAdapter(Adapter):
 
     def relay(self, id: str, text: str, timeout: float = RELAY_TIMEOUT_SEC,
               mode: Optional[str] = None, poll: float = RELAY_POLL_SEC,
-              min_timeout: float = RELAY_MIN_TIMEOUT_SEC, model: str = "", effort: str = "") -> ActionResult:
+              min_timeout: float = RELAY_MIN_TIMEOUT_SEC, model: str = "", effort: str = "",
+              approval_dir: str = "") -> ActionResult:
         """把一句话送进一个**活着的** Codex 会话，并把回复取回来。
 
         - 别人（App / 终端）占着它 ⇒ `codex queue`，然后盯目标自己的 rollout 等回复。
@@ -1045,7 +1090,7 @@ class CodexAdapter(Adapter):
         try:
             spawned: list = []
             res = self._relay_locked(tid, text, timeout, mode, spawned, poll, min_timeout,
-                                     model=model, effort=effort)
+                                     model=model, effort=effort, approval_dir=approval_dir)
             if spawned and not res.delivered:
                 res = ActionResult(res.ok, res.text, res.session_id, delivered=True)
             return res
@@ -1058,7 +1103,7 @@ class CodexAdapter(Adapter):
     def _relay_locked(self, tid: str, text: str, timeout: float, mode: Optional[str],
                       spawned: list, poll: float,
                       min_timeout: float = RELAY_MIN_TIMEOUT_SEC, model: str = "",
-                      effort: str = "") -> ActionResult:
+                      effort: str = "", approval_dir: str = "") -> ActionResult:
         self.last_error = ""
         row = self._row(tid)
         if row is None:
@@ -1071,7 +1116,8 @@ class CodexAdapter(Adapter):
             return ActionResult(False, WHY_RELAY_BUSY, tid)
         if owner == "none":
             # 没人占着 ⇒ 直接 exec resume，同步拿回复（比排队等轮询快）
-            return self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort)
+            return self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort,
+                                     approval_dir=approval_dir)
         segs = self._segments(tid, row)
         if not segs:
             # 实测：没有 rollout 的线程 `codex queue` 直接报 -32603，先说清楚别白跑

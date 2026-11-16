@@ -58,10 +58,10 @@ class CodexSandboxModeTest(unittest.TestCase):
 
         self.assertEqual(signature(CodexAdapter.start).parameters["mode"].default, "trusted")
 
-    def test_trusted_is_workspace_write(self):
+    def test_trusted_is_full_access(self):
         from bridge.fleet.codex import SANDBOX_BY_MODE
 
-        self.assertEqual(SANDBOX_BY_MODE["trusted"], "workspace-write")
+        self.assertEqual(SANDBOX_BY_MODE["trusted"], "danger-full-access")
         self.assertEqual(SANDBOX_BY_MODE["write"], "workspace-write")
         self.assertEqual(SANDBOX_BY_MODE["readonly"], "read-only")
 

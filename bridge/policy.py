@@ -87,35 +87,12 @@ WRITE_EXTRA_TOOLS = ("Edit", "Write", "NotebookEdit")
 #               `rsync -e ssh`、`curl … | bash` 都被判「会写/要问」，用例在
 #               `test_r16_deny_narrow.py::test_exfiltration_shapes_still_need_approval`。
 # sudo / git push / git clean / kubectl delete：**不动**，照旧硬拒。
-ALWAYS_DENY = (
-    "Bash(sudo:*)",
-    "Bash(git push:*)",
-    "Bash(git reset --hard:*)",
-    "Bash(git clean:*)",
-    "Bash(kubectl delete:*)",
-    # 凭据：读不到就不会被回传进飞书。飞书是外部系统，发出去就等于发布了。
-    "Read(**/.env*)",
-    "Read(**/*.pem)",
-    "Read(**/*.key)",
-    "Read(**/id_rsa*)",
-    "Read(**/.aws/**)",
-    "Read(**/.ssh/**)",
-    "Read(**/credentials*)",
-    # 🔴 第 16 轮：上面那 7 条 `**/` 是**相对工作目录**的 glob，盖不到目录外。
-    # 主会话实测（真 claude 2.1.319，凭据放在工作目录外，bypass 参数下）：
-    #   `Read(**/.env*)` → 读到了；`Read(//**/.env*)` → DENIED
-    # 现在线上没漏：读工具本来只允许工作目录（`Read(<ws>/**)`），目录外的另有一道拒
-    # （拿桥全授权档的真实参数实测，修复前后工具层都拒、内容没进上下文）。
-    # 但要给领导放开「看工作目录外」，这几条就是凭据唯一的闸 ⇒ 必须先写成 `//**/`。
-    # 两份都留：老版本 CLI 认不认 `//` 没测过，多写一份不会更松。
-    "Read(//**/.env*)",
-    "Read(//**/*.pem)",
-    "Read(//**/*.key)",
-    "Read(//**/id_rsa*)",
-    "Read(//**/.aws/**)",
-    "Read(//**/.ssh/**)",
-    "Read(//**/credentials*)",
-)
+# 🔴 2026-11-17（FC-13，产品定义 §2 原则 1）：硬拒绝只剩删家目录（在钩子 `never_approvable` 里）。
+# sudo、git push、git reset --hard、git clean、kubectl delete、读凭据都改成**逐次审批**：
+# 由审批钩子出卡（`cmdclass.approval_reason`），点同意后执行。所以这里不再放 `Bash(...)`
+# 和 `Read(...)` 的硬拒——它们一旦写进 `--disallowed-tools`，点同意也执行不了。
+# 读凭据的 Read 工具改由钩子拦（HOOK_MATCHER 加了 Read），内容回到飞书前照样过 redact.py。
+ALWAYS_DENY: tuple = ()
 
 
 class PolicyError(ValueError):
@@ -368,11 +345,11 @@ class Policy:
         if self.mode == "write":
             return (
                 "可改文件：能改项目里的文件，每次动手前先问你一下。"
-                "删家目录、推代码、读私钥这几样永远不做"
+                "删家目录永远不做；推代码、读凭据、提权会先弹卡问你"
             )
         return (
             "全授权：项目里的事不问就做。要动项目以外的东西还会先问你；"
-            "删家目录、推代码、读私钥这几样永远不做"
+            "删家目录永远不做；推代码、读凭据、提权会先弹卡问你"
         )
 
 

@@ -127,7 +127,7 @@ WHY_SEND_JUST_OPENED = "电脑上好像刚打开了一个 Claude，可能就是�
 _FRESH_PROC_SEC = 5
 WHY_SEND_NO_POLICY = "手机发消息的权限档位没配好，先不发。"
 WHY_SEND_NO_HOOK = "当前会话的审批钩子没有接上，无法安全执行完整控制；请先修复本机服务配置。"
-WHY_SEND_DEFERRED = "这一步需要审批钩子确认，但当前回合没有完成确认，所以没有执行。"
+WHY_SEND_DEFERRED = "它停在一步需要你批准的操作上，还没执行；点审批卡上的同意或拒绝。"
 
 # relay（进会话聊天）那条路的拒绝理由。和上面 `WHY_SEND_*` 不是一回事：
 # 那些是「桥能不能起 `claude -p --resume` 接着跑」，这些是「能不能把一句话送进它」。

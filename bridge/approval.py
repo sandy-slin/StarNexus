@@ -565,7 +565,8 @@ def _classify_readonly(command: str) -> bool:
             return False
     return True
 _HOME_OR_ROOT = '[\\"\']?(?:~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s\\"\';&|]+|/home/[^/\\s\\"\';&|]+|/Users|/home|/)(?:/\\.?|/\\*|\\*)?[\\"\']?(?![^\\s;&|]*/[^\\s;&|])'
-_NEVER_APPROVABLE = ((re.compile('\\b(python3?|node|ruby|perl|php|osascript|deno|bun)\\b\\s+(-c|-e|-r|--eval)'), '用解释器跑内联代码等于绕过所有限制'), (re.compile('\\b(python3?|node|ruby|perl|sh|bash|zsh)\\b[^|;&\\n]*<<'), '用 heredoc 喂脚本等于绕过所有限制'), (re.compile('\\|\\s*(sh|bash|zsh|python3?|node)\\b'), '把输出管进解释器等于绕过所有限制'), (re.compile('\\beval\\b|\\bexec\\b'), 'eval/exec 等于绕过所有限制'), (re.compile('\\brm\\b(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*[rR]|--recursive)))(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*f|--force)))[^;&|]*\\s' + _HOME_OR_ROOT + '(?=\\s|$|;|&|\\|)'), '递归删除根目录或家目录'), (re.compile('\\bfind\\s+' + _HOME_OR_ROOT + '(?=\\s)[^;&|]*\\s-(?:delete\\b|exec(?:dir)?\\s+rm\\b|ok(?:dir)?\\s+rm\\b)'), '把根目录或家目录整个删掉'), (re.compile('\\bgit\\s+push\\b'), '把代码推到远端'), (re.compile('\\bgit\\s+reset\\s+--hard\\b|\\bgit\\s+clean\\s+-[a-z]*f'), '丢弃本地改动'), (re.compile('\\bsudo\\b|\\bdoas\\b'), '提权'), (re.compile('\\bdd\\b.*\\bof=/dev/'), '裸写磁盘'), (re.compile(':\\(\\)\\s*\\{.*\\}\\s*;?\\s*:'), 'fork 炸弹'), (re.compile('\\bkubectl\\s+delete\\b|\\bhelm\\s+(delete|uninstall)\\b'), '删线上资源'), (re.compile('\\b(curl|wget)\\b.*\\|\\s*(sh|bash)'), '下载直接执行'), (re.compile('\\bchmod\\s+-R\\s+777\\b|\\bchown\\s+-R\\b.*\\s/\\s*$'), '递归改权限'), (re.compile('\\bdiskutil\\s+(erase|reformat)|\\bmkfs\\b'), '格式化磁盘'), (re.compile('\\blaunchctl\\s+(bootout|unload)\\b.*\\bcom\\.apple\\b'), '卸载系统服务'), (re.compile('\\bdefaults\\s+(write|delete)\\b'), '改系统设置'))
+_NEVER_APPROVABLE = ((re.compile('\\brm\\b(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*[rR]|--recursive)))(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*f|--force)))[^;&|]*\\s' + _HOME_OR_ROOT + '(?=\\s|$|;|&|\\|)'), '递归删除根目录或家目录'), (re.compile('\\bfind\\s+' + _HOME_OR_ROOT + '(?=\\s)[^;&|]*\\s-(?:delete\\b|exec(?:dir)?\\s+rm\\b|ok(?:dir)?\\s+rm\\b)'), '把根目录或家目录整个删掉'))
+_NEEDS_APPROVAL_CMDS = ((re.compile('\\b(python3?|node|ruby|perl|php|osascript|deno|bun)\\b\\s+(-c|-e|-r|--eval)'), '用解释器跑内联代码'), (re.compile('\\b(python3?|node|ruby|perl|sh|bash|zsh)\\b[^|;&\\n]*<<'), '用 heredoc 喂脚本'), (re.compile('\\|\\s*(sh|bash|zsh|python3?|node)\\b'), '把输出管进解释器'), (re.compile('\\beval\\b|\\bexec\\b'), 'eval/exec 执行拼出来的命令'), (re.compile('(?:^|[;&|(]\\s*)su\\b(?!-)'), '提权'), (re.compile('\\bgit\\s+push\\b'), '把代码推到远端'), (re.compile('\\bgit\\s+reset\\s+--hard\\b|\\bgit\\s+clean\\s+-[a-z]*f'), '丢弃本地改动'), (re.compile('\\bsudo\\b|\\bdoas\\b'), '提权'), (re.compile('\\bdd\\b.*\\bof=/dev/'), '裸写磁盘'), (re.compile(':\\(\\)\\s*\\{.*\\}\\s*;?\\s*:'), 'fork 炸弹'), (re.compile('\\bkubectl\\s+delete\\b|\\bhelm\\s+(delete|uninstall)\\b'), '删线上资源'), (re.compile('\\b(curl|wget)\\b.*\\|\\s*(sh|bash)'), '下载直接执行'), (re.compile('\\bchmod\\s+-R\\s+777\\b|\\bchown\\s+-R\\b.*\\s/\\s*$'), '递归改权限'), (re.compile('\\bdiskutil\\s+(erase|reformat)|\\bmkfs\\b'), '格式化磁盘'), (re.compile('\\blaunchctl\\s+(bootout|unload)\\b.*\\bcom\\.apple\\b'), '卸载系统服务'), (re.compile('\\bdefaults\\s+(write|delete)\\b'), '改系统设置'))
 
 def _flag_only_ok(tokens: list, start: int, spec: dict) -> str:
     """这一段是不是**只有**被认可的只读 token。返回空串 = 是；否则返回要问的原因。
@@ -687,9 +688,26 @@ def base_is_rm(out: list[str]) -> bool:
 def never_approvable(command: str) -> str:
     """这条命令是不是"连点同意都不许做"。返回原因，空串表示可以批准。
 
-    给审批层用：`ApprovalGate.approve` 在写 `.ok` 之前问一次。
-    这样用户在手机上点错也不会造成不可逆损失。
+    2026-11-17 起只剩一类：删根目录 / 家目录（FC-13）。其余危险操作见 `approval_reason`。
     原文和规范化文本（见上面第 25 轮那段）各判一次，任一命中就算。
+    """
+    text = (command or '').strip()
+    if not text:
+        return ''
+    normalized = _normalized_for_red_lines(text)
+    for candidate in (text, normalized):
+        if not candidate:
+            continue
+        for pattern, reason in _NEVER_APPROVABLE:
+            if pattern.search(candidate):
+                return reason
+    return ''
+
+def approval_reason(command: str) -> str:
+    """这条命令要不要**逐次审批**（任何档位都先出卡）。返回原因，空串 = 不需要。
+
+    读凭据、git push、提权、丢弃改动、删线上资源、内联解释器等。全授权档也不直接放行。
+    判据和原来的红线一样（原文 + 规范化文本），只是从「拒绝」改成「先问」。
     """
     text = (command or '').strip()
     if not text:
@@ -706,7 +724,7 @@ def never_approvable(command: str) -> str:
     for candidate in (text, normalized):
         if not candidate:
             continue
-        for pattern, reason in _NEVER_APPROVABLE:
+        for pattern, reason in _NEEDS_APPROVAL_CMDS:
             if pattern.search(candidate):
                 return reason
     return ''
@@ -913,6 +931,10 @@ def _is_safe(tool_name: str, tool_input: dict, directory: str) -> bool:
 
 
 def decide(decision: str, reason: str) -> None:
+    # Codex 的 PreToolUse 只认 deny（2026-11-17 实测 allow / ask 都报 unsupported）：
+    # 放行 = 什么都不输出、正常退出；defer 在 `_defer_for_approval` 里已换成 deny。
+    if os.environ.get("CARHER_HOOK_FLAVOR") == "codex" and decision != "deny":
+        sys.exit(0)
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -999,6 +1021,14 @@ def main() -> None:
             decide("deny", f"这是安全规则拦的，不是用户拒的：{red}。"
                            "不许拆开、写成脚本或换工具绕过；做不了就跳过这一步，"
                            "告诉用户你本来要做什么、为什么。")
+        # 🔴 2026-11-17（FC-13）：读凭据、git push、提权、丢弃改动等**逐次审批**，
+        # 在全授权放行之前判：全授权也要先出卡，点同意后才执行。
+        ask = approval_reason(str(tool_input.get("command") or ""))
+        if ask:
+            if _consume_grant(directory, digest(tool_name, tool_input)):
+                decide("allow", "你在飞书里批准了这一步")
+            _defer_for_approval(directory, tool_name, tool_input, session_id,
+                                f"这一步要你批准：{ask}")
 
     # 🔴 写文件的路径也要在工作目录内，在全授权之前判。
     # 2026-11-04 review 实测：trusted 下 Write 到 ~/.carher-feishu-agent/config.toml
@@ -1007,7 +1037,21 @@ def main() -> None:
     if tool_name in ("Write", "Edit", "NotebookEdit", "MultiEdit"):
         target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
         if target and not _write_inside(target, workspaces, cwd):
-            decide("deny", f"只能改工作目录里的文件，{target} 在范围外")
+            # 🔴 2026-11-17（FC-13）：工作区以外默认不改；确需改动先出审批卡，点同意后执行。
+            if _consume_grant(directory, digest(tool_name, tool_input)):
+                decide("allow", "你在飞书里批准了这一步")
+            _defer_for_approval(directory, tool_name, tool_input, session_id,
+                                f"要改工作目录以外的文件 {target}", {"outside": target})
+
+    # 读凭据（Read 工具）：逐次审批。其余 Read 不表态，交回启动参数的读作用域判。
+    if tool_name == "Read":
+        target = str(tool_input.get("file_path") or "")
+        if target and _touches_credentials(target):
+            if _consume_grant(directory, digest(tool_name, tool_input)):
+                decide("allow", "你在飞书里批准了这一步")
+            _defer_for_approval(directory, tool_name, tool_input, session_id,
+                                "这一步要你批准：读密钥 / 凭据文件")
+        sys.exit(0)
 
     # 路径越界：命令碰到 workspace 之外的用户数据 ⇒ 要审批。
     # 工具作用域（`Read(<目录>/**)`）管不到 Bash —— 实测 `cat <目录外文件>`
@@ -1037,16 +1081,8 @@ def main() -> None:
             # 用户看清了才点的同意，所以这里要认那一次批准。
             if _consume_grant(directory, digest(tool_name, tool_input)):
                 decide("allow", "你在飞书里批准了这一步")
-            try:
-                os.makedirs(directory, exist_ok=True)
-                with open(pending_path_for(directory, tool_name, tool_input), "w",
-                          encoding="utf-8") as handle:
-                    json.dump({"tool_name": tool_name, "tool_input": tool_input,
-                               "outside": outside, "session_id": session_id},
-                              handle, ensure_ascii=False)
-            except OSError:
-                pass
-            decide("defer", f"这条命令碰到了工作目录外的 {outside}")
+            _defer_for_approval(directory, tool_name, tool_input, session_id,
+                                f"这条命令碰到了工作目录外的 {outside}", {"outside": outside})
 
     # 全授权模式：到这里才放行 —— **路径检查在它前面**。
     # 「不问就做」不等于「能翻遍整台电脑」：读边界比全授权优先。
@@ -1084,14 +1120,28 @@ def main() -> None:
         decide("allow", "你在飞书里批准了这一步")
 
     # 还没批。落一份待办让服务端知道要发卡片，然后停下来。
+    _defer_for_approval(directory, tool_name, tool_input, session_id, "等你在飞书里确认")
+
+
+def _defer_for_approval(directory, tool_name, tool_input, session_id, reason, extra=None):
+    """落一份待办让服务端发审批卡，然后停下。
+
+    Codex 不支持 defer（实测只认 deny）⇒ `CARHER_HOOK_FLAVOR=codex` 时落待办后 deny，
+    并告诉模型：已经请主人在飞书里批准，批准后会再发一次让它接着做。
+    """
     try:
         os.makedirs(directory, exist_ok=True)
-        with open(pending, "w", encoding="utf-8") as handle:
-            json.dump({"tool_name": tool_name, "tool_input": tool_input,
-                       "session_id": session_id}, handle, ensure_ascii=False)
+        payload = {"tool_name": tool_name, "tool_input": tool_input, "session_id": session_id}
+        payload.update(extra or {})
+        with open(pending_path_for(directory, tool_name, tool_input), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
     except OSError:
         pass
-    decide("defer", "等你在飞书里确认")
+    if os.environ.get("CARHER_HOOK_FLAVOR") == "codex":
+        decide("deny", f"这不是出错：{reason}。已经在飞书里请主人批准，这一步先没执行。"
+                       "不要换写法绕过；先停下这一步，说明你要做什么、为什么，"
+                       "主人批准后会让你接着做。")
+    decide("defer", reason)
 
 
 def _consume_grant(directory, key):
@@ -1684,7 +1734,7 @@ def _inherit_auth(settings: dict) -> None:
         settings.setdefault(key, value)
 
 
-HOOK_MATCHER = "Bash|Write|Edit|NotebookEdit"
+HOOK_MATCHER = "Bash|Write|Edit|NotebookEdit|Read"
 
 
 def hook_settings(hook_path: str) -> dict:
@@ -1801,4 +1851,6 @@ def describe_action(tool_name: str, tool_input: dict) -> str:
         path = str(tool_input.get("file_path") or "?")
         verb = "新建/覆盖" if tool_name == "Write" else "修改"
         return f"{verb}文件：{_redact_then_cut(path, 300)}"
+    if tool_name == "Read":
+        return f"读文件：{_redact_then_cut(str(tool_input.get('file_path') or '?'), 300)}"
     return f"{tool_name}：{_redact_then_cut(json.dumps(tool_input, ensure_ascii=False), 300)}"
