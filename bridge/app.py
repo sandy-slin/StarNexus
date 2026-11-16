@@ -3171,7 +3171,7 @@ class Bridge:
             from .reply import normalize as _md_normalize
 
             body = _md_normalize(result.text or "")
-            self.replier.send(chat_id, f"🖥 {target.label} 回复：\n\n{body}{tail}")
+            await self._send_reply_maybe_doc(chat_id, f"🖥 {target.label}", body, tail)
             self._send_buttons(chat_id, self._choice_buttons(scope, chat_id, target.tool, target.id,
                                                              result.text or "") + buttons)
         elif result.delivered:
@@ -4419,7 +4419,7 @@ class Bridge:
         tail = f"\n\n{TALKING_PREFIX} {target.label} {TALKING_SUFFIX}"
         if result.ok:
             body = _md_normalize(result.text or "")
-            self.replier.send(target_chat_id, f"🆕 {target.label} 回复：\n\n{body}{tail}")
+            await self._send_reply_maybe_doc(target_chat_id, f"🆕 {target.label}", body, tail)
             choice = self._choice_buttons(target_scope, target_chat_id, tool, result.session_id,
                                           result.text or "")
             if choice:
@@ -4461,6 +4461,30 @@ class Bridge:
             return read_progress(path, offset).lines(lambda t: redact(t)[0])
 
         return read
+
+    async def _send_reply_maybe_doc(self, chat_id: str, label: str, body: str, tail: str) -> None:
+        """FC-10：会话回复超过 1500 字 ⇒ 全文进飞书文档，群里只发摘要和链接。建文档失败 ⇒ 照旧分段发原文。"""
+        from .fleet import longreply
+
+        if longreply.is_long(body):
+            try:
+                url = await asyncio.to_thread(self._publish_long_reply, label, body)
+                self.replier.send(chat_id, longreply.group_text(label, body, url) + tail)
+                logger.info("长回复 已转文档 字数=%d", len(body))
+                return
+            except Exception as exc:  # noqa: BLE001 —— 文档建不出来也不能丢回复
+                logger.warning("长回复 转文档失败，改为分段发原文：%s", _redact_text(str(exc)))
+        self.replier.send(chat_id, f"{label} 回复：\n\n{body}{tail}")
+
+    def _publish_long_reply(self, label: str, body: str) -> str:
+        from . import botmenu as bm
+        from .fleet import longreply
+        from .redact import redact
+
+        token = bm.tenant_token(self.settings.app_id, self.settings.app_secret)
+        owner = next(iter(sorted(self.settings.owner_open_ids)), "")
+        clean, _hits = redact(body)
+        return longreply.publish(bm._http, token, longreply.title_for(label.lstrip("🖥🆕 "), clean), clean, owner)
 
     def _choice_buttons(self, scope: str, chat_id: str, tool: str, sid: str, text: str) -> list:
         """回复结尾是「选一个」⇒ 每个选项一个按钮（FC-07）。选项文字记在服务端，按钮只带序号。"""

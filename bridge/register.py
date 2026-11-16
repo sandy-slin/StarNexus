@@ -65,6 +65,13 @@ _BASE_SCOPES = (
     #        [im:message.history:readonly, im:message:readonly, im:message]
     #    挑只读的 `im:message:readonly`，不要可写的 `im:message`。
     "im:message:readonly",
+    # 4. FC-10 长回复转飞书文档（2026-11-17 实测服务端原话，各挑最窄的一项）：
+    #    建文档 [docx:document, docx:document:create]；加协作者 [drive:drive, …, docs:permission.member:create]。
+    #    转块、写块用的 `docx:document.block:convert` / `docx:document:write_only` 本机已有，一并写进清单。
+    "docx:document:create",
+    "docx:document.block:convert",
+    "docx:document:write_only",
+    "docs:permission.member:create",
 )
 # 这台机器需要的全部权限面：单聊 3 项 + 建群清单里推荐开的那一项（去重、保序）。
 WANT_SCOPES = list(dict.fromkeys([*_BASE_SCOPES, *(need[2] for need in _GROUP_NEEDS)]))
