@@ -9,6 +9,7 @@
 - 代码逻辑发生变化时，必须完成仓库测试、同步本机运行目录、重启后台服务，并核对运行状态。
 - 只在目标 bot `Her remote · Pro` 和目标 MacBook Pro2 上做真实飞书验收；不要误操作“林森的her”。
 - 所有交付物必须放在本仓库并由 Git 管理；交付前不得留下未跟踪的交付文件，必须提交并记录提交 SHA。
+- 每次向 GitHub 推送前，必须先把远端同步到本地（`git fetch origin` + `git pull --rebase origin main`），再推送；禁止强推。步骤见 [`docs/runtime-delivery.md`](docs/runtime-delivery.md)。
 - 临时文件、日志和运行时备份不得混入交付；最终说明必须明确交付文件路径、提交 SHA 和验证结果。
 
 ## 细节文档索引
