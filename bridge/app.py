@@ -4254,6 +4254,9 @@ class Bridge:
         if not args:
             self._send_new_tool_card(chat_id)
             return True
+        if args[0].lower() in ("project", "项目") and len(args) >= 2 and args[1].lower() in ("new", "新建"):
+            await self._new_project(scope, chat_id, args[2:])
+            return True
         tool = TOOL_ALIASES.get(args[0].lower())
         if tool is None:
             self._say(chat_id, "认不出要用哪个，能用的是 claude / codex。")
@@ -4289,6 +4292,30 @@ class Bridge:
                 return True
         self._arm_new_session(scope, chat_id, tool, found.workspace, model, effort)
         return True
+
+    async def _new_project(self, scope: str, chat_id: str, args: list) -> None:
+        """`/ns project new <路径> [--git] [claude|codex]`：建项目目录，然后接着选工具（或直接进第一句）。"""
+        from .fleet.newsession import TOOL_ALIASES
+
+        git = any(a.lower() in ("--git", "git") for a in args)
+        tool = next((TOOL_ALIASES[a.lower()] for a in args if a.lower() in TOOL_ALIASES), "")
+        path = " ".join(a for a in args if a.lower() not in ("--git", "git") and a.lower() not in TOOL_ALIASES)
+        made = await asyncio.to_thread(workspace_mod.create_project, self.policy, path, git=git)
+        if not made.ok or not made.workspace:
+            self._say(chat_id, made.reply)
+            return
+        if tool:
+            self._say(chat_id, made.reply)
+            self._arm_new_session(scope, chat_id, tool, made.workspace)
+            return
+        self._say(chat_id, made.reply + "。接着选用哪个工具，选完说第一句就开工。")
+        self._remember_new_project(scope, made.workspace)
+        self._send_new_tool_card(chat_id)
+
+    def _remember_new_project(self, scope: str, path: str) -> None:
+        if not hasattr(self, "_new_projects"):
+            self._new_projects = {}
+        self._new_projects[scope] = path
 
     def _send_new_tool_card(self, chat_id: str) -> None:
         from .fleet.newsession import build_tool_card
@@ -4380,6 +4407,11 @@ class Bridge:
             self._unknown_chat_notice(chat_id)
             return toast("error", "服务刚重启过，先在这个聊天里发一句「新建会话」", "拒绝:scope对不上")
         if click["op"] == "tool":
+            project = getattr(self, "_new_projects", {}).pop(scope, "")
+            if project and self.policy.resolve_workspace(project):
+                # 刚用 `/ns project new` 建的项目 ⇒ 直接用它，不再让他选一遍目录
+                self._in_background(self._arm_new_session, scope, chat_id, click["tool"], project)
+                return toast("info", "好，用刚建的项目，说第一句吧", "已选好:新项目")
             self._in_background(self._send_new_dir_card, scope, chat_id, click["tool"])
             return toast("info", "收到，选一下项目", "已排队:选项目")
         tool, cwd = self._newsession_state().take(scope, click["n"], click["i"])

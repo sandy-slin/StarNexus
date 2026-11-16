@@ -414,6 +414,90 @@ def create_missing_workspace(policy: Policy, raw: str) -> CdResult:
     return CdResult(Outcome.OK, f"已新建目录：{_short(target, policy)}", workspace=target)
 
 
+_SYSTEM_PREFIXES = ("/System", "/Library", "/bin", "/sbin", "/usr", "/etc", "/private", "/var", "/dev", "/opt")
+PROJECT_MAX_DEPTH = 4
+
+
+def create_project(policy: Policy, raw: str, *, git: bool = False, runner=None) -> CdResult:
+    """`/ns project new <路径> [--git]`：在白名单内新建一个项目目录（FC 5.1「新建项目」）。
+
+    - 必须是完整路径（或 ~/ 开头），落在白名单根目录下；越界、系统目录、`..` 逃逸一律拒。
+    - **不覆盖**：目标已经存在（目录或文件）就拒，不往已有目录里 git init。
+    - 白名单根下最多新建 4 级；父目录不存在时一起建。
+    - `git=True`：`git init` + 一个空的初始提交（失败不回滚目录，照实说）。
+    白名单就是 `policy.workspaces` 的根目录：新项目落在根下就自动可用，不改配置（产品定义 §9：来源=用户创建）。
+    """
+    raw = (raw or "").strip().strip("'\\\"")
+    if not raw:
+        return CdResult(Outcome.MISSING, "要写项目路径，比如：/ns project new ~/work/demo --git")
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return CdResult(Outcome.OUTSIDE, "项目路径要写完整，比如 ~/work/demo。")
+    if ".." in expanded.replace("\\", "/").split("/"):
+        return CdResult(Outcome.OUTSIDE, "项目路径里不能有 ..。")
+    target = os.path.normpath(expanded)
+    root = None
+    for allowed in policy.workspaces:
+        base = os.path.realpath(os.path.expanduser(allowed))
+        for form in (target, os.path.join(os.path.realpath(os.path.dirname(target)), os.path.basename(target))):
+            if form.startswith(base + os.sep):
+                root, target = base, form
+                break
+        if root:
+            break
+    if root is None:
+        if any(target == p or target.startswith(p + os.sep) for p in _SYSTEM_PREFIXES):
+            return CdResult(Outcome.OUTSIDE, "不能在系统目录里新建项目。")
+        return _verify(policy, target, raw)
+    rel_top = os.path.relpath(target, root).split(os.sep)[0]
+    if rel_top.startswith(".") or any(root + os.sep + rel_top == p for p in _SYSTEM_PREFIXES):
+        return CdResult(Outcome.OUTSIDE, "不能在隐藏目录或系统目录里新建项目。")
+    if os.path.lexists(target):
+        return CdResult(Outcome.NOT_DIR, f"这个位置已经有东西了，不覆盖：{_short(target, policy)}。换一个名字再建。")
+    depth = len(os.path.relpath(target, root).split(os.sep))
+    if depth > PROJECT_MAX_DEPTH:
+        return CdResult(Outcome.OUTSIDE, f"新建的项目最多在可用目录下 {PROJECT_MAX_DEPTH} 层。")
+    existing = target
+    while not os.path.exists(existing):
+        existing = os.path.dirname(existing)
+    if os.path.realpath(existing) != existing and policy.resolve_workspace(os.path.realpath(existing)) is None:
+        return _verify(policy, os.path.realpath(existing), raw)
+    if not os.access(existing, os.W_OK):
+        return CdResult(Outcome.NO_ACCESS, f"这个位置我写不进去：{_short(existing, policy)}")
+    try:
+        os.makedirs(target, 0o755)
+    except OSError as exc:
+        logger.warning("新建项目失败 path=%s error=%s", target, exc)
+        return CdResult(Outcome.NO_ACCESS, f"没能新建这个项目：{_short(target, policy)}")
+    resolved = policy.resolve_workspace(target)
+    if resolved is None:
+        return CdResult(Outcome.OUTSIDE, "新建的目录不在可用范围里。")
+    note = ""
+    if git:
+        note = _git_init(resolved, runner)
+    logger.info("新建项目 path=%s git=%s", resolved, git)
+    return CdResult(Outcome.OK, f"已新建项目：{_short(resolved, policy)}{note}", workspace=resolved)
+
+
+def _git_init(path: str, runner=None) -> str:
+    import subprocess
+
+    run = runner or (lambda argv: subprocess.run(argv, cwd=path, capture_output=True, text=True, timeout=30))
+    steps = (["git", "init", "-q"],
+             ["git", "-c", "user.name=StarNexus", "-c", "user.email=starnexus@localhost",
+              "commit", "-q", "--allow-empty", "-m", "chore: initial commit"])
+    for argv in steps:
+        try:
+            res = run(argv)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("新建项目 git 失败 step=%s error=%s", argv[1], exc)
+            return "（目录建好了，但 git 初始化没成功）"
+        if getattr(res, "returncode", 1) != 0:
+            logger.warning("新建项目 git 失败 step=%s rc=%s", argv[-1], getattr(res, "returncode", "?"))
+            return "（目录建好了，但 git 初始化没成功）"
+    return "，已 git init 并做了初始提交"
+
+
 def _verify(policy: Policy, candidate: str, raw: str) -> CdResult:
     """收敛 + 存在性检查。越界的回话里**不能泄露**那个路径存不存在。"""
     resolved = policy.resolve_workspace(candidate)
