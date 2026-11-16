@@ -60,6 +60,11 @@ _BASE_SCOPES = (
     # 2. 流式输出（第 17 轮角色 F 的方案）：建卡片实体 + 反复推全量文本。
     #    F 实测现有 13 项 scope 里 cardkit 一项都没有。
     "cardkit:card:write",
+    # 3. FC-09 图片 / 文件输入：下载消息里的资源。2026-11-17 实测服务端原话：
+    #        code=99991672  One of the following scopes is required:
+    #        [im:message.history:readonly, im:message:readonly, im:message]
+    #    挑只读的 `im:message:readonly`，不要可写的 `im:message`。
+    "im:message:readonly",
 )
 # 这台机器需要的全部权限面：单聊 3 项 + 建群清单里推荐开的那一项（去重、保序）。
 WANT_SCOPES = list(dict.fromkeys([*_BASE_SCOPES, *(need[2] for need in _GROUP_NEEDS)]))

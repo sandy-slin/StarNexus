@@ -254,6 +254,17 @@ class MenuHeal:
         if sub.get("code"):
             return self._failed_with(sub, "订阅按钮点击")
 
+        # 🔴 补权限（2026-11-17，FC-09 撞出来）：清单变了指纹会让这里重跑，但原来只写菜单 + 发版，
+        # 新加进 `register.WANT_SCOPES` 的权限从没申请过 ⇒ 发出去的版本里照样没有。必须在发版之前补。
+        reg = bm._reg()
+        have = bm.read_scopes(token, http=call)
+        todo = reg.missing_scopes(have or ())
+        if todo:
+            added = bm.add_scopes(self.app_id, token, todo, http=call)
+            if added.get("code"):
+                return self._failed_with(added, "申请权限")
+            logger.info("常驻菜单自愈：已申请权限 %s", ", ".join(todo))
+
         # 发版前再回读一次标记：安装器可能就在这几秒里发过了
         if is_done(self.state_path, self.app_id):
             self._done = True
