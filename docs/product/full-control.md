@@ -136,7 +136,8 @@
 - **能力声明**：每个工具声明自己支持的能力和限制；不支持的项在菜单和卡片里隐藏或置灰，并给出替代方法。§4 的矩阵按工具逐列展开。
 - **最小接入验收**：能建会话、发一句话、看到一轮完成、能停下；再按 §4 矩阵补齐提问、审批、模型、权限等项。
 - **边界**：工具私有协议不进交互层；工具升级导致接口变化时，只改对应适配器，并跑同一套验收用例。
-- **现状**：未实现。当前只有 Claude 和 Codex 两条接入路径，适配层尚未抽象；先抽层，再接第三个工具。
+- **现状**：已有（2026-11-17）。能力声明表在 `bridge/fleet/model.py` 的 `CAPS`（start / send / stop / fork / archive / model / effort / approval / progress / choices），菜单、新建会话卡、模型卡按它显示。第三个工具 opencode 已接入（`bridge/fleet/opencode.py`）：新建、接着聊、停下、复制、模型列表；真实飞书验收通过（私聊 `/ns opencode` → 写文件 → 自动建群 → 群里接着问能答对）。opencode 不支持：逐条审批（档位 trusted / write 用 `--auto`）、effort、进展卡里的工具列表。
+- **实测坑**：opencode 认环境变量 `PWD` 而不是子进程 cwd；要加 `--standalone` 才按指定目录工作；本机自带默认模型（grok-4.6）一次工具调用要几分钟，默认改用 `cpa-gui/gpt-5.6-luna`（可用 `CARHER_OPENCODE_MODEL` 换）；后台服务 PATH 会先找到旧版 `~/.local/bin/opencode`（1.18），现在自动挑最新版本。
 
 ## 6. 菜单定义
 
