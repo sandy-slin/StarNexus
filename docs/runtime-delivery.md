@@ -17,6 +17,14 @@
 - 最终说明必须给出提交 SHA、交付文件路径、测试结果、部署状态和遗留问题。
 - 临时日志、密钥、access token、app secret 和完整授权链接不得提交。
 
+## 推送到 GitHub
+
+- 远端：`origin` = `git@github.com:sandy-slin/StarNexus.git`，分支 `main`。
+- 核心更新提交后立即推送：功能代码、测试、产品定义、操作手册、菜单变更。不要攒到最后一起推。
+- 推送前用 `git diff origin/main..main` 扫一遍密钥、access token、app secret、私钥；有命中就先移除，不推送。
+- 只用普通 `git push origin main`；不强推、不改写已推送的历史。推送被拒时先 `git pull --rebase`，解决冲突后再推。
+- 推送后 `git status -sb` 应显示与 `origin/main` 一致，交付说明里写明已推送的 SHA。
+
 ## 结果记录
 
 项目记录写根因、决策、提交、测试、同步、重启、飞书版本和客户端证据。需要林森事后关注的事项用红色字体标注。项目记录不替代 Git 交付。

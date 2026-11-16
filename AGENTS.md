@@ -18,7 +18,7 @@
 | 选择操作手册和交付规则 | [`docs/operations.md`](docs/operations.md) | 先按任务类型读取对应细节；所有交付必须有 Git 提交 |
 | Computer Use、飞书真实验收 | [`docs/computer-use.md`](docs/computer-use.md) | 按目标确认、操作、结果三段验收；客户端画面未确认时不能宣布完成 |
 | 常驻菜单更新和发布 | [`docs/menu-update.md`](docs/menu-update.md) | 源码、能力、版本、客户端四层分别验收 |
-| 后台同步、回归和交付 | [`docs/runtime-delivery.md`](docs/runtime-delivery.md) | 同步运行目录、重启服务、跑回归、提交 Git 并记录 SHA |
+| 后台同步、回归和交付 | [`docs/runtime-delivery.md`](docs/runtime-delivery.md) | 同步运行目录、重启服务、跑回归、提交并推送 GitHub，记录 SHA |
 | 常驻菜单结构、节点限制、事件订阅和版本发布 | [`bridge/botmenu.py`](bridge/botmenu.py)、[`bridge/menu_heal.py`](bridge/menu_heal.py) | 先跑 `validate_tree()`；菜单形状变化必须发布新版本 |
 | 菜单版本号回归 | [`tests/test_menu_version.py`](tests/test_menu_version.py) | 覆盖整点前十分钟等前导零场景 |
 | 新建会话、建群、模型和权限 | [`bridge/fleet/newsession.py`](bridge/fleet/newsession.py)、[`bridge/fleet/chatbind.py`](bridge/fleet/chatbind.py)、[`bridge/fleet/model.py`](bridge/fleet/model.py) | 以代码和测试为准，真实群聊必须在目标 bot 上核对 |
@@ -31,9 +31,10 @@
 1. 运行针对性测试和 Python 语法检查。
 2. 运行完整测试；依赖缺失时记录为环境阻塞，不能把部分通过写成全量通过。
 3. 将交付文件加入 Git，提交并记录提交 SHA；不能以本地未提交文件作为交付结果。
-4. 备份并同步 `bridge/` 到 `~/.carher-feishu-agent/bridge/`。
-5. 核对关键文件哈希，重启 `com.carher.feishu-agent`，确认服务 `running`。
-6. 对飞书功能做 Computer Use 实测；只看到服务端回执不算客户端验收通过。
+4. 核心更新提交后立即推送到 GitHub（`origin main`），推送前扫描密钥；细节见 [`docs/runtime-delivery.md`](docs/runtime-delivery.md)。
+5. 备份并同步 `bridge/` 到 `~/.carher-feishu-agent/bridge/`。
+6. 核对关键文件哈希，重启 `com.carher.feishu-agent`，确认服务 `running`。
+7. 对飞书功能做 Computer Use 实测；只看到服务端回执不算客户端验收通过。
 
 ## 结果记录
 
