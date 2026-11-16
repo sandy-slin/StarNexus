@@ -917,7 +917,10 @@ class Bridge:
         # 🔴 发图片 / 文件 / 语音原来一声不响（R2 实测 6 种全部静默）。
         # 只回主人（走到这里已经过了鉴权），表情不回（他只是在逗，回了反而吵）。
         mtype = str(getattr(message, "message_type", "") or "text")
-        if mtype not in ("text", "post", "sticker") and message_id:
+        from .fleet.inbox import attachments_of
+
+        attachments = attachments_of(mtype, getattr(message, "content", "") or "")
+        if mtype not in ("text", "post", "sticker") and message_id and not attachments:
             self._seen_messages[message_id] = now
             chat_for_reply = getattr(message, "chat_id", "") or ""
             if chat_for_reply:
@@ -928,8 +931,8 @@ class Bridge:
                 self._seen_messages[message_id] = now
             return
 
-        text = self._extract_text(message)
-        if not text:
+        text = "" if mtype not in ("text", "post") else self._extract_text(message)
+        if not text and not attachments:
             if message_id:
                 self._seen_messages[message_id] = now   # 真没正文 ⇒ 处理完了，重推不必再看
             if mtype == "post":
@@ -967,9 +970,11 @@ class Bridge:
             if self._recently_disconnected():
                 late_note = f"（这条晚到了约 {late_min} 分钟 —— 电脑多半刚才睡着了，现在开始处理）"
         # 提示和回复走同一个协程、先发提示（R-entry：原来两路并行，菜单卡可能比「现在开始处理」先到）
-        asyncio.run_coroutine_threadsafe(
-            self._handle_then_unack(scope, chat_id, text, message_id, late_note=late_note), self._loop
-        )
+        if attachments:
+            coro = self._attachments_then_handle(scope, chat_id, text, message_id, attachments, late_note)
+        else:
+            coro = self._handle_then_unack(scope, chat_id, text, message_id, late_note=late_note)
+        asyncio.run_coroutine_threadsafe(coro, self._loop)
         if message_id:
             self._seen_messages[message_id] = now   # 真派发出去了才算「处理过」
 
@@ -1035,6 +1040,55 @@ class Bridge:
         return " ".join(parts).strip()
 
     # ---------- 真正干活 ----------
+
+    def _inbox_cwd(self, scope: str) -> str:
+        """附件存到哪个项目：群绑定的会话 > 待发目标的会话 > 桥自己这个聊天的工作目录。"""
+        control = getattr(self, "fleet", None)
+        target = None
+        binds = getattr(self, "chat_binds", None)
+        if control is not None and str(scope).startswith("group:") and binds is not None:
+            try:
+                target = binds.active_of_scope(scope)
+            except Exception:  # noqa: BLE001 —— 读不出绑定就按没绑处理
+                target = None
+        if target is None and control is not None:
+            target, _expired = control.peek_pending_fresh(scope)
+        if target is not None and control is not None:
+            cwd = control._cwd_of(target.tool, target.id)
+            if cwd:
+                return cwd
+        workspaces = getattr(self, "workspaces", None)
+        if workspaces is not None:
+            try:
+                return workspaces.get(scope)
+            except Exception:  # noqa: BLE001
+                pass
+        return self.settings.policy.default_workspace
+
+    async def _attachments_then_handle(self, scope: str, chat_id: str, text: str, message_id: str,
+                                       attachments: list, late_note: str = "") -> None:
+        """FC-09：先把图片 / 文件下载进 `<项目>/.starnexus/inbox/`，再把「原话 + 路径」当成这条消息处理。"""
+        from .fleet import inbox
+
+        cwd = await asyncio.to_thread(self._inbox_cwd, scope)
+        saved: list = []
+        failed = 0
+        for kind, key, name in attachments:
+            try:
+                data, served_name, mime = await asyncio.to_thread(inbox.download, self.client, message_id, key, kind)
+                directory = await asyncio.to_thread(inbox.inbox_dir, cwd)
+                fname = inbox.safe_name(name or served_name, key, kind, mime)
+                saved.append(await asyncio.to_thread(inbox.save, directory, fname, data))
+            except Exception as exc:  # noqa: BLE001 —— 一个附件失败不影响别的
+                failed += 1
+                logger.warning("附件 下载失败 kind=%s 原因=%s", kind, _redact_text(str(exc)))
+        logger.info("附件 收到=%d 存好=%d 失败=%d 目录=%s", len(attachments), len(saved), failed, cwd)
+        if not saved:
+            self._say(chat_id, "附件没能存到电脑上（下载失败），这条没发出去。稍后再发一次，或者把内容打成文字。")
+            return
+        if failed:
+            self._say(chat_id, f"有 {failed} 个附件没下载下来，先把存好的 {len(saved)} 个发过去。")
+        await self._handle_then_unack(scope, chat_id, inbox.compose(text, saved), message_id, late_note=late_note)
 
     async def _handle_then_unack(self, scope: str, chat_id: str, text: str,
                                  message_id: str, late_note: str = "") -> None:
