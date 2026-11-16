@@ -197,3 +197,53 @@ def build_push_text(push: Push, label: str, project: str, last_reply: str = "",
             lines.append("它最后说：\n" + reply)
         lines.append("在群里直接回话就能接着给它派活。")
     return "\n".join(line for line in lines if line)
+
+
+# ---------- 重要进展（§5.8：计划确定 / 阶段完成 / 产出文档）----------
+
+
+MILESTONE_GAP_SEC = 10 * 60
+MILESTONE_CHARS = 90
+# 认出「值得说一句」的句子。宁少不多：只是过程描述（跑测试、改文件）不推。
+_MILESTONE_WORDS = (
+    "计划", "方案", "阶段", "已完成", "完成了", "搞定了", "修好了", "已修复",
+    "已生成", "已导出", "已部署", "已提交", "文档已", "结论",
+)
+
+
+def milestone_of(text: str) -> str:
+    """从一段回复里挑一句「重要进展」；没有 ⇒ 空串。
+
+    只认短句（一行一条），太长的是解释过程，不适合推。命中词见 `_MILESTONE_WORDS`。
+    """
+    for raw in str(text or "").splitlines():
+        line = " ".join(raw.split()).strip(" \t#*-•>")
+        if not line or len(line) > MILESTONE_CHARS:
+            continue
+        if line.endswith("：") or line.endswith(":"):
+            continue
+        if any(word in line for word in _MILESTONE_WORDS):
+            return line
+    return ""
+
+
+class Milestones:
+    """同一会话 10 分钟最多推一条；同一句话不重复推。"""
+
+    def __init__(self, *, gap: float = MILESTONE_GAP_SEC, now: Callable[[], float] = time.time) -> None:
+        self.gap = float(gap)
+        self._now = now
+        self._lock = threading.Lock()
+        self._last: dict = {}  # key -> (句子, 时间)
+
+    def due(self, key: tuple, text: str) -> str:
+        line = milestone_of(text)
+        if not line:
+            return ""
+        now = self._now()
+        with self._lock:
+            prev = self._last.get(key)
+            if prev is not None and (prev[0] == line or now - prev[1] < self.gap):
+                return ""
+            self._last[key] = (line, now)
+        return line

@@ -6810,6 +6810,10 @@ class Bridge:
         control = getattr(self, "fleet", None)
         if pusher is None or binds is None or control is None:
             return
+        try:
+            self._milestone_tick(view, binds, control)
+        except Exception:  # noqa: BLE001 —— 重要进展是锦上添花
+            logger.debug("重要进展这一拍失败", exc_info=True)
         pushes = pusher.due(view, binds)
         if not pushes:
             return
@@ -6840,6 +6844,34 @@ class Bridge:
                 ok = self._say(push.chat_id, text)
             logger.info("群进展推送 类型=%s tool=%s 会话=%s 送达=%s", push.kind, sess.tool,
                         str(sess.id)[:8], ok)
+
+    def _milestone_tick(self, view, binds, control) -> None:
+        """§5.8 重要进展：电脑上正在跑的会话（不是群里发进去的那轮）说了一句里程碑 ⇒ 群里推一句。
+
+        同一会话 10 分钟最多一条。群里自己发进去的那一轮，回复本来就会贴回群里 ⇒ 不推。
+        """
+        from .fleet.cards import session_label
+        from .fleet.grouppush import Milestones
+
+        tracker = getattr(self, "_milestones", None)
+        if tracker is None:
+            tracker = self._milestones = Milestones()
+        inflight = {v for v in getattr(self, "_fleet_inflight", {}).values()}
+        for sess in list(getattr(view, "sessions", None) or []):
+            if getattr(sess, "status", "") != "running" or (sess.tool, sess.id) in inflight:
+                continue
+            bound = binds.of_session(sess.tool, sess.id)
+            if bound is None or not getattr(bound, "on", True):
+                continue
+            try:
+                _fresh, messages, _note = control.detail(sess.tool, sess.id, 2)
+            except Exception:  # noqa: BLE001
+                continue
+            last = next((m.text for m in reversed(messages or []) if getattr(m, "role", "") == "assistant"), "")
+            line = tracker.due((sess.tool, sess.id), _redact_text(last))
+            if line:
+                ok = self._say(bound.chat_id, f"📌 {session_label(sess, _redact_text)} 进展：{line}")
+                logger.info("重要进展 推送 tool=%s 会话=%s 送达=%s", sess.tool, str(sess.id)[:8], ok)
 
     def _escalator(self):
         esc = getattr(self, "_needs_you_escalator", None)

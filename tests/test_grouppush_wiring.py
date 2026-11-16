@@ -84,3 +84,57 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MilestoneTest(unittest.TestCase):
+    def test_picks_short_milestone_line(self):
+        from bridge.fleet.grouppush import milestone_of
+
+        self.assertEqual(milestone_of("看了下代码"), "")
+        self.assertEqual(milestone_of("计划："), "")
+        self.assertEqual(milestone_of("看了下代码\n计划已确定，三步走"), "计划已确定，三步走")
+        self.assertEqual(milestone_of("x" * 200), "")
+
+    def test_gap_and_dedupe(self):
+        from bridge.fleet.grouppush import Milestones
+
+        now = [1000.0]
+        m = Milestones(gap=600, now=lambda: now[0])
+        self.assertEqual(m.due(("codex", "s"), "阶段一完成"), "阶段一完成")
+        self.assertEqual(m.due(("codex", "s"), "阶段一完成"), "")
+        self.assertEqual(m.due(("codex", "s"), "阶段二完成"), "")
+        now[0] += 601
+        self.assertEqual(m.due(("codex", "s"), "阶段二完成"), "阶段二完成")
+
+
+class MilestoneWiringTest(unittest.TestCase):
+    def test_running_bound_session_pushes_once(self):
+        from types import SimpleNamespace as NS
+
+        from bridge import app as app_mod
+
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        said = []
+        bridge._say = lambda chat, text: said.append((chat, text)) or True
+        sess = NS(tool="codex", id="s1", status="running", title="修登录")
+        view = NS(sessions=[sess])
+        binds = NS(of_session=lambda t, s: NS(chat_id="oc_g", on=True))
+        control = NS(detail=lambda t, s, n: (sess, [NS(role="assistant", text="阶段一已完成，开始写测试")], ""))
+        bridge._milestone_tick(view, binds, control)
+        bridge._milestone_tick(view, binds, control)
+        self.assertEqual(len(said), 1)
+        self.assertIn("阶段一已完成", said[0][1])
+
+    def test_inflight_from_group_not_pushed(self):
+        from types import SimpleNamespace as NS
+
+        from bridge import app as app_mod
+
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        bridge._fleet_inflight = {"group:oc_g": ("codex", "s1")}
+        said = []
+        bridge._say = lambda chat, text: said.append(text) or True
+        sess = NS(tool="codex", id="s1", status="running", title="x")
+        bridge._milestone_tick(NS(sessions=[sess]), NS(of_session=lambda t, s: NS(chat_id="oc_g", on=True)),
+                               NS(detail=lambda t, s, n: (sess, [NS(role="assistant", text="已完成")], "")))
+        self.assertEqual(said, [])
