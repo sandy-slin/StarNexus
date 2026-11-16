@@ -120,8 +120,8 @@ _USER_NOISE_PREFIXES = (
 )
 _TEXT_PART_TYPES = ("input_text", "output_text", "text")
 
-# 手机上的档位 → `-c sandbox_mode=…`。明确给 trusted 一个工作区写入边界，
-# 避免依赖用户 Codex 配置，也避免无值时回退到只读。
+# 当前权限档位 → `-c sandbox_mode=…`。手机入口和终端入口共用同一档位，
+# 明确给 trusted 一个工作区写入边界，避免依赖用户 Codex 配置。
 # `readonly` 只读；`write` / `trusted` 可写当前工作区，不能越过工作区边界。
 SANDBOX_BY_MODE = {"readonly": "read-only", "write": "workspace-write", "trusted": "workspace-write"}
 
@@ -760,7 +760,7 @@ class CodexAdapter(Adapter):
     def send(self, id: str, text: str, timeout: float = 600, mode: Optional[str] = None) -> ActionResult:
         """没人占着才发：`codex exec resume --json --skip-git-repo-check [-c sandbox_mode=…] -- <id> <text>`。
 
-        `mode`：手机上的权限档位。给了就按档位压 sandbox（见 SANDBOX_BY_MODE）；认不出 ⇒ 只读。
+        `mode`：当前权限档位。给了就按档位压 sandbox（见 SANDBOX_BY_MODE）；认不出 ⇒ 只读。
         不给（None）= 用用户 config.toml 里那份（老调用方式，测试在用）。
         """
         if not is_thread_id(id):
@@ -868,11 +868,11 @@ class CodexAdapter(Adapter):
 
     # ---------- start：手机上新建会话 ----------
 
-    def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "readonly",
+    def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "trusted",
               model: str = "", on_pid: Optional[Callable[[int], None]] = None) -> ActionResult:
         """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
 
-        🔴 和 send 同一条红线：手机上发进 Codex 一律按只读（control.start 传 readonly）。
+        手机入口和终端入口共用当前权限档位；默认 trusted，对应工作区内可写。
         新会话的 id 从 `thread.started` 事件里拿；拿不到就当没开成（没法接着聊）。
         """
         text = str(text or "").strip()

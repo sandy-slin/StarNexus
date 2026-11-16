@@ -52,6 +52,12 @@ class ControlOnPidTest(unittest.TestCase):
 
 
 class CodexSandboxModeTest(unittest.TestCase):
+    def test_mobile_start_defaults_to_trusted_mode(self):
+        from inspect import signature
+        from bridge.fleet.codex import CodexAdapter
+
+        self.assertEqual(signature(CodexAdapter.start).parameters["mode"].default, "trusted")
+
     def test_trusted_is_workspace_write(self):
         from bridge.fleet.codex import SANDBOX_BY_MODE
 

@@ -3446,7 +3446,7 @@ class Bridge:
             # 🔴 说法和确认卡同一个判断（要不要 @）；退出给按钮，不叫人打「取消」
             # （11-05 用户原话：「不要让用户输入 "/cancel" 等类似的 尽量用按钮的形式」）。
             # 原来确认卡上那几条安全提示**照样说一遍**（只是不再要他点确认）：
-            # 它用的是电脑上那套权限、手机这边的只读管不到它、别拉别人进来。
+            # 手机和终端共用当前权限档位；群里的人能看到回复，别拉无关人员进来。
             self._say_with_buttons(
                 bound.chat_id,
                 f"这个群直达{label}，现在就能说。"
@@ -4261,7 +4261,7 @@ class Bridge:
         关掉了（jsonl 还在）⇒ 桥起 `claude -p --resume` 接着跑，用**手机这边的档位**。
         选路在 `control.send` 里按现查的结果走，用户在聊天里感觉不到换了路 ——
         所以这一位要进确认的指纹：路变了，他确认过的就不是这回事了。
-        Codex / Cursor 两条路都按只读发（control.send 的红字），开没开着权限不变，不算。
+        Codex 跟随当前权限档位；Cursor 保持自身的权限映射。开没开着不改变权限规则，不算会话身份变化。
         """
         return getattr(sess, "tool", "") == "claude" and getattr(sess, "owner", "") == "none"
 
@@ -4393,7 +4393,7 @@ class Bridge:
         else:
             fallback = (
                 f"要直接跟{label}说话：你之后说的每一句都进电脑上那个会话，"
-                "由它用**你在电脑上给它的权限**去做（多半是不问你就改），手机这边的只读管不到它。\n"
+                "手机和终端共用当前权限档位；当前默认是全授权，需要收紧时请切到「只读」。\n"
                 + extra +
                 "卡片发不出去：确认的话回一句 `/talk!`，不确认什么都不用做。"
             )
@@ -4540,7 +4540,7 @@ class Bridge:
 
         - Claude 电脑上开着 ⇒ 话送进那个会话，用**它在电脑上那套权限**（多半不问就改）
         - Claude 电脑上关着 ⇒ 后台接着跑，用**手机这边的档位**（`_runs_in_background`，F 那套）
-        - Codex ⇒ 跟随手机这边的权限档位（trusted 可写，write 限定工作区，readonly 只读）
+        - Claude / Codex ⇒ 跟随当前权限档位（trusted 可写，write 限定工作区，readonly 只读）
         写死一句「按电脑上那套」在后两种情况都是错的，而且错在「以为它能改」那个方向反了也不安全。
         """
         sess = None
@@ -4550,10 +4550,11 @@ class Bridge:
             sess = None
         if tool == "codex":
             mode = MODE_LABELS.get(getattr(self.policy, "mode", "trusted"), "全授权")
-            return f"· 从手机发过去的话按**{mode}**权限处理\n"
+            return f"· 按当前权限档位 **{mode}** 处理，手机和终端一致\n"
         if sess is not None and self._runs_in_background(sess):
-            return "· 电脑上这个会话现在关着，会在后台接着跑，权限按手机这边的档位\n"
-        return "· 它按电脑上那套权限干活，多半不问就改；手机这边的「只读」管不到它\n"
+            return "· 电脑上这个会话现在关着，会在后台接着跑，权限按当前档位处理\n"
+        mode = MODE_LABELS.get(getattr(self.policy, "mode", "trusted"), "全授权")
+        return f"· 手机和终端共用当前权限档位（当前：{mode}）\n"
 
     def _grant_by_open_click(self, scope: str, tool: str, sid: str) -> None:
         """把「主人在单聊点了接着聊 → 建群」这一下当成确认。走**和点「确认」完全一样**的记法。

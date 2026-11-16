@@ -14,7 +14,7 @@ planning → running → (waiting_human ⇄ running) → done / failed / cancell
 - 服务重启时还在跑的任务记成 interrupted，发「/ceo 继续」接着复核
 
 🔴 安全：子任务和平时手机上新开会话走同一套闸门（control.start：目录白名单；
-Codex 一律只读；Claude 按手机档位 + 审批钩子）。CEO 大脑本身没有任何工具，只出 JSON。
+Claude / Codex 都按当前权限档位和审批钩子）。CEO 大脑本身没有任何工具，只出 JSON。
 """
 
 from __future__ import annotations
@@ -88,8 +88,8 @@ ROLE = (
     "你是一个 AI 团队的 CEO。董事长（人）给你一个总任务，你手下有若干会话（Claude 或 Codex，各用不同模型），"
     "每个会话完成一个子任务。你负责：拆分任务、给每个会话写清楚的指令、汇总进展、仲裁冲突、决定下一步，"
     "最后把总结果交给董事长。只有真正需要人拍板（取舍、授权、缺信息、风险操作）时才问董事长。\n"
-    "能力约束：Codex 会话是**只读**的（只能读代码、分析、调研、评审、给方案，不能改文件、不能运行会写盘的命令）；"
-    "Claude 会话能改文件和运行命令（在项目目录里）。需要改代码的子任务交给 Claude；评审、分析、调研可以交给 Codex。"
+    "能力约束：Claude 和 Codex 都按当前权限档位工作；trusted / write 档可按工作区规则改文件和运行命令，readonly 档只读。"
+    "需要改代码的子任务可以交给 Claude 或 Codex；评审、分析、调研同样可以交给两者。"
     "可选模型：Claude 用 " + " / ".join(CLAUDE_MODELS) + "；Codex 用 " + " / ".join(CODEX_MODELS) + "。"
     "所有输出用简体中文。"
 )

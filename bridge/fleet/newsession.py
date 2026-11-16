@@ -5,7 +5,7 @@
 1. 点「➕ 新建会话」（或发「新建会话」/ `/newsession` / `/ns`）⇒ 选工具卡：Claude / Codex。
 2. 点一个工具 ⇒ 选项目卡：当前项目 + 白名单里最近动过的仓库（`workspace.recent_repos`）。
 3. 点一个项目 ⇒ **下一句话**就是新会话的第一句。开好之后自动进对话模式，后面每句走现有的
-   `control.send(relay=True)` 管道（Claude 按手机档位 + 审批钩子；Codex 一律只读）。
+   `control.send(relay=True)` 管道（Claude / Codex 都按当前权限档位）。
 
 ## 回调值（白名单，同 `actions.resolve_do_click` 的思路）
 
@@ -59,8 +59,8 @@ def model_hint(tool: str) -> str:
 
 
 TOOL_HINTS = {
-    "claude": "按手机这边的权限干活",
-    "codex": "按手机这边的权限干活",
+    "claude": "和终端一样按当前权限干活",
+    "codex": "和终端一样按当前权限干活",
 }
 
 
@@ -210,5 +210,5 @@ def build_dir_card(tool: str, labels: list, nonce: str, cancel_button: dict) -> 
 
 def permission_line(tool: str, mode_label: str) -> str:
     if tool == "claude":
-        return f"· 权限按手机这边的「{mode_label}」，和后台接着跑电脑上的会话一样"
-    return f"· {TOOL_LABELS.get(tool, tool)} 按手机这边的「{mode_label}」权限干活"
+        return f"· 权限按当前「{mode_label}」档位，和终端一样"
+    return f"· {TOOL_LABELS.get(tool, tool)} 按当前「{mode_label}」档位，和终端一样"
