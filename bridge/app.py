@@ -1841,6 +1841,8 @@ class Bridge:
                 return self._on_model_click(event, clicker, value)
             if value.get("act") == "sc":
                 return self._on_status_card_click(event, clicker, value)
+            if value.get("act") == "ch":
+                return self._on_choice_click(event, clicker, value)
 
             # 点击时**重新**查白名单：卡片可能在群里被别人看到，
             # 而白名单在这期间可能已经变了。比"签发时查过"更严。
@@ -3104,7 +3106,8 @@ class Bridge:
 
             body = _md_normalize(result.text or "")
             self.replier.send(chat_id, f"🖥 {target.label} 回复：\n\n{body}{tail}")
-            self._send_buttons(chat_id, buttons)
+            self._send_buttons(chat_id, self._choice_buttons(scope, chat_id, target.tool, target.id,
+                                                             result.text or "") + buttons)
         elif result.delivered:
             # 消息**已经进了会话**，只是没正常回完（超时 / 被停 / 等确认 / 报错）。
             # 不能说「没发进去」—— 用户会重发，在他真实的会话里重复执行一次。
@@ -4351,6 +4354,10 @@ class Bridge:
         if result.ok:
             body = _md_normalize(result.text or "")
             self.replier.send(target_chat_id, f"🆕 {target.label} 回复：\n\n{body}{tail}")
+            choice = self._choice_buttons(target_scope, target_chat_id, tool, result.session_id,
+                                          result.text or "")
+            if choice:
+                self._send_buttons(target_chat_id, choice)
         else:
             self._say(target_chat_id, f"⚠️ 会话已经开了，但这一句没正常回完：{result.text}{tail}")
         self._send_buttons(target_chat_id, self._talk_buttons(target.tool, target.id))
@@ -4369,6 +4376,58 @@ class Bridge:
         "claude": "继续",
         "codex": "主人已在飞书批准了刚才被拦下的那一步。请原样重新执行同一条命令（一个字都不要改），然后继续完成任务。",
     }
+
+    def _choice_buttons(self, scope: str, chat_id: str, tool: str, sid: str, text: str) -> list:
+        """回复结尾是「选一个」⇒ 每个选项一个按钮（FC-07）。选项文字记在服务端，按钮只带序号。"""
+        from .fleet.actions import _button
+        from .fleet.choices import choice_value, extract_choices
+
+        options = extract_choices(text)
+        if not options or not sid:
+            return []
+        import secrets
+
+        nonce = secrets.token_hex(6)
+        if not hasattr(self, "_choice_offers"):
+            self._choice_offers = {}
+        self._choice_offers[scope] = {"n": nonce, "options": options, "tool": tool, "sid": sid,
+                                      "chat_id": chat_id}
+        from .redact import redact
+
+        return [_button(f"👉 {redact(label)[0]}", choice_value(nonce, i), primary=(i == 0))
+                for i, label in enumerate(options)]
+
+    def _on_choice_click(self, event, clicker: str, value: dict):
+        """点了回复下面的选项按钮 ⇒ 把那一项当成主人的回答发回同一个会话。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.choices import resolve_choice_click
+
+        def toast(kind: str, content: str, result: str):
+            logger.info("选项按钮点击 结果=%s", result)
+            return P2CardActionTriggerResponse({"toast": {"type": kind, "content": content}})
+
+        if clicker not in self.settings.owner_open_ids:
+            return toast("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN], "拒绝:不是主人")
+        nonce, index = resolve_choice_click(value)
+        if not nonce:
+            return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED], "拒绝:形状不对")
+        offers = getattr(self, "_choice_offers", {})
+        found = next(((scope, o) for scope, o in offers.items() if o["n"] == nonce), None)
+        if found is None or index >= len(found[1]["options"]):
+            return toast("info", "这组选项已经过期了（之后又有新回复），直接打字回答就行", "拒绝:过期")
+        scope, offer = found
+        offers.pop(scope, None)
+        answer = offer["options"][index]
+        control = getattr(self, "fleet", None)
+        if control is None or self._loop is None:
+            return toast("error", "我这边还没准备好，直接打字回答就行", "拒绝:没起来")
+        control.set_pending(scope, offer["tool"], offer["sid"])
+        asyncio.run_coroutine_threadsafe(
+            self._maybe_send_to_fleet(scope, offer["chat_id"], answer), self._loop)
+        return toast("info", f"好，回答：{answer[:20]}", "发出")
 
     def _fleet_continue_text(self, tool: str, commands: list) -> str:
         """批准后续跑那一句。Codex 没有 defer，要把批过的命令原样告诉它重跑（钩子按指纹放行一次）。"""
