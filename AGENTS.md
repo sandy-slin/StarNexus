@@ -31,7 +31,7 @@
 1. 运行针对性测试和 Python 语法检查。
 2. 运行完整测试；依赖缺失时记录为环境阻塞，不能把部分通过写成全量通过。
 3. 将交付文件加入 Git，提交并记录提交 SHA；不能以本地未提交文件作为交付结果。
-4. 核心更新提交后立即推送到 GitHub（`origin main`），推送前扫描密钥；细节见 [`docs/runtime-delivery.md`](docs/runtime-delivery.md)。
+4. 核心更新提交后立即推送到 GitHub（`origin main`）。每次推送前必须先把远端同步到本地（`git fetch` + `git pull --rebase origin main`），有新提交时重跑测试，再扫描密钥并推送；细节见 [`docs/runtime-delivery.md`](docs/runtime-delivery.md)。
 5. 备份并同步 `bridge/` 到 `~/.carher-feishu-agent/bridge/`。
 6. 核对关键文件哈希，重启 `com.carher.feishu-agent`，确认服务 `running`。
 7. 对飞书功能做 Computer Use 实测；只看到服务端回执不算客户端验收通过。
