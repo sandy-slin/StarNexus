@@ -270,12 +270,25 @@ class MenuHeal:
             self._done = True
             return True
         version = bm.version_for_time(self._clock())
+        self._pending_scopes = list(todo)
         # 措辞不再写「装机时没配上」：菜单改了形状（指纹变了）也走这里，那时装机是好的。
         pub = bm.publish(self.app_id, token, version, "补上或更新常驻菜单", http=call)
         if pub.get("code"):
             return self._failed_with(pub, "发布版本", table=bm.PUBLISH_ERRORS)
 
         shown = (pub.get("data") or {}).get("version") or version
+        # 🔴 2026-11-17 实测：`im:message.urgent:app_send` 申请接口回 success、版本也发了，权限列表里
+        # 仍然没有（这类权限要在开发者后台手动开 / 等管理员批）。发版后回读一次，没生效的写日志 + 开通链接，
+        # 别让「申请成功」掩盖「其实没开」。
+        asked = list(getattr(self, "_pending_scopes", []) or [])
+        if asked:
+            after = bm.read_scopes(token, http=call)
+            if after is not None:
+                still = [sc for sc in asked if sc not in after]
+                if still:
+                    logger.warning("常驻菜单自愈：权限申请了但还没生效 %s，需要在后台手动开通："
+                                   "https://open.feishu.cn/app/%s/auth?q=%s",
+                                   ", ".join(still), self.app_id, ",".join(still))
         self._done = True
         self.last_reason = ""
         try:
