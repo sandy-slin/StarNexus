@@ -5823,6 +5823,12 @@ class Bridge:
         model = choice.text() if (choice.model or choice.effort) else ""
         if not model:
             model = "工具默认"
+            try:
+                native = self.model_prefs.catalog.native(bound.tool)
+            except Exception:  # noqa: BLE001
+                native = None
+            if native is not None and native.model:
+                model = f"工具默认（{native.text()}）"
         mode = MODE_LABELS.get(getattr(getattr(self, "policy", None), "mode", ""), "")
         progress = ""
         pending = getattr(sess, "pending", None) if sess is not None else None

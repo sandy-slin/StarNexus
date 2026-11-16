@@ -100,6 +100,34 @@ class Catalog:
     def has(self, tool: str, name: str) -> bool:
         return name in self.names(tool)
 
+    def native(self, tool: str) -> Choice:
+        """工具自己的配置里写的模型 / effort（飞书没指定时实际用的就是它）；读不到返回空。"""
+        model = effort = ""
+        try:
+            if tool == "claude":
+                with open(self._claude, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                model = data.get("model", "") if isinstance(data, dict) else ""
+            elif tool == "codex":
+                with open(os.path.join(self._codex_home, "config.toml"), encoding="utf-8") as handle:
+                    for line in handle:
+                        hit = re.match(r'^\s*(model|model_reasoning_effort)\s*=\s*"([^"]+)"', line)
+                        if hit and hit.group(1) == "model" and not model:
+                            model = hit.group(2)
+                        elif hit and hit.group(1) == "model_reasoning_effort" and not effort:
+                            effort = hit.group(2)
+                        elif re.match(r"^\s*\[", line):
+                            break
+            elif tool == "opencode":
+                from .opencode import DEFAULT_MODEL
+
+                model = DEFAULT_MODEL
+        except (OSError, ValueError, ImportError):
+            return Choice()
+        model = model if safe_name(model) else ""
+        effort = effort if effort and _EFFORT_RE.match(effort) else ""
+        return Choice(model, effort)
+
     def _read(self, tool: str) -> tuple:
         if tool == "claude":
             return self._read_claude()

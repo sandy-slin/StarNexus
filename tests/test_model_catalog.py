@@ -55,6 +55,21 @@ class CatalogTest(CatalogFixture):
         self.assertIn("gpt-6-sol", empty.names("codex"))
 
 
+class NativeModelTest(CatalogFixture):
+    def test_codex_reads_top_level_model_and_effort(self):
+        write(os.path.join(self.codex_home, "config.toml"),
+              'model = "gpt-6-sol"\nmodel_reasoning_effort = "ultra"\n[profiles.x]\nmodel = "other"\n')
+        self.assertEqual(self.catalog.native("codex"), Choice("gpt-6-sol", "ultra"))
+
+    def test_claude_reads_settings_model(self):
+        self.assertEqual(self.catalog.native("claude").model, "claude-opus-5-5")
+
+    def test_missing_or_unsafe_is_empty(self):
+        write(self.claude, {"model": "-bad"})
+        self.assertEqual(self.catalog.native("claude"), Choice())
+        self.assertEqual(Catalog("/nonexistent.json", "/nonexistent").native("codex"), Choice())
+
+
 class ModelPrefsTest(CatalogFixture):
     def test_defaults_are_per_tool(self):
         self.assertTrue(self.prefs.set_default("claude", model="claude-sonnet-5-5"))
