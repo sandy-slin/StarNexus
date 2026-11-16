@@ -170,13 +170,32 @@ class OpencodeAdapter(Adapter):
     # ---------- 发 ----------
 
     def _bin(self) -> str:
+        """本机装了好几份时挑版本最新的（同 `codex._codex`）。
+
+        🔴 2026-11-17 实测：后台服务 PATH 先找到 `~/.local/bin/opencode`（1.18.32，不认 `--standalone`），
+        终端里是 `/opt/homebrew/bin/opencode`（v2.0.15）⇒ 手机上新建会话报参数错。
+        """
         if self.binary:
             return self.binary
-        for cand in (shutil.which("opencode"), os.path.expanduser("~/.local/bin/opencode"),
-                     "/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"):
-            if cand and os.path.exists(cand):
-                return cand
-        return "opencode"
+        cached = getattr(self, "_bin_pick", "")
+        if cached:
+            return cached
+        from .codex import _codex_version
+
+        cands: list = []
+        for cand in (shutil.which("opencode"), "/opt/homebrew/bin/opencode", "/usr/local/bin/opencode",
+                     os.path.expanduser("~/.local/bin/opencode")):
+            if cand and os.path.exists(cand) and cand not in cands:
+                cands.append(cand)
+        best, best_ver = "", ()
+        for cand in cands:
+            ver = _codex_version(cand)
+            if ver > best_ver or not best:
+                best, best_ver = cand, ver
+        self._bin_pick = best or "opencode"
+        logger.info("opencode 命令 选用=%s 版本=%s 候选=%d", self._bin_pick, ".".join(map(str, best_ver)) or "?",
+                    len(cands))
+        return self._bin_pick
 
     def _argv(self, text: str, mode: Optional[str], model: str, sid: str = "", fork: bool = False) -> list:
         # `--standalone`：用它自己的私有服务，**按我们给的 cwd** 干活。不加的话它连本机常驻服务，
