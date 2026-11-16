@@ -479,6 +479,48 @@ class Replier:
             return False
         return True
 
+    def send_card_id(self, chat_id: str, card_json: str) -> str | None:
+        """发一张现成的卡片，返回 message_id（会话群状态卡要靠它原地更新）。失败返回 None。"""
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+
+        body = (
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(card_json)
+            .build()
+        )
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type(_id_type(chat_id))
+            .request_body(body)
+            .build()
+        )
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            logger.warning("卡片发送失败 code=%s msg=%s", response.code, response.msg)
+            return None
+        data = getattr(response, "data", None)
+        return getattr(data, "message_id", None) if data else None
+
+    def patch_card(self, message_id: str, card_json: str) -> bool:
+        """原地换掉一张卡片的内容。失败返回 False。"""
+        from lark_oapi.api.im.v1 import (
+            PatchMessageRequest,
+            PatchMessageRequestBody,
+        )
+
+        body = PatchMessageRequestBody.builder().content(card_json).build()
+        request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+        response = self._client.im.v1.message.patch(request)
+        if not response.success():
+            logger.info("卡片原地更新失败 code=%s msg=%s", response.code, response.msg)
+            return False
+        return True
+
     def send_status_card(self, chat_id: str, text: str, with_stop: bool = True) -> str | None:
         """发一张状态卡，返回 message_id（之后靠它原地更新）。失败返回 None。
 

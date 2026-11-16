@@ -436,6 +436,15 @@ class GroupSetup:
         code = _code(out)
         return not code, code, str(out.get("msg") or "")
 
+    def pin(self, message_id: str) -> tuple:
+        """把群里一条消息置顶 → `(成功, code, msg)`。要 `im:message.pins:write_only` 一类权限；没开就失败，调用方降级。"""
+        mid = str(message_id or "")
+        if not mid.startswith("om_"):
+            return False, 0, "消息编号不对"
+        out = self._authed("POST", "/im/v1/pins", {"message_id": mid})
+        code = _code(out)
+        return not code, code, str(out.get("msg") or "")
+
     def add_owner(self, chat_id: str, owner_open_id: str) -> tuple:
         """把主人拉回群里 → `(成功, code, msg)`。只拉主人这一个人，不接受别的 id。"""
         cid, owner = str(chat_id or ""), str(owner_open_id or "")

@@ -636,6 +636,20 @@ class Bridge:
         except Exception:  # noqa: BLE001
             logger.exception("建群 client 没起来，群功能先不可用")
             self.group_client = None
+        # 会话群置顶状态卡（fleet/statuscard.py，产品定义 §5.1）。起不来只是少一张卡。
+        self.status_cards = None
+        try:
+            from .fleet.statuscard import STATE_FILE, StatusCardKeeper, StatusCards
+
+            pinner = getattr(self.group_client, "pin", None) if self.group_client is not None else None
+            self.status_cards = StatusCardKeeper(
+                StatusCards(os.path.join(home, STATE_FILE)),
+                send=self.replier.send_card_id,
+                patch=self.replier.patch_card,
+                pin=pinner,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("会话群状态卡没起来，群里不会有置顶状态卡")
         try:
             from .fleet.control import build_default
 
@@ -1824,6 +1838,8 @@ class Bridge:
                 return self._on_new_click(event, clicker, value)
             if value.get("act") == "mdl":
                 return self._on_model_click(event, clicker, value)
+            if value.get("act") == "sc":
+                return self._on_status_card_click(event, clicker, value)
 
             # 点击时**重新**查白名单：卡片可能在群里被别人看到，
             # 而白名单在这期间可能已经变了。比"签发时查过"更严。
@@ -2959,6 +2975,10 @@ class Bridge:
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
         result = None
         try:
+            if str(scope).startswith("group:"):
+                keeper = getattr(self, "status_cards", None)
+                if keeper is not None and keeper.finished(chat_id):
+                    self._in_background(self._mark_session_done, chat_id, False)
             approval_dir = self._fleet_approval_dir(target.tool, target.id, policy)
             # 🔴 发之前 adapter 在锁里**再查一次**有没有人占着（五分钟里终端可能打开了它）。
             # `relay=True`：电脑上正开着的会话走「进会话聊天」那条路（消息进它的输入队列，
@@ -2984,6 +3004,8 @@ class Bridge:
                 await wait_card.finish(result)
             except Exception:  # noqa: BLE001 —— 等待卡收尾失败不能吞掉回复
                 logger.debug("等待卡收尾失败", exc_info=True)
+            if str(scope).startswith("group:"):
+                self._refresh_status_card_later(chat_id)
         # 🔴 **接着聊的目标保持住**，下一句还发给它（5 分钟内、每发一次续期）。
         # 2026-11-04 体验审查：原来发一句就清掉目标 ⇒ 用户看完回复自然接一句「那你修一下」，
         # 这句**悄悄**落到了桥自己的 claude、而且在另一个项目里，可改档下可能动错仓库的文件。
@@ -3472,6 +3494,10 @@ class Bridge:
             )
         else:
             self._ask_relay_consent(bound.chat_id, group_scope, tool, sid)
+        try:
+            await asyncio.to_thread(self._refresh_status_card, bound.chat_id)
+        except Exception:  # noqa: BLE001 —— 状态卡失败不能连累进群
+            logger.exception("建群后发状态卡失败")
         return bound
 
     async def _group_enter_button(self, group_chat_id: str):
@@ -5132,6 +5158,150 @@ class Bridge:
                 self._refresh_status_card_later(chat_id)
         return reply("success", f"{where}：{now.text()}", list_card(mp, to, tool, sid, label))
 
+    def _status_card_info(self, chat_id: str):
+        """会话群 ⇒ 状态卡要显示的东西（全部服务端现查）；不是会话群 ⇒ None。"""
+        from .fleet.cards import project_of
+        from .fleet.model import short_title
+        from .fleet.statuscard import CardInfo
+
+        binds = getattr(self, "chat_binds", None)
+        if binds is None or not chat_id:
+            return None
+        try:
+            bound = binds.of_chat(chat_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if bound is None:
+            return None
+        sess = None
+        try:
+            sess = self.fleet.cached(bound.tool, bound.id)
+        except Exception:  # noqa: BLE001
+            sess = None
+        cwd = getattr(sess, "cwd", "") if sess is not None else ""
+        if not cwd:
+            cwd = getattr(self, "_new_session_cwd", {}).get(bound.id, "")
+        title = getattr(sess, "title", "") if sess is not None else ""
+        choice = self._effective_model(bound.tool, bound.id)
+        model = choice.text() if (choice.model or choice.effort) else ""
+        if not model:
+            model = "工具默认"
+        mode = MODE_LABELS.get(getattr(getattr(self, "policy", None), "mode", ""), "")
+        progress = ""
+        pending = getattr(sess, "pending", None) if sess is not None else None
+        if pending is not None:
+            from .fleet.grouppush import _pending_text
+
+            progress = "等你：" + short_title(_redact_text(_pending_text(sess)), 60)
+        keeper = getattr(self, "status_cards", None)
+        return CardInfo(
+            tool=bound.tool, sid=bound.id,
+            title=short_title(_redact_text(title), 24) if title else "",
+            project=_redact_text(project_of(cwd)) if cwd else "",
+            model=model, mode=mode,
+            status=getattr(sess, "status", "unknown") if sess is not None else "unknown",
+            last_turn=getattr(sess, "last_turn", "") if sess is not None else "",
+            last_turn_at=float(getattr(sess, "last_turn_at", 0) or 0) if sess is not None else 0.0,
+            progress=progress,
+            finished=bool(keeper.finished(chat_id)) if keeper is not None else False,
+        )
+
+    def _refresh_status_card(self, chat_id: str, force: bool = False) -> str:
+        """会话群的状态卡：没有就发并置顶，有就原地更新。返回 keeper 的结果（测试和日志用）。"""
+        keeper = getattr(self, "status_cards", None)
+        if keeper is None:
+            return "off"
+        info = self._status_card_info(chat_id)
+        if info is None:
+            return "not_group"
+        how = keeper.ensure(chat_id, info, force=force)
+        if how not in ("same",):
+            logger.info("状态卡 %s chat=%s tool=%s", how, chat_id[:12], info.tool)
+        return how
+
+    def _status_cards_tick(self) -> None:
+        """后台每拍：所有开着的会话群的状态卡跟着会话状态更新（内容没变不发请求）。"""
+        binds = getattr(self, "chat_binds", None)
+        if getattr(self, "status_cards", None) is None or binds is None:
+            return
+        try:
+            rows = list(binds.all())
+        except Exception:  # noqa: BLE001
+            return
+        for bound in rows:
+            if not getattr(bound, "on", True):
+                continue
+            try:
+                self._refresh_status_card(bound.chat_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("状态卡这一拍更新失败 chat=%s", str(bound.chat_id)[:12])
+
+    def _mark_session_done(self, chat_id: str, done: bool) -> str:
+        """✅ 完成 / ↩︎ 重新打开：状态卡改状态，群名加或去掉 ✅ 前缀（主人自己改过的群名不碰）。"""
+        from .fleet.statuscard import DONE_PREFIX
+
+        keeper = getattr(self, "status_cards", None)
+        binds = getattr(self, "chat_binds", None)
+        if keeper is None or binds is None:
+            return "off"
+        bound = binds.of_chat(chat_id)
+        if bound is None:
+            return "not_group"
+        keeper.set_finished(chat_id, done)
+        client = getattr(self, "group_client", None)
+        getter = getattr(client, "name_of", None)
+        setter = getattr(client, "rename", None)
+        renamed = ""
+        if getter is not None and setter is not None and bound.name:
+            try:
+                current, _code, _msg = getter(chat_id)
+            except Exception:  # noqa: BLE001
+                current = ""
+            if current and current.strip() == bound.name.strip():
+                base = bound.name[len(DONE_PREFIX):] if bound.name.startswith(DONE_PREFIX) else bound.name
+                want = (DONE_PREFIX + base) if done else base
+                if want != bound.name:
+                    try:
+                        ok, _code, _msg = setter(chat_id, want)
+                    except Exception:  # noqa: BLE001
+                        ok = False
+                    if ok:
+                        binds.set_name(chat_id, want)
+                        renamed = want
+        self._refresh_status_card(chat_id, force=True)
+        logger.info("会话收尾 done=%s chat=%s 改名=%s", done, chat_id[:12], bool(renamed))
+        return renamed or "kept"
+
+    def _on_status_card_click(self, event, clicker: str, value: dict):
+        """状态卡上的 🔄 刷新 / ✅ 完成 / ↩︎ 重新打开。闸门：主人 + 形状白名单 + 点在会话群里。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.statuscard import resolve_click
+
+        def toast(kind: str, content: str):
+            return P2CardActionTriggerResponse({"toast": {"type": kind, "content": content}})
+
+        if clicker not in self.settings.owner_open_ids:
+            return toast("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
+        op = resolve_click(value)
+        if not op:
+            return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
+        chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""
+        if self._model_session_of(chat_id) is None and (
+                getattr(self, "chat_binds", None) is None or self.chat_binds.of_chat(chat_id) is None):
+            return toast("error", "这里不是会话群")
+        logger.info("状态卡 点击 op=%s", op)
+        if op == "refresh":
+            self._in_background(self._refresh_status_card, chat_id, True)
+            return toast("info", "正在刷新")
+        done = op == "done"
+        self._in_background(self._mark_session_done, chat_id, done)
+        if done:
+            self._say_later(chat_id, "✅ 这个会话标记为已完成。之后在群里再说一句，就会重新打开接着做。")
+        return toast("success", "已标记完成" if done else "已重新打开")
+
     def _refresh_status_card_later(self, chat_id: str) -> None:
         """会话群的状态卡跟着刷新（状态卡模块接上之前是空操作）。"""
         fn = getattr(self, "_refresh_status_card", None)
@@ -5933,6 +6103,10 @@ class Bridge:
                 self._group_push_tick(view)
             except Exception:  # noqa: BLE001 —— 群推送出错不能拖累单聊那条
                 logger.exception("群进展推送这一拍失败")
+        try:
+            self._status_cards_tick()
+        except Exception:  # noqa: BLE001
+            logger.exception("状态卡这一拍失败")
         if not waiting_on:
             return
         try:
