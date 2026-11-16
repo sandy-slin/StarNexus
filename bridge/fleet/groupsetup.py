@@ -445,6 +445,17 @@ class GroupSetup:
         code = _code(out)
         return not code, code, str(out.get("msg") or "")
 
+    def urgent(self, message_id: str, open_ids) -> tuple:
+        """应用内加急一条消息 → `(成功, code, msg)`。要 `im:message.urgent` 权限；没开就失败，调用方只记日志。"""
+        mid = str(message_id or "")
+        ids = sorted({str(i) for i in open_ids or () if str(i).startswith("ou_")})
+        if not mid.startswith("om_") or not ids:
+            return False, 0, "消息或人的编号不对"
+        out = self._authed("PATCH", f"/im/v1/messages/{mid}/urgent_app?user_id_type=open_id",
+                           {"user_id_list": ids})
+        code = _code(out)
+        return not code, code, str(out.get("msg") or "")
+
     def add_owner(self, chat_id: str, owner_open_id: str) -> tuple:
         """把主人拉回群里 → `(成功, code, msg)`。只拉主人这一个人，不接受别的 id。"""
         cid, owner = str(chat_id or ""), str(owner_open_id or "")

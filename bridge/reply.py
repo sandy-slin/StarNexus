@@ -506,6 +506,40 @@ class Replier:
         data = getattr(response, "data", None)
         return getattr(data, "message_id", None) if data else None
 
+    def send_md_id(self, chat_id: str, text: str) -> str | None:
+        """发一条 post 富文本（md，可以带 `<at user_id=...>`），返回 message_id；失败返回 None。
+
+        给「需要人介入」那条用：要拿 message_id 去加急。正文照样先脱敏。
+        """
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+
+        from .redact import redact_with_notice
+
+        content = json.dumps({"zh_cn": {"content": [[{"tag": "md", "text": redact_with_notice(text)}]]}},
+                             ensure_ascii=False)
+        body = (
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("post")
+            .content(content)
+            .build()
+        )
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type(_id_type(chat_id))
+            .request_body(body)
+            .build()
+        )
+        response = self._client.im.v1.message.create(request)
+        if not response.success():
+            logger.warning("带 @ 的消息发送失败 code=%s msg=%s", response.code, response.msg)
+            return None
+        data = getattr(response, "data", None)
+        return getattr(data, "message_id", None) if data else None
+
     def patch_card(self, message_id: str, card_json: str) -> bool:
         """原地换掉一张卡片的内容。失败返回 False。"""
         from lark_oapi.api.im.v1 import (
