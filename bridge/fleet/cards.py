@@ -854,7 +854,8 @@ def _panel(title: str, expanded: bool, elements: list) -> dict:
 
 
 def build_overview_card(view: Overview, redact=None, expand: str = "",
-                        seen_at: Any = _AUTO, viewer: str = OWNER_VIEWER, settled: Any = _AUTO) -> str:
+                        seen_at: Any = _AUTO, viewer: str = OWNER_VIEWER, settled: Any = _AUTO,
+                        row_button: Any = None) -> str:
     """总览：按工具分组，一行一个会话（点一行进详情），最后是读失败的说明 + 刷新。
 
     用户原话「文字太多 手机上显示不全」⇒ 一组里**一样的那几样**（工具名、项目）在
@@ -881,7 +882,7 @@ def build_overview_card(view: Overview, redact=None, expand: str = "",
         seen_at = OVERVIEW_SEEN.before(viewer, getattr(view, "at", 0) or None)
     view, gone = _drop_settled(view, settled)
     try:
-        return _build_overview_card(view, redact, expand, seen_at, gone)
+        return _build_overview_card(view, redact, expand, seen_at, gone, row_button)
     finally:
         if record:
             OVERVIEW_SEEN.mark(viewer, getattr(view, "at", 0))
@@ -913,7 +914,7 @@ def _drop_settled(view: Overview, settled: Any) -> tuple:
 
 
 def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[float],
-                         gone: int = 0) -> str:
+                         gone: int = 0, row_button: Any = None) -> str:
     clean = redact or (lambda s: s)
     groups = {tool: sort_for_overview(items, seen_at) for tool, items in view.by_tool().items()}
     expand = expand if expand in TOOLS and groups.get(expand) else ""
@@ -938,8 +939,15 @@ def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[
                 label = row_label(sess, shared_project=main, with_tool=False, dup_tag=tag, seen_at=seen_at)
                 # 🔴 只有「等你」的那几行用醒目的主按钮。原来是「有进程或在跑」就主按钮
                 # ⇒ 终端里闲着的会话也是蓝的，一屏全蓝，等于没有重点（2026-11-06 UX 侦察）。
-                inner.append(_button(label, fleet_value("open", tool, sess.id),
-                                     primary=display_status(sess, seen_at) in _URGENT))
+                urgent = display_status(sess, seen_at) in _URGENT
+                # 产品定义 §5.7 / FC-03：点会话 = 有群直接进群、没群就建群（`row_button` 由 app 按单聊给）
+                direct = None
+                if row_button is not None:
+                    try:
+                        direct = row_button(sess, label, urgent)
+                    except Exception:  # noqa: BLE001 —— 造不出直达按钮就退回看详情
+                        direct = None
+                inner.append(direct or _button(label, fleet_value("open", tool, sess.id), primary=urgent))
                 # 「等你」⇒ 紧跟一句它在问什么，省掉「点进详情才看得见」那一下（第 17 轮）。
                 # 🔴 必须紧跟在**它自己**那个按钮后面：上下两行都在等你时才分得清谁问的。
                 asked = overview_pending_line(sess, clean)

@@ -461,9 +461,30 @@ class GroupClient:
         return True
 
 
+_ENSURE_LOCKS: dict = {}
+_ENSURE_GUARD = threading.Lock()
+
+
+def _ensure_lock(tool: str, sid: str) -> "threading.Lock":
+    with _ENSURE_GUARD:
+        lock = _ENSURE_LOCKS.get((tool, sid))
+        if lock is None:
+            lock = _ENSURE_LOCKS[(tool, sid)] = threading.Lock()
+        return lock
+
+
 def ensure_group(binds: ChatBinds, client: Any, tool: str, sid: str, title: str = "",
                  *, owner_open_id: str = "", clean: Optional[Callable[[str], str]] = None,
                  project: str = "") -> GroupResult:
+    """同一个会话串行建群：连点两下时第二下等第一下建完，然后复用它（FC-03）。"""
+    with _ensure_lock(tool, sid):
+        return _ensure_group(binds, client, tool, sid, title, owner_open_id=owner_open_id,
+                             clean=clean, project=project)
+
+
+def _ensure_group(binds: ChatBinds, client: Any, tool: str, sid: str, title: str = "",
+                  *, owner_open_id: str = "", clean: Optional[Callable[[str], str]] = None,
+                  project: str = "") -> GroupResult:
     """「这个会话要有一个群」。**幂等**：同一个会话点两次复用同一个群（spec 二 2）。
 
     顺序是有讲究的：

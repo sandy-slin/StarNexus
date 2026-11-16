@@ -2683,7 +2683,9 @@ class Bridge:
         fallback = "🖥 电脑上的会话\n" + "\n".join("· " + line for line in lines)
         if view.notes:
             fallback += "\n" + "\n".join("⚠️ " + _redact_text(n) for n in view.notes)
-        card = self._honest_overview_card(build_overview_card(view, redact=_redact_text), view, unread)
+        card = self._honest_overview_card(
+            build_overview_card(view, redact=_redact_text, row_button=self._overview_row_button(chat_id)),
+            view, unread)
         if card:
             self._send_card_or_text(chat_id, card, fallback)
         else:
@@ -2793,6 +2795,44 @@ class Bridge:
                               group_link=self._session_group_link(scope, sess)),
             fallback,
         )
+
+    def _overview_row_button(self, chat_id: str):
+        """总览卡上每一行的按钮（产品定义 §5.7，FC-03）：能接着聊的会话 ⇒ 点一下就进它的群。
+
+        - 已经有群 ⇒ 一个按钮同时跳进群 + 回调 `go`（后台核对群还在、不在就重建）
+        - 还没有群 ⇒ 回调 `send`，单聊里点就建群（`ensure_group` 按会话串行，连点两下也只建一个）
+        - 不能接着聊的会话 ⇒ None，照旧点开看详情
+        只在单聊里这样做：群里的总览点一行是「改绑这个群」，跳去别的群就错了。建群能力没起来 ⇒ None。
+        """
+        binds = getattr(self, "chat_binds", None)
+        client = getattr(self, "group_client", None)
+        if binds is None or client is None or not chat_id:
+            return None
+        known = getattr(self, "_chat_ids", {}) or {}
+        if any(c == chat_id and str(sc).startswith("group:") for sc, c in known.items()):
+            return None
+        try:
+            if binds.of_chat(chat_id) is not None:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        from .fleet.actions import _button, jump_callback_button, safe_link
+        from .fleet.cards import fleet_value
+
+        opener = getattr(client, "open_link", None)
+
+        def make(sess, label: str, urgent: bool):
+            if not (getattr(sess, "can_send", False) or getattr(sess, "can_relay", False)):
+                return None
+            bound = binds.of_session(sess.tool, sess.id)
+            if bound is not None and opener is not None:
+                link = safe_link(opener(bound.chat_id))
+                if link:
+                    return jump_callback_button(label, link, fleet_value("go", sess.tool, sess.id),
+                                                primary=urgent)
+            return _button(label, fleet_value("send", sess.tool, sess.id), urgent)
+
+        return make
 
     def _session_group_link(self, scope: str, sess) -> str:
         """这个会话**已经有群**时，那个群的直开链接；否则空串（详情卡就用只回调的老按钮）。
@@ -3764,7 +3804,8 @@ class Bridge:
             unread = unread_tools(view, control)
             view = fill_unread(view, control, getattr(scanner, "read_at", None))
             card = self._honest_overview_card(
-                build_overview_card(view, redact=_redact_text, expand=tool), view, unread)
+                build_overview_card(view, redact=_redact_text, expand=tool,
+                                    row_button=self._overview_row_button(chat_id)), view, unread)
             return json.loads(card) if card else None
         except Exception:  # noqa: BLE001 —— 换不了卡就退回新发一张，别让这一下什么都没有
             logger.exception("「看全部」造卡失败 tool=%s，退回重新扫描", tool)
