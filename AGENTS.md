@@ -24,6 +24,7 @@
 | 新建会话、建群、模型和权限 | [`bridge/fleet/newsession.py`](bridge/fleet/newsession.py)、[`bridge/fleet/chatbind.py`](bridge/fleet/chatbind.py)、[`bridge/fleet/model.py`](bridge/fleet/model.py) | 以代码和测试为准，真实群聊必须在目标 bot 上核对 |
 | 群进展通知 | [`bridge/fleet/grouppush.py`](bridge/fleet/grouppush.py) | 需要人介入必须推送；普通过程更新不刷屏 |
 | CEO 编排 | [`bridge/fleet/ceo.py`](bridge/fleet/ceo.py) | CEO 负责拆分、派发、汇总、仲裁和向人请求决策 |
+| 产品定义：完全控制 Claude / Codex | [`docs/product/full-control.md`](docs/product/full-control.md) | 新功能先对照能力矩阵和验收用例 FC-01~FC-15 |
 
 ## 代码变更后的最低门禁
 
