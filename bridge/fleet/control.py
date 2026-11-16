@@ -193,7 +193,7 @@ class FleetControl:
     # ---------- 发 / 停 ----------
 
     def send(self, tool: str, sid: str, text: str, *, policy: Any = None, approval_dir: str = "",
-             timeout: float = 600, relay: bool = False) -> ActionResult:
+             timeout: float = 600, relay: bool = False, model: str = "", effort: str = "") -> ActionResult:
         """按家分派。三家的 send 都在锁里**再查一次**有没有人占着，这里不重复查。
 
         `relay=True`：走「进会话聊天」那条路（adapter 的 `relay()`）。Codex / Cursor 的
@@ -217,7 +217,8 @@ class FleetControl:
                         return adapter.relay(sid, text, timeout=timeout)
                     if why:
                         return ActionResult(False, why, sid)
-                return adapter.send(sid, text, timeout=timeout, policy=policy, approval_dir=approval_dir)
+                return adapter.send(sid, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
+                                    **_model_kw(model, effort))
             # Codex 跟随当前权限档位：普通 trusted 可写，write 限定工作区，readonly 才只读。
             # 工作目录仍要和 Claude 一样过一遍白名单。
             cwd = self._cwd_of(tool, sid)
@@ -228,13 +229,14 @@ class FleetControl:
             if method is None:
                 method = adapter.send
             mode = getattr(policy, "mode", "trusted") if policy is not None else "trusted"
-            return method(sid, text, timeout=timeout, mode=mode)
+            extra = _model_kw(model, effort) if tool == "codex" else {}
+            return method(sid, text, timeout=timeout, mode=mode, **extra)
         except Exception as exc:
             # 不带前缀：app.py 那边已经套了「❌ 没发进去：」，再加一层就是「没发进去：没发出去：」
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
 
     def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
-              timeout: float = 600, model: str = "", on_pid: Any = None) -> ActionResult:
+              timeout: float = 600, model: str = "", on_pid: Any = None, effort: str = "") -> ActionResult:
         """手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
 
         闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
@@ -250,7 +252,7 @@ class FleetControl:
         if not resolved:
             return ActionResult(False, WHY_OUTSIDE_WORKSPACE, "")
         try:
-            extra = {"model": model} if model and tool in ("claude", "codex") else {}
+            extra = _model_kw(model, effort) if tool in ("claude", "codex") else {}
             if on_pid is not None and tool in ("claude", "codex"):
                 extra["on_pid"] = on_pid
             if tool == "claude":
@@ -340,3 +342,13 @@ def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings:
         "cursor": CursorAdapter(jobs=jobs, mode=lambda: getattr(policy(), "mode", "readonly")),
     }
     return FleetControl(Fleet(adapters))
+
+
+def _model_kw(model: str = "", effort: str = "") -> dict:
+    """只把真设了的模型 / effort 传给 adapter：老的 adapter（和测试替身）不认这两个参数。"""
+    out = {}
+    if model:
+        out["model"] = model
+    if effort:
+        out["effort"] = effort
+    return out

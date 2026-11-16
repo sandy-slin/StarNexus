@@ -757,7 +757,8 @@ class CodexAdapter(Adapter):
             env["CODEX_HOME"] = self.home  # 读和发看同一份数据
         return env
 
-    def send(self, id: str, text: str, timeout: float = 600, mode: Optional[str] = None) -> ActionResult:
+    def send(self, id: str, text: str, timeout: float = 600, mode: Optional[str] = None,
+             model: str = "", effort: str = "") -> ActionResult:
         """没人占着才发：`codex exec resume --json --skip-git-repo-check [-c sandbox_mode=…] -- <id> <text>`。
 
         `mode`：当前权限档位。给了就按档位压 sandbox（见 SANDBOX_BY_MODE）；认不出 ⇒ 只读。
@@ -775,7 +776,7 @@ class CodexAdapter(Adapter):
             self._sending.add(tid)
         try:
             spawned: list = []
-            res = self._send_locked(tid, text, timeout, mode, spawned)
+            res = self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort)
             # 起过子进程 ⇒ 消息已经进了会话（不管后面超时 / 被停 / 报错）
             if spawned and not res.delivered:
                 res = ActionResult(res.ok, res.text, res.session_id, delivered=True)
@@ -787,7 +788,7 @@ class CodexAdapter(Adapter):
                 self._sending.discard(tid)
 
     def _send_locked(self, tid: str, text: str, timeout: float, mode: Optional[str] = None,
-                     spawned: Optional[list] = None) -> ActionResult:
+                     spawned: Optional[list] = None, model: str = "", effort: str = "") -> ActionResult:
         row = self._row(tid)
         if row is None:
             return ActionResult(False, self.last_error or "没找到这个 Codex 会话。", tid)
@@ -809,6 +810,9 @@ class CodexAdapter(Adapter):
             sandbox = SANDBOX_BY_MODE.get(mode, SANDBOX_BY_MODE["readonly"])
             if sandbox:
                 argv += ["-c", f'sandbox_mode="{sandbox}"']
+        bad = _model_args(argv, model, effort)
+        if bad:
+            return ActionResult(False, bad, tid)
         argv += ["--", tid, text]
         spawned = spawned if spawned is not None else []
         timer_box: list = []
@@ -869,7 +873,8 @@ class CodexAdapter(Adapter):
     # ---------- start：手机上新建会话 ----------
 
     def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "trusted",
-              model: str = "", on_pid: Optional[Callable[[int], None]] = None) -> ActionResult:
+              model: str = "", on_pid: Optional[Callable[[int], None]] = None,
+              effort: str = "") -> ActionResult:
         """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
 
         手机入口和终端入口共用当前权限档位；默认 trusted，对应工作区内可写。
@@ -883,10 +888,9 @@ class CodexAdapter(Adapter):
         codex = self._codex()
         sandbox = SANDBOX_BY_MODE.get(mode or "trusted", SANDBOX_BY_MODE["trusted"])
         argv = [codex, "exec", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"']
-        if model:
-            if not safe_model_name(model):
-                return ActionResult(False, f"模型名不对：{short_title(str(model), 40)}", "")
-            argv += ["-m", model]
+        bad = _model_args(argv, model, effort)
+        if bad:
+            return ActionResult(False, bad, "")
         argv += ["--", text]
         spawned: list = []
         timer_box: list = []
@@ -1018,7 +1022,7 @@ class CodexAdapter(Adapter):
 
     def relay(self, id: str, text: str, timeout: float = RELAY_TIMEOUT_SEC,
               mode: Optional[str] = None, poll: float = RELAY_POLL_SEC,
-              min_timeout: float = RELAY_MIN_TIMEOUT_SEC) -> ActionResult:
+              min_timeout: float = RELAY_MIN_TIMEOUT_SEC, model: str = "", effort: str = "") -> ActionResult:
         """把一句话送进一个**活着的** Codex 会话，并把回复取回来。
 
         - 别人（App / 终端）占着它 ⇒ `codex queue`，然后盯目标自己的 rollout 等回复。
@@ -1040,7 +1044,8 @@ class CodexAdapter(Adapter):
             self._sending.add(tid)
         try:
             spawned: list = []
-            res = self._relay_locked(tid, text, timeout, mode, spawned, poll, min_timeout)
+            res = self._relay_locked(tid, text, timeout, mode, spawned, poll, min_timeout,
+                                     model=model, effort=effort)
             if spawned and not res.delivered:
                 res = ActionResult(res.ok, res.text, res.session_id, delivered=True)
             return res
@@ -1052,7 +1057,8 @@ class CodexAdapter(Adapter):
 
     def _relay_locked(self, tid: str, text: str, timeout: float, mode: Optional[str],
                       spawned: list, poll: float,
-                      min_timeout: float = RELAY_MIN_TIMEOUT_SEC) -> ActionResult:
+                      min_timeout: float = RELAY_MIN_TIMEOUT_SEC, model: str = "",
+                      effort: str = "") -> ActionResult:
         self.last_error = ""
         row = self._row(tid)
         if row is None:
@@ -1065,7 +1071,7 @@ class CodexAdapter(Adapter):
             return ActionResult(False, WHY_RELAY_BUSY, tid)
         if owner == "none":
             # 没人占着 ⇒ 直接 exec resume，同步拿回复（比排队等轮询快）
-            return self._send_locked(tid, text, timeout, mode, spawned)
+            return self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort)
         segs = self._segments(tid, row)
         if not segs:
             # 实测：没有 rollout 的线程 `codex queue` 直接报 -32603，先说清楚别白跑
@@ -1250,6 +1256,22 @@ def thread_id_from_exec_output(stdout: str) -> str:
 
 
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
+
+
+_EFFORT_NAME_RE = re.compile(r"^[a-z]{2,10}$")
+
+
+def _model_args(argv: list, model: str = "", effort: str = "") -> str:
+    """把会话模型 / effort 追加到 `codex exec` 的 argv。名字不合法 ⇒ 返回一句人话、argv 不动。"""
+    if model and not safe_model_name(model):
+        return f"模型名不对：{short_title(str(model), 40)}"
+    if effort and not (isinstance(effort, str) and _EFFORT_NAME_RE.match(effort)):
+        return f"推理强度不对：{short_title(str(effort), 20)}"
+    if model:
+        argv += ["-m", model]
+    if effort:
+        argv += ["-c", f'model_reasoning_effort="{effort}"']
+    return ""
 
 
 def safe_model_name(name: Any) -> bool:

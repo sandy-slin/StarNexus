@@ -932,7 +932,7 @@ class ClaudeAdapter(Adapter):
             return self._send_locks.setdefault(sid, threading.Lock())
 
     def send(self, id: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
-             approval_dir: str = "") -> ActionResult:
+             approval_dir: str = "", model: str = "", effort: str = "") -> ActionResult:
         """只有**没进程占着**才发：`claude -p --resume <id> --output-format json`。
 
         `policy` 不传就用构造时给的。工具白名单 = `policy.allowed_tools()`，红线 = `disallowed_tools()`。
@@ -952,13 +952,15 @@ class ClaudeAdapter(Adapter):
         if not lock.acquire(blocking=False):
             return ActionResult(False, WHY_SEND_BRIDGE_BUSY, id)
         try:
-            return self._send_locked(id, text, timeout, self._get_policy(policy), approval_dir)
+            return self._send_locked(id, text, timeout, self._get_policy(policy), approval_dir,
+                                     model=model, effort=effort)
         except Exception as exc:  # 绝不抛给上层
             return ActionResult(False, friendly_error(exc), id)
         finally:
             lock.release()
 
-    def _send_locked(self, sid: str, text: str, timeout: float, policy: Any, approval_dir: str = "") -> ActionResult:
+    def _send_locked(self, sid: str, text: str, timeout: float, policy: Any, approval_dir: str = "",
+                     model: str = "", effort: str = "") -> ActionResult:
         # 🔴 spawn 之前现查一次：用户可能刚在终端里打开它（卡片上的 can_send 可能是几分钟前的）
         table = self._table()
         if table.error:
@@ -987,7 +989,10 @@ class ClaudeAdapter(Adapter):
             # 可改 / 全授权档靠审批钩子挡越界写和红线命令；钩子没带上就只给只读档发
             return ActionResult(False, WHY_SEND_NO_HOOK, sid)
 
-        argv = self._send_argv(sid, text, policy, hook)
+        bad = _model_problem(model, effort)
+        if bad:
+            return ActionResult(False, bad, sid)
+        argv = self._send_argv(sid, text, policy, hook, model=model, effort=effort)
         env = self._send_env(approval_dir if hook else "")
         spawned: list = []
 
@@ -1107,7 +1112,8 @@ class ClaudeAdapter(Adapter):
             env["CARHER_APPROVAL_DIR"] = approval_dir
         return env
 
-    def _send_argv(self, sid: str, text: str, policy: Any, hook: Optional[dict] = None) -> list:
+    def _send_argv(self, sid: str, text: str, policy: Any, hook: Optional[dict] = None,
+                   model: str = "", effort: str = "") -> list:
         """和 runner.py 同一个形状：prompt 紧跟 `-p`，白名单 / 红线放最后（这两个参数吃多个值）。
 
         以「-」开头的话会被当成参数 ⇒ 前面垫一个空格（模型看不出差别）。
@@ -1122,6 +1128,13 @@ class ClaudeAdapter(Adapter):
         argv = [
             self.claude_bin, "-p", prompt,
             "--resume", sid,
+        ]
+        # 模型 / effort 紧跟会话参数：后面的 --allowed-tools / --disallowed-tools 吃多个值，不能放它们后面
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        argv += [
             "--output-format", "json",
             # manual = 没批准的工具直接拒，不挂在那儿等人（和 runner.py 同一档）
             "--permission-mode", "manual",
@@ -1148,7 +1161,7 @@ class ClaudeAdapter(Adapter):
 
     def start(self, cwd: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
               approval_dir: str = "", model: str = "",
-              on_pid: Optional[Callable[[int], None]] = None) -> ActionResult:
+              on_pid: Optional[Callable[[int], None]] = None, effort: str = "") -> ActionResult:
         """在 `cwd` 新开一个会话，第一句是 `text`。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
         只是把 `--resume <id>` 换成 `--session-id <新 uuid>`：id 由我们先定好，起进程前就能登记，
         这样「停下」和占用判断从第一秒起就认得它。
@@ -1172,16 +1185,13 @@ class ClaudeAdapter(Adapter):
         hook = self._hook()
         if getattr(policy, "mode", "readonly") != "readonly" and not (hook and approval_dir):
             return ActionResult(False, WHY_SEND_NO_HOOK, "")
+        bad = _model_problem(model, effort)
+        if bad:
+            return ActionResult(False, bad, "")
         sid = str(uuid.uuid4())
-        argv = self._send_argv(sid, text, policy, hook)
+        argv = self._send_argv(sid, text, policy, hook, model=model, effort=effort)
         at = argv.index("--resume")
         argv[at:at + 2] = ["--session-id", sid]
-        if model:
-            from .codex import safe_model_name
-
-            if not safe_model_name(model):
-                return ActionResult(False, f"模型名不对：{short_title(str(model), 40)}", "")
-            argv[at + 2:at + 2] = ["--model", model]
         env = self._send_env(approval_dir if hook else "")
         spawned: list = []
 
@@ -1375,3 +1385,17 @@ def _send_result(sid: str, result: Any) -> ActionResult:
         # 正常不会发生（没带 --fork-session）。真发生了要让人知道，不能装成接上了
         return ActionResult(True, (reply or "（没有文字回复）") + f"\n\n⚠️ 这次落到了新会话 {got[:8]}，没接在原来那段后面。", got)
     return ActionResult(True, reply or "（没有文字回复）", sid)
+
+
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _model_problem(model: str = "", effort: str = "") -> str:
+    """会话模型 / effort 不合法 ⇒ 一句人话；合法 ⇒ 空串。"""
+    from .codex import safe_model_name
+
+    if model and not safe_model_name(model):
+        return f"模型名不对：{short_title(str(model), 40)}"
+    if effort and effort not in _CLAUDE_EFFORTS:
+        return f"推理强度不对：{short_title(str(effort), 20)}"
+    return ""

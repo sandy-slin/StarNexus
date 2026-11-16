@@ -560,6 +560,14 @@ class Bridge:
         # 🔴 config.toml 的 mode = 本机上限；聊天里能在上限以内切换，收紧点一次，放开要二次确认。
         # 范围由本机文件定 —— 聊天超不过它。
         self.prefs = PrefsStore(os.path.join(home, "prefs.json"), settings.policy)
+        # 按工具的默认模型 / effort + 会话级覆盖（fleet/catalog.py，产品定义 §5.4）
+        self.model_prefs = None
+        try:
+            from .fleet.catalog import Catalog, ModelPrefs
+
+            self.model_prefs = ModelPrefs(os.path.join(home, "model_prefs.json"), Catalog())
+        except Exception:  # noqa: BLE001
+            logger.exception("模型设置没起来，会话照旧用工具自己的默认模型")
         # 🔴 令牌密钥**必须落盘**。
         # 原来用 os.urandom(32) 每次启动随机生成，注释里写"重启后旧卡片失效是对的，
         # 因为 claude 会话也续不上了"—— 这个推理是错的：会话 id 存在
@@ -1814,6 +1822,8 @@ class Bridge:
             # 「➕ 新建会话」那两张卡：只带工具名 / 服务端序号，目录不在卡上
             if value.get("act") == "new":
                 return self._on_new_click(event, clicker, value)
+            if value.get("act") == "mdl":
+                return self._on_model_click(event, clicker, value)
 
             # 点击时**重新**查白名单：卡片可能在群里被别人看到，
             # 而白名单在这期间可能已经变了。比"签发时查过"更严。
@@ -2953,11 +2963,12 @@ class Bridge:
             # 🔴 发之前 adapter 在锁里**再查一次**有没有人占着（五分钟里终端可能打开了它）。
             # `relay=True`：电脑上正开着的会话走「进会话聊天」那条路（消息进它的输入队列，
             # 不分叉、不打断）；没人占着的还是走 resume（同步拿回复，更快）。选路在 control.send。
+            choice = self._effective_model(target.tool, target.id)
             result = await asyncio.to_thread(
                 control.send, target.tool, target.id, text,
                 policy=policy, approval_dir=approval_dir,
                 timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
-                relay=True,
+                relay=True, model=choice.model, effort=choice.effort,
             )
         finally:
             inflight.pop(scope, None)
@@ -4203,10 +4214,13 @@ class Bridge:
         result = None
         try:
             approval_dir = self._fleet_approval_dir(tool, "new-" + scope, policy) if tool == "claude" else ""
+            base = self._effective_model(tool, "")
+            start_model = armed.get("model", "") or base.model
+            start_effort = armed.get("effort", "") or (base.effort if start_model == base.model else "")
             result = await asyncio.to_thread(
                 control.start, tool, cwd, text, policy=policy, approval_dir=approval_dir,
                 timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
-                model=armed.get("model", ""),
+                model=start_model, effort=start_effort,
             )
         finally:
             inflight.pop(scope, None)
@@ -4224,6 +4238,10 @@ class Bridge:
         # 🔴 新会话是主人自己从手机开的，权限说明在选项目时已经给过 ⇒ 记成确认（和建群那条同一套记法），
         # 之后会话改名 / 换项目 / 在电脑上打开，照旧会再问。
         clicker = scope[3:] if scope.startswith("dm:") else ""
+        mp = getattr(self, "model_prefs", None)
+        if mp is not None and (armed.get("model") or armed.get("effort")):
+            mp.set_session(tool, result.session_id, model=armed.get("model") or None,
+                           effort=armed.get("effort") or None)
         if not hasattr(self, "_new_session_cwd"):
             self._new_session_cwd = {}
         self._new_session_cwd[result.session_id] = cwd
@@ -5012,6 +5030,102 @@ class Bridge:
         else:
             self._say(chat_id, "\n".join(lines))
 
+    def _effective_model(self, tool: str, sid: str):
+        """这一轮该用的模型 / effort：会话覆盖 > 工具默认 > 工具自己的配置。"""
+        from .fleet.catalog import Choice
+
+        mp = getattr(self, "model_prefs", None)
+        if mp is None or tool not in ("claude", "codex"):
+            return Choice()
+        try:
+            return mp.effective(tool, sid)
+        except Exception:  # noqa: BLE001
+            logger.exception("读模型设置失败，用工具默认")
+            return Choice()
+
+    def _model_session_of(self, chat_id: str):
+        """这个聊天是会话群 ⇒ (tool, sid, 标签)；不是 ⇒ None。"""
+        binds = getattr(self, "chat_binds", None)
+        if binds is None or not chat_id:
+            return None
+        try:
+            bound = binds.of_chat(chat_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if bound is None or bound.tool not in ("claude", "codex"):
+            return None
+        return bound.tool, bound.id, bound.name or bound.tool
+
+    def _on_model_click(self, event, clicker: str, value: dict):
+        """「🧠 模型」卡上的按钮。闸门：主人 + 形状白名单；会话按点击所在群现查绑定。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.catalog import LABELS
+        from .fleet.modelcard import home_card, list_card, resolve_click
+
+        def reply(kind: str, text: str, card: str = ""):
+            body = {"toast": {"type": kind, "content": text}}
+            if card:
+                body["card"] = {"type": "raw", "data": json.loads(card)}
+            return P2CardActionTriggerResponse(body)
+
+        if clicker not in self.settings.owner_open_ids:
+            return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
+        click = resolve_click(value)
+        mp = getattr(self, "model_prefs", None)
+        if click is None or mp is None:
+            return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
+        chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""
+        session = self._model_session_of(chat_id)
+        op, to, tool = click["op"], click["to"], click["tool"]
+        if to == "s":
+            if session is None:
+                return reply("error", "这里不是会话群，只能设默认模型", home_card(mp, None))
+            tool, sid, label = session
+        else:
+            sid, label = "", ""
+        logger.info("模型卡 点击 op=%s to=%s tool=%s", op, to, tool or "-")
+        if op == "home":
+            return reply("info", "模型总览", home_card(mp, session))
+        if op == "open":
+            return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", list_card(mp, to, tool, sid, label))
+        if op == "m":
+            names = mp.catalog.names(tool)
+            if click["i"] >= len(names):
+                return reply("error", "模型列表变了，重新选一次", list_card(mp, to, tool, sid, label))
+            name = names[click["i"]]
+            ok = mp.set_session(tool, sid, model=name) if to == "s" else mp.set_default(tool, model=name)
+            if ok and to == "d" and tool == "claude" and getattr(self, "prefs", None) is not None:
+                from .policy import known_model
+
+                if known_model(name):
+                    self.prefs.set_model(name)
+        else:
+            effort = click["e"]
+            ok = mp.set_session(tool, sid, effort=effort) if to == "s" else mp.set_default(tool, effort=effort)
+        if not ok:
+            return reply("error", "这一项现在不能选，刷新后再试", list_card(mp, to, tool, sid, label))
+        now = mp.effective(tool, sid) if to == "s" else mp.default(tool)
+        where = "这个会话" if to == "s" else f"{LABELS.get(tool, tool)} 默认"
+        tail = "下一轮开始生效。" if to == "s" else "以后新建的会话用它。"
+        if chat_id:
+            self._say_later(chat_id, f"🧠 {where}：**{now.text()}**。{tail}")
+            if to == "s":
+                self._refresh_status_card_later(chat_id)
+        return reply("success", f"{where}：{now.text()}", list_card(mp, to, tool, sid, label))
+
+    def _refresh_status_card_later(self, chat_id: str) -> None:
+        """会话群的状态卡跟着刷新（状态卡模块接上之前是空操作）。"""
+        fn = getattr(self, "_refresh_status_card", None)
+        if fn is None:
+            return
+        try:
+            self._in_background(fn, chat_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("状态卡刷新排队失败", exc_info=True)
+
     def _handle_model(self, chat_id: str, text: str) -> None:
         """`/model` 看当前模型 + 给可选项；`/model claude-opus-5-5` 切换。
 
@@ -5026,8 +5140,14 @@ class Bridge:
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if not arg:
-            card = build_model_card(policy)
+            mp = getattr(self, "model_prefs", None)
             sender = getattr(self.replier, "send_card", None)
+            if mp is not None and sender is not None:
+                from .fleet.modelcard import home_card
+
+                if sender(chat_id, home_card(mp, self._model_session_of(chat_id))):
+                    return
+            card = build_model_card(policy)
             if sender is not None and sender(chat_id, card):
                 return
             lines = [f"🧠 现在用 **{policy.model}**", ""]
