@@ -274,8 +274,9 @@ class FleetControl:
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
 
     def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
-              timeout: float = 600, model: str = "", on_pid: Any = None, effort: str = "") -> ActionResult:
-        """手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
+              timeout: float = 600, model: str = "", on_pid: Any = None, effort: str = "",
+              fork_from: str = "") -> ActionResult:
+        """`fork_from`：复制那个会话的上下文开新会话（同一个工具）。手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
 
         闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
         Codex 跟随当前权限档位：trusted 可写，write 限定工作区，readonly 只读。开成了就记进 `_known`，
@@ -293,6 +294,8 @@ class FleetControl:
             extra = _model_kw(model, effort) if tool in ("claude", "codex") else {}
             if on_pid is not None and tool in ("claude", "codex"):
                 extra["on_pid"] = on_pid
+            if fork_from and tool in ("claude", "codex"):
+                extra["fork_from"] = fork_from
             if tool == "claude":
                 result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
                                        **extra)
@@ -349,6 +352,17 @@ class FleetControl:
         if jobs is None:
             return ActionResult(False, WHY_NO_ADAPTER, "")
         return jobs.signal(pid)
+
+    def archive(self, tool: str, sid: str) -> ActionResult:
+        """归档会话：Codex 用它自己的 archive；别的工具只在我们这边记成「结束」（调用方处理）。"""
+        adapter = self.fleet.adapter(tool)
+        method = getattr(adapter, "archive", None) if adapter is not None else None
+        if method is None:
+            return ActionResult(False, "", sid)
+        try:
+            return method(sid)
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, "没归档成", log_as=f"归档失败 tool={tool}"), sid)
 
     def stop(self, tool: str, sid: str, *, relay: bool = False) -> ActionResult:
         """`relay=True`：对话模式里的 `/stop`。

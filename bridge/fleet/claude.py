@@ -1164,8 +1164,9 @@ class ClaudeAdapter(Adapter):
 
     def start(self, cwd: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
               approval_dir: str = "", model: str = "",
-              on_pid: Optional[Callable[[int], None]] = None, effort: str = "") -> ActionResult:
-        """在 `cwd` 新开一个会话，第一句是 `text`。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
+              on_pid: Optional[Callable[[int], None]] = None, effort: str = "",
+              fork_from: str = "") -> ActionResult:
+        """在 `cwd` 新开一个会话，第一句是 `text`。`fork_from`：复制这个会话的上下文再开（`--resume X --fork-session`）。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
         只是把 `--resume <id>` 换成 `--session-id <新 uuid>`：id 由我们先定好，起进程前就能登记，
         这样「停下」和占用判断从第一秒起就认得它。
         """
@@ -1192,9 +1193,16 @@ class ClaudeAdapter(Adapter):
         if bad:
             return ActionResult(False, bad, "")
         sid = str(uuid.uuid4())
-        argv = self._send_argv(sid, text, policy, hook, model=model, effort=effort)
-        at = argv.index("--resume")
-        argv[at:at + 2] = ["--session-id", sid]
+        if fork_from:
+            if not self._jsonl_path(fork_from):
+                return ActionResult(False, "找不到要复制的那个会话的记录。", "")
+            argv = self._send_argv(fork_from, text, policy, hook, model=model, effort=effort)
+            at = argv.index("--resume")
+            argv[at:at + 2] = ["--resume", fork_from, "--fork-session", "--session-id", sid]
+        else:
+            argv = self._send_argv(sid, text, policy, hook, model=model, effort=effort)
+            at = argv.index("--resume")
+            argv[at:at + 2] = ["--session-id", sid]
         env = self._send_env(approval_dir if hook else "")
         spawned: list = []
 

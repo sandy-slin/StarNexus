@@ -141,10 +141,10 @@ class NewSessionState:
             self._offers.pop(scope, None)
             return got["tool"], got["dirs"][index]
 
-    def arm(self, scope: str, tool: str, cwd: str, model: str = "", effort: str = "") -> None:
+    def arm(self, scope: str, tool: str, cwd: str, model: str = "", effort: str = "", fork_from: str = "") -> None:
         with self._lock:
             self._armed[scope] = {"tool": tool, "cwd": cwd, "model": model, "effort": effort,
-                                  "expires": self._now() + ARMED_TTL_SEC}
+                                  "fork_from": fork_from, "expires": self._now() + ARMED_TTL_SEC}
 
     def peek(self, scope: str) -> tuple:
         """(没过期的 armed 或 None, 是否过期)。过期的顺手清掉。"""

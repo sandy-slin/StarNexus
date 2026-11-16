@@ -2443,6 +2443,10 @@ class Bridge:
             query = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
             await self._fleet_search(scope, chat_id, query)
             return True
+        if command in {"/fork", "/复制会话", "/archive", "/归档", "/rename", "/重命名"} \
+                or text.strip() in ("复制会话", "归档会话"):
+            await self._session_manage(scope, chat_id, command, text)
+            return True
         if command in {"/stop", "/s"}:
             event = self._cancels.get(scope)
             # 🔴 「停」要停全部 —— 包括**停在等审批**的那一步。
@@ -2962,6 +2966,97 @@ class Bridge:
             return None
         target = control.peek_pending(scope)
         return (target.tool, target.id) if target is not None else None
+
+    async def _session_manage(self, scope: str, chat_id: str, command: str, text: str) -> None:
+        """会话群里的会话管理（§4「会话管理」）：复制（fork）、归档、重命名。"""
+        bound = None
+        binds = getattr(self, "chat_binds", None)
+        if binds is not None and str(scope).startswith("group:"):
+            try:
+                bound = binds.of_chat(chat_id)
+            except Exception:  # noqa: BLE001
+                bound = None
+        if bound is None or bound.tool not in ("claude", "codex"):
+            self._say(chat_id, "这个命令要在会话群里用：复制会话 /fork、归档 /archive、重命名 /rename 新名字。")
+            return
+        word = text.strip()
+        if command in ("/fork", "/复制会话") or word == "复制会话":
+            await self._session_fork(scope, chat_id, bound)
+        elif command in ("/archive", "/归档") or word == "归档会话":
+            await self._session_archive(chat_id, bound)
+        else:
+            name = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+            await asyncio.to_thread(self._session_rename, chat_id, bound, name)
+
+    async def _session_fork(self, scope: str, chat_id: str, bound) -> None:
+        cwd = ""
+        sess = self.fleet.cached(bound.tool, bound.id) if getattr(self, "fleet", None) is not None else None
+        cwd = getattr(sess, "cwd", "") if sess is not None else ""
+        cwd = cwd or getattr(self, "_new_session_cwd", {}).get(bound.id, "")
+        if not cwd or not self.policy.resolve_workspace(cwd):
+            self._say(chat_id, "读不出这个会话在哪个项目里，没法复制。点状态卡上的刷新再试。")
+            return
+        choice = self._effective_model(bound.tool, bound.id)
+        dm_scope = self._owner_dm_scope()
+        target_scope = dm_scope or scope
+        self._newsession_state().arm(target_scope, bound.tool, cwd, choice.model or "", choice.effort or "",
+                                     fork_from=bound.id)
+        logger.info("会话管理 复制 tool=%s 会话=%s", bound.tool, bound.id[:8])
+        where = "私聊里" if dm_scope else "这里"
+        self._say(chat_id, f"🧬 好，复制一份「{_redact_text(bound.name or bound.id[:8])}」：新会话带着它的全部上下文，"
+                           f"另开一个群。到{where}说新会话的第一句（10 分钟内有效），原会话不受影响。")
+        if dm_scope:
+            dm_chat = getattr(self, "_chat_ids", {}).get(dm_scope, "")
+            if dm_chat:
+                self._say(dm_chat, f"🧬 下一句话会作为「{_redact_text(bound.name or bound.id[:8])}」复制出来的新会话的第一句。")
+
+    def _owner_dm_scope(self) -> str:
+        owners = sorted(getattr(getattr(self, "settings", None), "owner_open_ids", None) or ())
+        known = getattr(self, "_chat_ids", {}) or {}
+        for owner in owners:
+            scope = f"dm:{owner}"
+            if scope in known:
+                return scope
+        return ""
+
+    async def _session_archive(self, chat_id: str, bound) -> None:
+        control = getattr(self, "fleet", None)
+        res = await asyncio.to_thread(control.archive, bound.tool, bound.id) if control is not None else None
+        if res is not None and not res.ok and res.text:
+            self._say(chat_id, f"❌ {res.text}")
+            return
+        try:
+            self._fleet_settled_store().settle(bound.tool, bound.id)
+        except Exception:  # noqa: BLE001
+            logger.exception("归档后记结束失败")
+        await asyncio.to_thread(self._mark_session_done, chat_id, True)
+        tail = res.text if res is not None and res.ok else "Claude 没有归档命令：总览里不再列它，在群里再说一句就会重新出现。"
+        logger.info("会话管理 归档 tool=%s 会话=%s 工具归档=%s", bound.tool, bound.id[:8], bool(res and res.ok))
+        self._say(chat_id, f"🗄 已归档这个会话，群名加了 ✅。{tail}群保留着，聊天记录都在。")
+
+    def _session_rename(self, chat_id: str, bound, name: str) -> None:
+        from .fleet.chatbind import GROUP_PREFIX_SN, MAX_NAME_CHARS, _clean_name
+        from .fleet.model import short_title
+        from .fleet.scan import TOOL_LABELS
+
+        clean = _clean_name(_redact_text(name))
+        if not clean:
+            self._say(chat_id, "要带新名字，比如：/rename 修登录 bug")
+            return
+        want = short_title("·".join([GROUP_PREFIX_SN, TOOL_LABELS.get(bound.tool, bound.tool), clean]), MAX_NAME_CHARS)
+        client = getattr(self, "group_client", None)
+        setter = getattr(client, "rename", None)
+        if setter is None:
+            self._say(chat_id, "这台电脑上改不了群名。")
+            return
+        ok, code, _msg = setter(chat_id, want)
+        if not ok:
+            self._say(chat_id, f"没改成群名（code={code}）。")
+            return
+        self.chat_binds.set_name(chat_id, want)
+        self._refresh_status_card(chat_id, force=True)
+        logger.info("会话管理 重命名 tool=%s 会话=%s", bound.tool, bound.id[:8])
+        self._say(chat_id, f"✏️ 群名改成「{want}」。会话本身的标题在 Claude / Codex 里不变，这里只改飞书这边的名字。")
 
     async def _fleet_search(self, scope: str, chat_id: str, query: str) -> None:
         """`/find 关键字`：按标题 / 项目 / 编号找会话，点一下进它的群（没有群就建）。"""
@@ -4520,6 +4615,7 @@ class Bridge:
                 control.start, tool, cwd, text, policy=policy, approval_dir=approval_dir,
                 timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
                 model=start_model, effort=start_effort,
+                **({"fork_from": armed["fork_from"]} if armed.get("fork_from") else {}),
             )
         finally:
             inflight.pop(scope, None)

@@ -920,8 +920,8 @@ class CodexAdapter(Adapter):
 
     def start(self, cwd: str, text: str, timeout: float = 600, mode: Optional[str] = "trusted",
               model: str = "", on_pid: Optional[Callable[[int], None]] = None,
-              effort: str = "", approval_dir: str = "") -> ActionResult:
-        """在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
+              effort: str = "", approval_dir: str = "", fork_from: str = "") -> ActionResult:
+        """`fork_from`：复制这个会话的上下文再开（`codex exec fork <id>`）。在 `cwd` 新开一个 Codex 会话：`codex exec --json --skip-git-repo-check -c sandbox_mode=… -- <text>`。
 
         手机入口和终端入口共用当前权限档位；默认 trusted，对应工作区内可写。
         新会话的 id 从 `thread.started` 事件里拿；拿不到就当没开成（没法接着聊）。
@@ -933,12 +933,14 @@ class CodexAdapter(Adapter):
             return ActionResult(False, "这个项目目录不在了，换一个再开。", "")
         codex = self._codex()
         env = self._env(codex)
-        argv = [codex, "exec", "--json", "--skip-git-repo-check"]
+        if fork_from and not is_thread_id(fork_from):
+            return ActionResult(False, "要复制的会话编号不对。", "")
+        argv = [codex, "exec"] + (["fork"] if fork_from else []) + ["--json", "--skip-git-repo-check"]
         argv += self._sandbox_args(mode or "trusted", approval_dir, env)
         bad = _model_args(argv, model, effort)
         if bad:
             return ActionResult(False, bad, "")
-        argv += ["--", text]
+        argv += ["--"] + ([fork_from.lower()] if fork_from else []) + [text]
         spawned: list = []
         timer_box: list = []
         fired = threading.Event()
@@ -986,6 +988,22 @@ class CodexAdapter(Adapter):
             detail = short_title(failure or "", 120)
             return ActionResult(False, "Codex 没回成功" + (f"：{detail}" if detail else "。"), tid, delivered=True)
         return ActionResult(True, reply or "Codex 跑完了，但没有文字回复。", tid, delivered=True)
+
+    def archive(self, id: str) -> ActionResult:
+        """`codex archive <id>`：归档（Codex 自己的归档，`codex unarchive` 能恢复）。"""
+        if not is_thread_id(id):
+            return ActionResult(False, "会话编号不对。", str(id or ""))
+        tid = id.lower()
+        if self.jobs.jobs(tool=self.tool, session_id=tid):
+            return ActionResult(False, "它正在跑，停下之后再归档。", tid)
+        codex = self._codex()
+        try:
+            res = self.runner.run([codex, "archive", tid], timeout=30, env=self._env(codex))
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, "没归档成"), tid)
+        if res.error or res.returncode != 0:
+            return ActionResult(False, "没归档成：" + short_title(res.error or (res.stderr or "").strip(), 120), tid)
+        return ActionResult(True, "已归档。要找回可以在电脑上运行 codex unarchive。", tid)
 
     # ---------- relay：进会话聊天 ----------
 

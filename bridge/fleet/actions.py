@@ -52,6 +52,9 @@ DO_COMMANDS = {
     # 「➕ 新建会话」：只打开选工具卡；真正开会话要再点工具、点项目、再说一句话（fleet/newsession.py）
     "newsession": "/newsession",
     "newcancel": "/newsession cancel",  # 不建了：只清掉选到一半的新建会话，不碰对话模式
+    # 会话群状态卡「更多」（§4 会话管理）：复制只是摆好「下一句开新会话」；归档只改记录 + 工具自己的可恢复归档
+    "fork": "/fork",
+    "archive": "/archive",
 }
 
 # 这几个只是「看」，不看是哪个聊天也能做；其余的要对准是哪个聊天（退出 / 停 / 新话题 / 继续）。
@@ -74,12 +77,16 @@ DEFAULT_LABELS = {
     "history": "↑ 最近问过",
     "newsession": "➕ 新建会话",
     "newcancel": "✖️ 不建了",
+    "fork": "🧬 复制会话",
+    "archive": "🗄 归档",
 }
 
 # 点了之后的 toast。不许露内部命令（同 app._toast_for 的红字）。
 TOASTS = {
     "quit": "好，退出对话",
     "stop": "收到，正在停",
+    "fork": "收到，准备复制",
+    "archive": "收到，正在归档",
     "sessions": "收到，看看电脑上的会话",
     "new": "收到，开个新话题",
     "resume": "收到，继续",

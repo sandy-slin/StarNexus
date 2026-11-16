@@ -115,12 +115,14 @@ def build_card(info: CardInfo) -> str:
     if info.progress:
         lines.append(f"**最近进展**：{info.progress}")
     lines.append("")
-    lines.append("💬 继续：直接在群里说话，就发给这个会话。")
+    lines.append("💬 继续：直接在群里说话，就发给这个会话。改群名发「/rename 新名字」。")
     buttons = [
         _button("🧠 模型", {"act": "mdl", "op": "home", "to": "s"}),
         _button("⏹ 停下", {"act": "do", "op": "stop"}),
         _button("↩︎ 重新打开" if info.finished else "✅ 完成", value("reopen" if info.finished else "done")),
         _button("🔄 刷新", value("refresh")),
+        _button("🧬 复制会话", {"act": "do", "op": "fork"}),
+        _button("🗄 归档", {"act": "do", "op": "archive"}),
     ]
     title = f"{tool}「{info.title or info.sid[:8]}」"
     card = {
