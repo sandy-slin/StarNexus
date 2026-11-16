@@ -90,6 +90,22 @@ class FleetControl:
             items = [s for s in self._known.values() if getattr(s, "status", "") == "running"]
         return sorted(items, key=lambda s: (not getattr(s, "can_stop", False), -float(getattr(s, "updated_at", 0) or 0)))
 
+    def search(self, query: str, limit: int = 8) -> list:
+        """按标题 / 项目目录 / 会话编号找会话（§5.7 搜索）。多个词都要命中；不分大小写。"""
+        words = [w.lower() for w in str(query or "").split() if w]
+        if not words:
+            return []
+        with self._lock:
+            items = list(self._known.values())
+        hits = []
+        for sess in items:
+            hay = " ".join([str(getattr(sess, "title", "") or ""), str(getattr(sess, "cwd", "") or ""),
+                            str(getattr(sess, "id", "") or ""), str(getattr(sess, "tool", "") or "")]).lower()
+            if all(w in hay for w in words):
+                hits.append(sess)
+        hits.sort(key=lambda s: -float(getattr(s, "updated_at", 0) or 0))
+        return hits[:limit]
+
     def known_keys(self) -> set:
         with self._lock:
             return set(self._known)

@@ -208,7 +208,10 @@ def _is_cancel_word(text: str) -> bool:
 def _is_fleet_word(text: str) -> bool:
     from .fleet.newsession import WORDS as _NEW_WORDS
 
-    return (text or "").strip() in FLEET_WORDS | DIAG_WORDS | UPDATE_WORDS | _NEW_WORDS or _is_cancel_word(text)
+    stripped = (text or "").strip()
+    if stripped.startswith(("找会话 ", "搜会话 ")):
+        return True
+    return stripped in FLEET_WORDS | DIAG_WORDS | UPDATE_WORDS | _NEW_WORDS or _is_cancel_word(text)
 
 
 def _redact_text(text: str) -> str:
@@ -2436,6 +2439,10 @@ class Bridge:
             self._say(chat_id, "好，新话题。前面聊的不带了。")
             self._send_menu(chat_id, scope)
             return True
+        if command in {"/find", "/搜会话", "/找会话"} or text.startswith(("找会话 ", "搜会话 ")):
+            query = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+            await self._fleet_search(scope, chat_id, query)
+            return True
         if command in {"/stop", "/s"}:
             event = self._cancels.get(scope)
             # 🔴 「停」要停全部 —— 包括**停在等审批**的那一步。
@@ -2955,6 +2962,40 @@ class Bridge:
             return None
         target = control.peek_pending(scope)
         return (target.tool, target.id) if target is not None else None
+
+    async def _fleet_search(self, scope: str, chat_id: str, query: str) -> None:
+        """`/find 关键字`：按标题 / 项目 / 编号找会话，点一下进它的群（没有群就建）。"""
+        from .fleet.actions import do_button, fleet_button
+        from .fleet.cards import session_label
+        from .workspace import short_name
+
+        control = getattr(self, "fleet", None)
+        if control is None:
+            self._say(chat_id, "会话总控这次没起来，重启一下服务再试。")
+            return
+        if not query.strip():
+            self._say(chat_id, "要带关键字，比如：/find 登录 或 /find remote_control")
+            return
+        scanner = self._fleet_scanner()
+        try:
+            await asyncio.to_thread(scanner.overview if scanner is not None else control.overview)
+        except Exception:  # noqa: BLE001 —— 扫不出来就按上次的找
+            logger.debug("搜索会话 扫描失败", exc_info=True)
+        hits = control.search(query)
+        logger.info("搜索会话 词数=%d 命中=%d", len(query.split()), len(hits))
+        if not hits:
+            self._say_with_buttons(chat_id, f"没找到和「{_redact_text(query)[:30]}」有关的会话。换个词，或者看看总览。",
+                                   [do_button("sessions", "🖥 看看会话")])
+            return
+        lines = [f"找到 {len(hits)} 个会话，点一下进它的群（还没有群就建一个）："]
+        buttons = []
+        for sess in hits:
+            label = session_label(sess, _redact_text)
+            proj = _redact_text(short_name(getattr(sess, "cwd", "") or "", self.policy)) if getattr(sess, "cwd", "") else ""
+            lines.append(f"- {label}" + (f" · {proj}" if proj else ""))
+            buttons.append(fleet_button("send", sess.tool, sess.id, f"💬 {label}"[:28]))
+        buttons.append(do_button("sessions", "🖥 回到总览"))
+        self._say_with_buttons(chat_id, "\n".join(lines), buttons)
 
     async def _offer_stop_choices(self, chat_id: str) -> bool:
         """私聊「停下」，手边没有在跑的 ⇒ 列出电脑上正在跑的会话，选一个停（FC-11/12）。没有 ⇒ False。
