@@ -178,6 +178,19 @@ class WiringTest(unittest.TestCase):
         bridge._mark_session_done("oc_g", False)
         self.assertEqual(bridge.group_client.name, "SN·Codex·remote_control·修登录")
 
+    def test_done_on_full_length_name_round_trips(self):
+        fs = FakeFeishu()
+        bridge = make_bridge(tempfile.mkdtemp(), fs, sess(tool="codex", sid="c1"))
+        full = "SN·Codex·sn-newproj-1117·在当前目录创建 hello.…"
+        self.assertEqual(len(full), 40)
+        bridge.chat_binds.set_name("oc_g", full)
+        bridge.group_client.name = full
+        bridge._mark_session_done("oc_g", True)
+        self.assertTrue(bridge.group_client.name.startswith("✅"))
+        self.assertLessEqual(len(bridge.group_client.name), 40)
+        bridge._mark_session_done("oc_g", False)
+        self.assertFalse(bridge.group_client.name.startswith("✅"))
+
     def test_done_keeps_owner_renamed_group(self):
         fs = FakeFeishu()
         bridge = make_bridge(tempfile.mkdtemp(), fs, sess(tool="codex", sid="c1"))

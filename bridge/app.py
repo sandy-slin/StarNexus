@@ -5722,8 +5722,13 @@ class Bridge:
             except Exception:  # noqa: BLE001
                 current = ""
             if current and current.strip() == bound.name.strip():
+                from .fleet.chatbind import MAX_NAME_CHARS
+                from .fleet.model import short_title
+
                 base = bound.name[len(DONE_PREFIX):] if bound.name.startswith(DONE_PREFIX) else bound.name
-                want = (DONE_PREFIX + base) if done else base
+                # 加 ✅ 后要整体塞进群名上限，否则记下的名字会被截断、和飞书上对不上，
+                # 下次「重新打开」就会误判成主人改过名而不动（2026-11-17 实测）。
+                want = (DONE_PREFIX + short_title(base, MAX_NAME_CHARS - len(DONE_PREFIX))) if done else base
                 if want != bound.name:
                     try:
                         ok, _code, _msg = setter(chat_id, want)
