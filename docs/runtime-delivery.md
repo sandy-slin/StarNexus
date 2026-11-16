@@ -10,6 +10,10 @@
 6. 重启 `com.carher.feishu-agent`，确认 launchd 为 `running`，日志出现飞书连接成功。
 7. 按 [`computer-use.md`](computer-use.md) 做真实验收，按 [`menu-update.md`](menu-update.md) 做菜单验收。
 
+## 不让安装包覆盖仓库代码
+
+本机运行目录用仓库代码同步，不走安装包。`~/.carher-feishu-agent/.local-deploy` 存在时，自动更新一律跳过（`bridge/selfupdate.py`）。2026-11-17 04:43 发生过一次：自动更新装回 20261116 的旧包，覆盖了已修好的 `codex queue` 参数等改动，群里发给 Codex 的消息全部失败。这个标记文件不要删；每次同步后核对一次关键文件里的新函数还在。
+
 ## Git 交付门禁
 
 - 所有交付文件必须在仓库中，不能只存在于 `/tmp`、运行目录或聊天附件。

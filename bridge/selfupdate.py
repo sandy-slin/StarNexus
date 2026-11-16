@@ -155,6 +155,23 @@ def latest(*, opener=None, params: Optional[dict] = None) -> Optional[dict]:
     return data
 
 
+# 2026-11-17：这台机是用仓库代码 rsync 上去的（不是安装包）。有它就不让安装包覆盖 ——
+# 现场事故：04:43 自动更新装回 20261116 的旧包，把刚修好的 `codex queue` 参数、复制会话、
+# 新建项目全冲掉了，群里发消息一律「没发进去」。文件内容随便，只用来表明「这里归 git 管」。
+LOCAL_DEPLOY_MARK = ".local-deploy"
+
+
+def local_deploy_mark(package_dir: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(package_dir)), LOCAL_DEPLOY_MARK)
+
+
+def is_local_deploy(package_dir: str) -> bool:
+    try:
+        return os.path.exists(local_deploy_mark(package_dir))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def installer_key() -> str:
     """这台机器要哪个包。"""
     return "windows" if platform.system() == "Windows" else "mac"
@@ -398,6 +415,11 @@ class SelfUpdater:
         `manual=True`（他亲手发「更新」）⇒ 绕过失败冷却：他就是要现在再试一次。
         """
         self.last_error = ""
+        if is_local_deploy(self.package_dir):
+            # 仓库直接部署的机器：安装包会把本地新代码覆盖成旧版本（实测过一次）⇒ 一律不装
+            self.last_error = "这台电脑跑的是仓库里的代码，更新用 git 部署，别用安装包"
+            logger.info("本机有 %s，跳过自动更新（安装包会覆盖仓库代码）", LOCAL_DEPLOY_MARK)
+            return None
         current = self.current_build()
         # 第 32 轮：先把「在装」「被退回」落定，上报的 `u` 才是这次真实的结果（not_applied）
         self._reconcile(current)
