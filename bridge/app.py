@@ -3002,7 +3002,7 @@ class Bridge:
         self._newsession_state().arm(target_scope, bound.tool, cwd, choice.model or "", choice.effort or "",
                                      fork_from=bound.id)
         logger.info("会话管理 复制 tool=%s 会话=%s", bound.tool, bound.id[:8])
-        where = "私聊里" if dm_scope else "这里"
+        where = "和 Her remote · Pro 的私聊里" if dm_scope else "这里"
         self._say(chat_id, f"🧬 好，复制一份「{_redact_text(bound.name or bound.id[:8])}」：新会话带着它的全部上下文，"
                            f"另开一个群。到{where}说新会话的第一句（10 分钟内有效），原会话不受影响。")
         if dm_scope:
@@ -3011,13 +3011,9 @@ class Bridge:
                 self._say(dm_chat, f"🧬 下一句话会作为「{_redact_text(bound.name or bound.id[:8])}」复制出来的新会话的第一句。")
 
     def _owner_dm_scope(self) -> str:
+        # 私聊 scope 只由 open_id 决定（`SessionStore.scope_for`），重启后不必等他先在私聊说一句
         owners = sorted(getattr(getattr(self, "settings", None), "owner_open_ids", None) or ())
-        known = getattr(self, "_chat_ids", {}) or {}
-        for owner in owners:
-            scope = f"dm:{owner}"
-            if scope in known:
-                return scope
-        return ""
+        return f"dm:{owners[0]}" if len(owners) == 1 else ""
 
     async def _session_archive(self, chat_id: str, bound) -> None:
         control = getattr(self, "fleet", None)

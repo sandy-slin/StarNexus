@@ -104,3 +104,11 @@ class BridgeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DmScopeTest(unittest.TestCase):
+    def test_dm_scope_without_seen_chat(self):
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        bridge.settings = SimpleNamespace(owner_open_ids=frozenset({"ou_me"}))
+        bridge._chat_ids = {}
+        self.assertEqual(bridge._owner_dm_scope(), "dm:ou_me")
