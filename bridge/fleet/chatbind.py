@@ -63,7 +63,10 @@ def _replace(bound, **kw):
 logger = logging.getLogger("feishu-bridge.fleet")
 
 # 群名上限。手机上一行看得全的宽度按 22~24 个汉字算（spec 一），群名再长列表里会被截。
-MAX_NAME_CHARS = 24
+MAX_NAME_CHARS = 40
+# 所有会话群统一前缀，飞书里搜「SN·」就能列出全部会话群（产品定义 §5.1 群名规范）。
+GROUP_PREFIX_SN = "SN"
+PROJECT_NAME_CHARS = 16
 # 重名时加的短 id 长度。会话 id 是 uuid，前 6 位足够分开同名的两个会话。
 SHORT_ID_CHARS = 6
 # 记这么多条就够了（一个人手机上不会有几百个群）。超了清最旧的，别让文件无限长。
@@ -128,8 +131,24 @@ def _clean_name(text: Any) -> str:
     return "".join(kept).strip()
 
 
+def project_label(project: Any, clean: Optional[Callable[[str], str]] = None) -> str:
+    """项目目录 → 群名里的项目段：只取最后一级目录名，脱敏、去控制字符、截短。"""
+    raw = str(project or "").rstrip("/")
+    if not raw:
+        return ""
+    base = raw.rsplit("/", 1)[-1]
+    try:
+        base = _clean_name((clean or (lambda x: x))(base))
+    except Exception:  # noqa: BLE001
+        logger.exception("项目名脱敏失败，群名不带项目")
+        return ""
+    base = base.replace("·", "-")
+    return base[:PROJECT_NAME_CHARS]
+
+
 def group_name(tool: str, title: str, sid: str = "", *, taken: Iterable[str] = (),
-               clean: Optional[Callable[[str], str]] = None, limit: int = MAX_NAME_CHARS) -> str:
+               clean: Optional[Callable[[str], str]] = None, limit: int = MAX_NAME_CHARS,
+               project: str = "") -> str:
     """会话 → 群名。规则：`Claude · 修登录`，超长截断，重名加短 id。
 
     - `clean`：脱敏。会话标题是**用户项目里的文字**（第一句话 / AI 起的标题），而群里能看到的人
@@ -147,7 +166,9 @@ def group_name(tool: str, title: str, sid: str = "", *, taken: Iterable[str] = (
         safe = ""
     head = TOOL_LABELS.get(tool, tool) or "会话"
     tail = safe or f"会话 {str(sid or '')[:SHORT_ID_CHARS]}".strip()
-    name = short_title(f"{head}·{tail}", limit)
+    proj = project_label(project, clean)
+    parts = [GROUP_PREFIX_SN, head] + ([proj] if proj else []) + [tail]
+    name = short_title("·".join(parts), limit)
     used = {str(t) for t in (taken or ())}
     if name not in used:
         return name
@@ -441,7 +462,8 @@ class GroupClient:
 
 
 def ensure_group(binds: ChatBinds, client: Any, tool: str, sid: str, title: str = "",
-                 *, owner_open_id: str = "", clean: Optional[Callable[[str], str]] = None) -> GroupResult:
+                 *, owner_open_id: str = "", clean: Optional[Callable[[str], str]] = None,
+                 project: str = "") -> GroupResult:
     """「这个会话要有一个群」。**幂等**：同一个会话点两次复用同一个群（spec 二 2）。
 
     顺序是有讲究的：
@@ -461,7 +483,7 @@ def ensure_group(binds: ChatBinds, client: Any, tool: str, sid: str, title: str 
         logger.info("这个会话的群已经不在了，重建一个 tool=%s 会话=%s", tool, str(sid)[:8])
         binds.forget(existing.chat_id)
 
-    name = group_name(tool, title, sid, taken=binds.names(), clean=clean)
+    name = group_name(tool, title, sid, taken=binds.names(), clean=clean, project=project)
     try:
         chat_id, code, msg = client.create(name, owner_open_id)
     except Exception as exc:  # noqa: BLE001 —— 接口约定不抛；它抛了也不能让点击崩掉
@@ -504,7 +526,7 @@ class RenameResult:
 
 
 def rename_group(binds: ChatBinds, client: Any, bound: Bound, title: str = "",
-                 *, clean: Optional[Callable[[str], str]] = None) -> RenameResult:
+                 *, clean: Optional[Callable[[str], str]] = None, project: str = "") -> RenameResult:
     """群改绑到另一个会话之后，把群名也跟过去。
 
     ## 为什么非要改（2026-11-05 两份 review 都提了同一条）
@@ -538,7 +560,7 @@ def rename_group(binds: ChatBinds, client: Any, bound: Bound, title: str = "",
         logger.info("群名是主人自己改的，不覆盖 chat=%s", str(bound.chat_id)[:12])
         return RenameResult(KEPT_OWN, current)
     want = group_name(bound.tool, title, bound.id,
-                      taken=binds.names(skip_chat=bound.chat_id), clean=clean)
+                      taken=binds.names(skip_chat=bound.chat_id), clean=clean, project=project)
     if _clean_name(want) == _clean_name(current):
         binds.set_name(bound.chat_id, want)
         return RenameResult(SAME, want)

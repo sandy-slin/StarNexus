@@ -3381,10 +3381,13 @@ class Bridge:
         control = self.fleet
         sess = control.cached(tool, sid)
         title = getattr(sess, "title", "") if sess is not None else ""
+        project = getattr(sess, "cwd", "") if sess is not None else ""
+        if not project:
+            project = getattr(self, "_new_session_cwd", {}).get(sid, "")
         label = session_label(sess, _redact_text) if sess is not None else f"{tool} 会话"
         result = await asyncio.to_thread(
             ensure_group, self.chat_binds, self.group_client, tool, sid, title,
-            owner_open_id=clicker, clean=_redact_text,
+            owner_open_id=clicker, clean=_redact_text, project=project,
         )
         logger.info("群绑定 建群 结果=%s tool=%s 会话=%s code=%s", result.how, tool, sid[:8], result.code)
         if not result.ok:
@@ -3582,7 +3585,8 @@ class Bridge:
             control = getattr(self, "fleet", None)
             sess = control.cached(tool, sid) if control is not None else None
             title = str(getattr(sess, "title", "") or "")
-            got = rename_group(binds, client, bound, title, clean=_redact_text)
+            project = str(getattr(sess, "cwd", "") or "")
+            got = rename_group(binds, client, bound, title, clean=_redact_text, project=project)
         except Exception:  # noqa: BLE001 —— 改不了群名不该让这一下点击崩掉，绑定已经改好了
             logger.exception("改绑后改群名失败")
             return ""
@@ -4220,6 +4224,9 @@ class Bridge:
         # 🔴 新会话是主人自己从手机开的，权限说明在选项目时已经给过 ⇒ 记成确认（和建群那条同一套记法），
         # 之后会话改名 / 换项目 / 在电脑上打开，照旧会再问。
         clicker = scope[3:] if scope.startswith("dm:") else ""
+        if not hasattr(self, "_new_session_cwd"):
+            self._new_session_cwd = {}
+        self._new_session_cwd[result.session_id] = cwd
         group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id)
         target_scope = group_bound.scope if group_bound is not None else scope
         target_chat_id = group_bound.chat_id if group_bound is not None else chat_id

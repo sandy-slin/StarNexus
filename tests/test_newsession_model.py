@@ -137,8 +137,21 @@ class MissingWorkspaceTest(unittest.TestCase):
 
 
 class GroupNameTest(unittest.TestCase):
-    def test_uses_compact_tool_title_format(self):
-        self.assertEqual(group_name("codex", "修登录", "abcdef"), "Codex·修登录")
+    def test_uses_sn_prefix_tool_title_format(self):
+        self.assertEqual(group_name("codex", "修登录", "abcdef"), "SN·Codex·修登录")
+
+    def test_includes_project_basename(self):
+        self.assertEqual(group_name("codex", "修登录", "abcdef", project="/Users/x/work/remote_control/"),
+                         "SN·Codex·remote_control·修登录")
+
+    def test_duplicate_name_gets_short_id(self):
+        first = group_name("claude", "修登录", "abcdef12", project="/p/app")
+        second = group_name("claude", "修登录", "99887766", project="/p/app", taken=[first])
+        self.assertEqual(first, "SN·Claude·app·修登录")
+        self.assertEqual(second, "SN·Claude·app·修登录 #998877")
+
+    def test_project_separator_is_sanitized(self):
+        self.assertEqual(group_name("codex", "t", "a", project="/p/a·b"), "SN·Codex·a-b·t")
 
 
 if __name__ == "__main__":
