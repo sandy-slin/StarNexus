@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -362,8 +363,11 @@ def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings:
         "claude": ClaudeAdapter(bridge_home=bridge_home, jobs=jobs, policy=policy,
                                 hook_settings=hook_settings),
         "codex": CodexAdapter(jobs=jobs, hook_path=hook_path),
-        "cursor": CursorAdapter(jobs=jobs, mode=lambda: getattr(policy(), "mode", "readonly")),
     }
+    # 2026-11-16 林森决定：Cursor 移出目标（首批只做 Claude 和 Codex）。代码保留，默认不进总览；
+    # 要临时看 Cursor 会话就在服务环境里设 CARHER_FLEET_CURSOR=1。
+    if os.environ.get("CARHER_FLEET_CURSOR") == "1":
+        adapters["cursor"] = CursorAdapter(jobs=jobs, mode=lambda: getattr(policy(), "mode", "readonly"))
     return FleetControl(Fleet(adapters))
 
 

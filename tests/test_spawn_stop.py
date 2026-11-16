@@ -69,3 +69,20 @@ class CodexSandboxModeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CursorHiddenTest(unittest.TestCase):
+    def test_default_fleet_has_no_cursor(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        from bridge.fleet import control as control_mod
+
+        with mock.patch.dict(os.environ, {"CARHER_FLEET_CURSOR": ""}):
+            fleet = control_mod.build_default(policy=lambda: None, bridge_home=tempfile.mkdtemp())
+        self.assertIsNone(fleet.fleet.adapter("cursor"))
+        self.assertIsNotNone(fleet.fleet.adapter("codex"))
+        with mock.patch.dict(os.environ, {"CARHER_FLEET_CURSOR": "1"}):
+            fleet = control_mod.build_default(policy=lambda: None, bridge_home=tempfile.mkdtemp())
+        self.assertIsNotNone(fleet.fleet.adapter("cursor"))
