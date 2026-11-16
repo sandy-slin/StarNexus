@@ -320,8 +320,11 @@ class _FleetWaitCard:
     """
 
     def __init__(self, replier, chat_id: str, label: str, *, can_stop: bool,
-                 first_delay: float, escalate_sec: float = 0, limit_sec: float = 0) -> None:
+                 first_delay: float, escalate_sec: float = 0, limit_sec: float = 0,
+                 progress=None) -> None:
         self._replier = replier
+        # FC-14：返回进展几行（用了哪些工具、改了哪些文件、正在做什么）的函数；没有 ⇒ 只写等了多久
+        self._progress = progress
         self._chat_id = chat_id
         self._label = label
         self._can_stop = bool(can_stop)
@@ -333,8 +336,10 @@ class _FleetWaitCard:
         self._broken = getattr(replier, "send_status_card", None) is None
         self._started = time.monotonic()
 
-    def _render(self, elapsed: int) -> str:
+    def _render(self, elapsed: int, extra: list = ()) -> str:
         text = f"⏳ 已经发给{self._label} {_fmt_elapsed(elapsed)}，还在等它回"
+        if extra:
+            text += "\n" + "\n".join(extra)
         if self._escalate_sec and elapsed >= self._escalate_sec:
             text += "\n等得比平时久。可以先去忙，它回了会贴在这里"
             # 照实说上限：过了这个点就不再等，之后它回了也不会推过来
@@ -366,7 +371,13 @@ class _FleetWaitCard:
         except asyncio.TimeoutError:
             pass
         while not stop.is_set():
-            await self._show(self._render(int(time.monotonic() - self._started)), self._can_stop)
+            extra: list = []
+            if self._progress is not None:
+                try:
+                    extra = list(await asyncio.to_thread(self._progress) or [])
+                except Exception:  # noqa: BLE001 —— 进展读坏了只少几行
+                    logger.debug("读这一轮进展失败", exc_info=True)
+            await self._show(self._render(int(time.monotonic() - self._started), extra), self._can_stop)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=_STATUS_REFRESH_SEC)
             except asyncio.TimeoutError:
@@ -3021,6 +3032,7 @@ class Bridge:
             first_delay=getattr(settings, "progress_first_notice_sec", 90),
             escalate_sec=getattr(settings, "progress_escalate_sec", 0),
             limit_sec=float(getattr(policy, "turn_timeout_sec", 600) or 600),
+            progress=self._turn_progress(control, target.tool, target.id),
         )
         wait_stop = asyncio.Event()
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
@@ -4376,6 +4388,25 @@ class Bridge:
         "claude": "继续",
         "codex": "主人已在飞书批准了刚才被拦下的那一步。请原样重新执行同一条命令（一个字都不要改），然后继续完成任务。",
     }
+
+    @staticmethod
+    def _turn_progress(control, tool: str, sid: str):
+        """这一轮进展的读取函数：发之前记下会话记录的字节数，之后每次只读新增那段（FC-14）。"""
+        from .fleet.progress import mark, read_progress
+        from .redact import redact
+
+        try:
+            start_path = control.record_path(tool, sid)
+        except Exception:  # noqa: BLE001
+            return None
+        start = {"path": start_path, "offset": mark(start_path)}
+
+        def read() -> list:
+            path = control.record_path(tool, sid) or start["path"]
+            offset = start["offset"] if path == start["path"] else 0
+            return read_progress(path, offset).lines(lambda t: redact(t)[0])
+
+        return read
 
     def _choice_buttons(self, scope: str, chat_id: str, tool: str, sid: str, text: str) -> list:
         """回复结尾是「选一个」⇒ 每个选项一个按钮（FC-07）。选项文字记在服务端，按钮只带序号。"""

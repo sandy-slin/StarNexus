@@ -123,6 +123,19 @@ class FleetControl:
         self._remember(sess)
         return sess, ""
 
+    def record_path(self, tool: str, sid: str) -> str:
+        """会话记录文件（进展卡读新增部分用）。Claude = jsonl；Codex = 最新的 rollout 分段。读不到 ⇒ 空串。"""
+        adapter = self.fleet.adapter(tool)
+        try:
+            if tool == "claude" and hasattr(adapter, "_jsonl_path"):
+                return adapter._jsonl_path(sid) or ""
+            if tool == "codex" and hasattr(adapter, "_segments"):
+                segs = adapter._segments(sid)
+                return segs[0] if segs else ""
+        except Exception:  # noqa: BLE001 —— 只少了进展那几行
+            return ""
+        return ""
+
     def detail(self, tool: str, sid: str, n: int = DETAIL_MESSAGES) -> tuple:
         """(Session 或 None, 最近 n 条, 一句说明)。状态现查；查不到用上次扫描的并说明。"""
         adapter = self.fleet.adapter(tool)
