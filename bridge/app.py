@@ -3791,6 +3791,12 @@ class Bridge:
         if not project:
             project = getattr(self, "_new_session_cwd", {}).get(sid, "")
         label = session_label(sess, _redact_text) if sess is not None else f"{tool} 会话"
+        ns_name = getattr(self, "_new_session_name", {}).get(sid, "")
+        if ns_name:
+            from .fleet.cards import TOOL_LABELS as _tool_labels
+            from .fleet.model import short_title
+
+            label = f"{_tool_labels.get(tool, tool)}「{short_title(_redact_text(ns_name), 24)}」"
         result = await asyncio.to_thread(
             ensure_group, self.chat_binds, self.group_client, tool, sid, title,
             owner_open_id=clicker, clean=_redact_text, project=project,

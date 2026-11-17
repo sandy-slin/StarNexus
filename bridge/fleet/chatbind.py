@@ -167,7 +167,7 @@ def group_name(tool: str, title: str, sid: str = "", *, taken: Iterable[str] = (
     head = TOOL_LABELS.get(tool, tool) or "会话"
     tail = safe or f"会话 {str(sid or '')[:SHORT_ID_CHARS]}".strip()
     proj = project_label(project, clean)
-    parts = [GROUP_PREFIX_SN, head] + ([proj] if proj else []) + [tail]
+    parts = [GROUP_PREFIX_SN, head] + ([proj] if proj and proj != tail else []) + [tail]
     name = short_title("·".join(parts), limit)
     used = {str(t) for t in (taken or ())}
     if name not in used:

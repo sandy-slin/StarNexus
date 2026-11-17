@@ -228,3 +228,13 @@ class SessionNameLabelTest(unittest.TestCase):
         self.assertEqual(control.set_pending("dm:x", "codex", "s1").label, "Codex「修登录」")
         control.set_name("codex", "s1", "")
         self.assertEqual(control.name_of("codex", "s1"), "")
+
+
+class GroupNameDedupTest(unittest.TestCase):
+    def test_project_equal_to_name_not_repeated(self):
+        name = group_name("claude", "ns-label-check", "e0aa0d1c", project="/Users/LinSen/work/AI_native/ns-label-check")
+        self.assertEqual(name, "SN·Claude·ns-label-check")
+
+    def test_project_different_from_name_kept(self):
+        name = group_name("claude", "ai-native", "b994d9f4", project="/Users/LinSen/work/AI_native")
+        self.assertEqual(name, "SN·Claude·AI_native·ai-native")
