@@ -31,6 +31,7 @@ EXPLAIN = {
     "trusted": "和终端一样，能读写和执行",
 }
 ALIASES = {
+    "r": "readonly", "w": "write", "f": "trusted",
     "只读": "readonly", "readonly": "readonly", "ro": "readonly",
     "可写": "write", "可改": "write", "可改文件": "write", "write": "write", "w": "write",
     "全部授权": "trusted", "全授权": "trusted", "全开": "trusted", "trusted": "trusted",
@@ -38,7 +39,7 @@ ALIASES = {
 ORIGIN_FEISHU = "feishu"
 ORIGIN_GROUP = "group"
 MAX_ROWS = 500
-COMMAND_HINT = "发「/权限 只读」「/权限 可写」「/权限 全部授权」也能切"
+COMMAND_HINT = "发「/p r」只读、「/p w」可写、「/p f」全部授权也能切（「/权限 只读」等中文照样认）"
 
 
 def parse_mode(word: str) -> Optional[str]:

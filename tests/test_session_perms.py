@@ -1,4 +1,4 @@
-"""1.3.0 会话级权限 + 模型下拉，SP-01 ~ SP-16。"""
+"""1.3.0 会话级权限 + 模型下拉，SP-01 ~ SP-18。"""
 
 import asyncio
 import json
@@ -71,13 +71,15 @@ class StoreTest(unittest.TestCase):
         for word, want in (("只读", "readonly"), ("可写", "write"), ("全部授权", "trusted"), ("全授权", "trusted")):
             self.assertEqual(sessperm.parse_mode(word), want)
         self.assertIsNone(sessperm.parse_mode("随便"))
+        for word, want in (("r", "readonly"), ("w", "write"), ("f", "trusted"), ("F", "trusted")):
+            self.assertEqual(sessperm.parse_mode(word), want)
 
 
 class CardTest(unittest.TestCase):
     def test_sp06_three_buttons_current_marked(self):
         card = sessperm.card("write", "SN·Codex·repo")
         blob = json.dumps(card, ensure_ascii=False)
-        for word in ("只读", "✅ 可写", "全部授权", "/权限 只读"):
+        for word in ("只读", "✅ 可写", "全部授权", "/p r", "/p w", "/p f", "/权限 只读"):
             self.assertIn(word, blob)
         values = [c["elements"][0]["behaviors"][0]["value"] for c in card["body"]["elements"][1]["columns"]]
         self.assertEqual(values, [{"act": "sp", "m": m} for m in sessperm.MODES])
@@ -118,6 +120,21 @@ class GroupTest(unittest.TestCase):
         self.assertEqual(bridge.session_perms.mode("codex", "t-1"), "readonly")
         self.assertEqual(bridge.policy.mode, "trusted")
         self.assertIn("只读", bridge.sent[-1][1])
+
+    def test_sp17_short_p_command_in_group(self):
+        bridge = bridge_with(self.tmp, policy("trusted"), BOUND)
+        for word, want in (("r", "readonly"), ("w", "write"), ("f", "trusted")):
+            bridge._handle_session_mode("oc_g", f"/p {word}")
+            self.assertEqual(bridge.session_perms.mode("codex", "t-1"), want)
+        self.assertEqual(bridge.policy.mode, "trusted")
+
+    def test_sp18_p_is_a_known_command_and_routes(self):
+        from bridge import menu
+
+        self.assertIn("/p", menu._APP_LITERALS)
+        src = open(app_mod.__file__, encoding="utf-8").read()
+        self.assertIn('{"/mode", "/权限", "/p"}', src)
+        self.assertIn('"f": "trusted"', src)
 
     def test_sp12_group_command_without_arg_sends_card(self):
         bridge = bridge_with(self.tmp, policy("trusted"), BOUND)
