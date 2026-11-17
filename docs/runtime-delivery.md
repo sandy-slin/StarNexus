@@ -24,7 +24,7 @@
 
 ## 推送到 GitHub
 
-- 远端：`origin` = `git@github.com:sandy-slin/StarNexus.git`，分支 `main`。
+- 远端：`origin` = `git@github.com:sandy-slin/StarNexus.git`。开发在 `codex/` 或 `claude/` 分支上进行，合回 `main` 和打标签按 [`dev-release.md`](dev-release.md)；下面的同步规则对开发分支和 `main` 都适用。
 - 核心更新提交后立即推送：功能代码、测试、产品定义、操作手册、菜单变更。不要攒到最后一起推。
 - 每次推送前先把远端同步到本地，顺序固定：
   1. `git fetch origin`，再 `git pull --rebase origin main`。Codex 和 Claude 都可能推送过，不能假设本地是最新的。

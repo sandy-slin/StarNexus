@@ -5,6 +5,7 @@
 ## 开始任务
 
 - 先检查 `git status`，保留已有修改，不覆盖用户改动。
+- 每个需求从最新 `main` 建独立工作区和 `codex/` 或 `claude/` 开发分支；合回 `main` 前同步最新 `main` 并跑回归，合回后第一件事打 `x.y.z` 标签，详见 [`docs/dev-release.md`](docs/dev-release.md)。
 - 先读与当前任务相关的细节文档，再修改代码。
 - 代码逻辑发生变化时，必须完成仓库测试、同步本机运行目录、重启后台服务，并核对运行状态。
 - 只在目标 bot `Her remote · Pro` 和目标 MacBook Pro2 上做真实飞书验收；不要误操作“林森的her”。
@@ -16,6 +17,7 @@
 
 | 任务 | 必读文档 | 关键要求 |
 |---|---|---|
+| 开发分支、合并、版本标签 | [`docs/dev-release.md`](docs/dev-release.md) | 基于最新 main、回归全过才合并；合并后先打 `x.y.z` 标签 |
 | 选择操作手册和交付规则 | [`docs/operations.md`](docs/operations.md) | 先按任务类型读取对应细节；所有交付必须有 Git 提交 |
 | Computer Use、飞书真实验收 | [`docs/computer-use.md`](docs/computer-use.md) | 按目标确认、操作、结果三段验收；客户端画面未确认时不能宣布完成 |
 | 常驻菜单更新和发布 | [`docs/menu-update.md`](docs/menu-update.md) | 源码、能力、版本、客户端四层分别验收 |
