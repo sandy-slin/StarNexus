@@ -4334,8 +4334,11 @@ class Bridge:
             if op == "go":
                 return toast("info", "收到，进群接着说", "已排队:跳进群")
             return toast("info", "收到，正在给它建群", "已排队:建群")
-        # 在绑过的群里点了另一个会话 ⇒ 改绑（这个群以后直达新点的那个）
-        self._group_bind_click(chat_id, scope, tool, sid)
+        # 在绑过的群里点了另一个会话 ⇒ 改绑（这个群以后直达新点的那个）。
+        # 改群名要调飞书接口（实测 3.4s），超过卡片回调 3 秒 ⇒ 丢后台，回调立刻返回。
+        if str(scope).startswith("group:") and getattr(self, "chat_binds", None) is not None:
+            self._in_background(self._group_session_click, chat_id, scope, tool, sid)
+            return toast("info", "收到，这个群改成直达它", "已排队:群改绑")
         # 🔴 没确认过**先弹确认卡、不记目标** —— 记了就等于他下一句话会直接进那个会话，
         # 而他还没被告知「那边的权限不是手机这边这套」。确认过的 24 小时内直接进。
         if not self._relay_granted(scope, tool, sid):
@@ -4346,6 +4349,33 @@ class Bridge:
         self._say_later_with_buttons(chat_id, self._enter_talk_text(target, scope),
                                      self._talk_buttons(target.tool, target.id))
         return toast("info", "收到，说吧", "进对话模式")
+
+    def _group_session_click(self, chat_id: str, scope: str, tool: str, sid: str) -> None:
+        """群里点了某个会话（后台跑）：绑过的群改绑过去；主人这一下点击就是确认，不再弹「确认，开始说话」。
+
+        和 da90e6e 同一口径（2026-11-17 林森要求去掉多余的确认卡）：能点到这里的只有主人
+        （`clicker` 在入口校验过），群又绑定到这个会话 ⇒ 记成确认、直接进对话模式。
+        普通群（没绑过）还是先弹确认卡。
+        """
+        control = getattr(self, "fleet", None)
+        if control is None:
+            return
+        self._group_bind_click(chat_id, scope, tool, sid)
+        group_chat = scope.split(":", 1)[1]
+        try:
+            bound = self.chat_binds.of_chat(group_chat)
+        except Exception:  # noqa: BLE001
+            bound = None
+        if bound is not None and (bound.tool, bound.id) == (tool, sid) \
+                and not self._relay_granted(scope, tool, sid):
+            self._grant_by_open_click(scope, tool, sid)
+        if not self._relay_granted(scope, tool, sid):
+            self._ask_relay_consent(chat_id, scope, tool, sid)
+            return
+        target = control.set_pending(scope, tool, sid)
+        self._sync_talk_marker(scope)
+        self._say_with_buttons(chat_id, self._enter_talk_text(target, scope),
+                               self._talk_buttons(target.tool, target.id))
 
     # ---------- 手机上「➕ 新建会话」（bridge/fleet/newsession.py） ----------
 
