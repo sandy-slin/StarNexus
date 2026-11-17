@@ -5854,7 +5854,13 @@ class Bridge:
             sid, label = "", ""
         logger.info("模型卡 点击 op=%s to=%s tool=%s", op, to, tool or "-")
         if op == "home":
-            return reply("info", "模型总览", home_card(mp, session))
+            card = home_card(mp, session)
+            if value.get("src") == "sc" and chat_id:
+                # 状态卡是置顶的那条：在原地换成模型卡，选完模型状态卡一刷新就把模型卡盖掉
+                # ⇒ 推理强度没法接着选。模型卡另发一条，状态卡留在原位。
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 发「/model」查看和切换模型")
+                return reply("info", "模型卡已发到群里")
+            return reply("info", "模型总览", card)
         if op == "open":
             return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", list_card(mp, to, tool, sid, label))
         if op == "m":

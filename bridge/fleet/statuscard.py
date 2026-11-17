@@ -117,7 +117,7 @@ def build_card(info: CardInfo) -> str:
     lines.append("")
     lines.append("💬 继续：直接在群里说话，就发给这个会话。改群名发「/rename 新名字」。")
     buttons = [
-        _button("🧠 模型", {"act": "mdl", "op": "home", "to": "s"}),
+        _button("🧠 模型", {"act": "mdl", "op": "home", "to": "s", "src": "sc"}),
         _button("⏹ 停下", {"act": "do", "op": "stop"}),
         _button("↩︎ 重新打开" if info.finished else "✅ 完成", value("reopen" if info.finished else "done")),
         _button("🔄 刷新", value("refresh")),

@@ -195,5 +195,46 @@ class ControlForwardTest(unittest.TestCase):
         self.assertNotIn("model", calls[1])
 
 
+class StatusCardModelButtonTest(CatalogFixture):
+    """状态卡上的「🧠 模型」：模型卡另发一条，置顶状态卡不被替换（选完模型还能接着选推理强度）。"""
+
+    def _bridge(self):
+        from bridge import app as app_mod
+
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        bridge.settings = SimpleNamespace(owner_open_ids=frozenset({"ou_owner"}))
+        bridge.model_prefs = self.prefs
+        bridge._model_session_of = lambda chat_id: ("claude", "s1", "SN·Claude·x")
+        bridge.sent = []
+        bridge._in_background = lambda fn, *args: fn(*args)
+        bridge._send_card_or_text = lambda chat_id, card, fallback: bridge.sent.append((chat_id, card))
+        return bridge
+
+    def _event(self):
+        return SimpleNamespace(context=SimpleNamespace(open_chat_id="oc_group"))
+
+    def test_status_card_button_sends_separate_card(self):
+        bridge = self._bridge()
+        resp = bridge._on_model_click(self._event(), "ou_owner",
+                                      {"act": "mdl", "op": "home", "to": "s", "src": "sc"})
+        self.assertIsNone(resp.card)
+        self.assertEqual(len(bridge.sent), 1)
+        self.assertEqual(bridge.sent[0][0], "oc_group")
+        self.assertIn("换这个会话的模型", bridge.sent[0][1])
+
+    def test_model_card_home_still_replaces_in_place(self):
+        bridge = self._bridge()
+        resp = bridge._on_model_click(self._event(), "ou_owner", {"act": "mdl", "op": "home", "to": "s"})
+        self.assertEqual(bridge.sent, [])
+        self.assertIn("换这个会话的模型", json.dumps(resp.card.data, ensure_ascii=False))
+
+    def test_status_card_button_carries_source(self):
+        from bridge.fleet.statuscard import CardInfo, build_card
+
+        card = build_card(CardInfo(tool="claude", sid="s1", title="t", project="p", model="m",
+                                   mode="全授权", status="idle"))
+        self.assertIn('"src": "sc"', card)
+
+
 if __name__ == "__main__":
     unittest.main()
