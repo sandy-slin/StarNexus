@@ -63,6 +63,7 @@ class CommandTest(unittest.TestCase):
         bridge._say = lambda chat, text: bridge.said.append(text) or True
         bridge._arm_new_session = lambda scope, chat, tool, cwd, *a, **kw: (bridge.armed.append((tool, cwd)), bridge.names.append(kw.get("name", "")))
         bridge._send_new_tool_card = lambda chat: bridge.cards.append(chat)
+        bridge._send_ns_card = lambda scope, chat, tool="", project="", *a: bridge.cards.append((chat, project))
         return bridge
 
     def test_with_tool_arms_directly(self):
@@ -73,12 +74,11 @@ class CommandTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(os.path.join(root, "p1", ".git")))
         self.assertEqual(bridge.names, ["p1"])
 
-    def test_without_tool_asks_tool_and_remembers(self):
+    def test_without_tool_sends_one_card_on_new_project(self):
         root = os.path.realpath(tempfile.mkdtemp())
         bridge = self.make(root)
         asyncio.run(bridge._new_project("dm:ou_me", "oc_dm", [os.path.join(root, "p2")]))
-        self.assertEqual(bridge.cards, ["oc_dm"])
-        self.assertEqual(bridge._new_projects["dm:ou_me"], os.path.join(root, "p2"))
+        self.assertEqual(bridge.cards, [("oc_dm", os.path.join(root, "p2"))])
 
     def test_refusal_is_said(self):
         root = os.path.realpath(tempfile.mkdtemp())

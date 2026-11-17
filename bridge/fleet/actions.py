@@ -49,7 +49,7 @@ DO_COMMANDS = {
     # 诊断卡。纯显示、且内容走 status.HEALTH_FIELDS 白名单 ⇒ 点错了最坏只是多发一张卡。
     "diag": "/诊断",
     "history": "/history",  # 「↑ 最近问过」卡（只显示，不改任何设置）
-    # 「➕ 新建会话」：只打开选工具卡；真正开会话要再点工具、点项目、再说一句话（fleet/newsession.py）
+    # 「➕ 新建会话」：发一张卡（工具 / 项目 / 模型 / 强度 / 第一句话），回车或点「开始」就开（fleet/nscard.py）
     "newsession": "/newsession",
     "newcancel": "/newsession cancel",  # 不建了：只清掉选到一半的新建会话，不碰对话模式
     # 会话群状态卡「更多」（§4 会话管理）：复制只是摆好「下一句开新会话」；归档只改记录 + 工具自己的可恢复归档
@@ -98,7 +98,7 @@ TOASTS = {
     "help": "收到，打开帮助",
     "diag": "收到，看看运行状态",
     "history": "收到，调出最近问过的话",
-    "newsession": "收到，选一下用哪个",
+    "newsession": "收到，填一下就开",
     "newcancel": "好，不建了",
 }
 

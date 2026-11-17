@@ -25,10 +25,10 @@
 | 后台同步、回归和交付 | [`docs/runtime-delivery.md`](docs/runtime-delivery.md) | 同步运行目录、重启服务、跑回归、提交并推送 GitHub，记录 SHA |
 | 常驻菜单结构、节点限制、事件订阅和版本发布 | [`bridge/botmenu.py`](bridge/botmenu.py)、[`bridge/menu_heal.py`](bridge/menu_heal.py) | 先跑 `validate_tree()`；菜单形状变化必须发布新版本 |
 | 菜单版本号回归 | [`tests/test_menu_version.py`](tests/test_menu_version.py) | 覆盖整点前十分钟等前导零场景 |
-| 新建会话、建群、模型和权限 | [`bridge/fleet/newsession.py`](bridge/fleet/newsession.py)、[`bridge/fleet/chatbind.py`](bridge/fleet/chatbind.py)、[`bridge/fleet/model.py`](bridge/fleet/model.py) | 以代码和测试为准，真实群聊必须在目标 bot 上核对 |
+| 新建会话、建群、模型和权限 | [`bridge/fleet/nscard.py`](bridge/fleet/nscard.py)（一张卡）、[`bridge/fleet/newsession.py`](bridge/fleet/newsession.py)、[`bridge/fleet/chatbind.py`](bridge/fleet/chatbind.py)、[`bridge/fleet/model.py`](bridge/fleet/model.py) | 以代码和测试为准，真实群聊必须在目标 bot 上核对 |
 | 群进展通知 | [`bridge/fleet/grouppush.py`](bridge/fleet/grouppush.py) | 需要人介入必须推送；普通过程更新不刷屏 |
 | CEO 编排 | [`bridge/fleet/ceo.py`](bridge/fleet/ceo.py) | CEO 负责拆分、派发、汇总、仲裁和向人请求决策 |
-| 产品定义：完全控制 Claude / Codex | [`docs/product/full-control.md`](docs/product/full-control.md) | 新功能先对照能力矩阵和验收用例 FC-01~FC-15 |
+| 产品定义：完全控制 Claude / Codex | [`docs/product/full-control.md`](docs/product/full-control.md) | 新功能先对照能力矩阵和验收用例 FC-01~FC-20 |
 
 ## 代码变更后的最低门禁
 
