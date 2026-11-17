@@ -390,6 +390,43 @@ def case_progress(dm: str) -> tuple:
     return True, f"一张进展卡更新了 {len(snapshots[cards[0]])} 个版本，其他新消息 {len(extra)} 条"
 
 
+def case_ns_one_line(dm: str) -> tuple:
+    """FC-20：/ns codex 名字 路径 luna high 第一句 ⇒ 不等下一句，直接开群、模型 luna / 高。"""
+    name = "lr-oneline-" + time.strftime("%H%M%S")
+    path = os.path.join(WORK, name)
+    os.makedirs(path, exist_ok=True)
+    before = set(binds())
+    if not send(dm, f"/ns codex {name} {path} luna high 回归测试，只回复 LR-ONE-OK"):
+        return False, "发 /ns 失败"
+    chat = wait_new_group(before)
+    if not chat:
+        return False, "6 分钟内没建群"
+    gname = group_name(chat)
+    if not gname.startswith("SN·Codex·"):
+        return False, f"群名不对：{gname}"
+    if not wait_bot(chat, "LR-ONE-OK", timeout=240):
+        return False, "群里没等到 LR-ONE-OK"
+    if not any("gpt-6-luna" in t and "高" in t for t in bot_texts(chat)):
+        return False, "状态卡没写 gpt-6-luna / 高"
+    return True, gname
+
+
+def case_ns_card(dm: str) -> tuple:
+    """FC-16（服务端部分）：/ns 只发一张「➕ 新建会话」卡，卡上有工具/项目/模型/强度/第一句/开始。点卡要 Computer Use。"""
+    if not send(dm, "/ns"):
+        return False, "发 /ns 失败"
+    end = time.time() + 60
+    while time.time() < end:
+        for m in messages(dm, 10):
+            if (m.get("sender") or {}).get("sender_type") != "app":
+                continue
+            body = str(m.get("content") or "")
+            if "新建会话" in body and "开始" in body and "第一句话" in body:
+                return True, "卡片已发出"
+        time.sleep(3)
+    return False, "60 秒内没收到新会话卡"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -403,6 +440,8 @@ CASES = {
     "codex_trusted": case_codex_trusted,
     "term_stop": case_term_stop,
     "progress": case_progress,
+    "ns_one_line": case_ns_one_line,
+    "ns_card": case_ns_card,
 }
 
 
