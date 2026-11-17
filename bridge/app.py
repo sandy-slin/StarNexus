@@ -4542,7 +4542,8 @@ class Bridge:
             return
         if tool:
             self._say(chat_id, made.reply)
-            self._arm_new_session(scope, chat_id, tool, made.workspace)
+            self._arm_new_session(scope, chat_id, tool, made.workspace,
+                                  name=os.path.basename(made.workspace.rstrip(os.sep)))
             return
         self._say(chat_id, made.reply + "。接着选用哪个工具，选完说第一句就开工。")
         self._remember_new_project(scope, made.workspace)
@@ -4649,7 +4650,8 @@ class Bridge:
             project = getattr(self, "_new_projects", {}).pop(scope, "")
             if project and self.policy.resolve_workspace(project):
                 # 刚用 `/ns project new` 建的项目 ⇒ 直接用它，不再让他选一遍目录
-                self._in_background(self._arm_new_session, scope, chat_id, click["tool"], project)
+                self._in_background(self._arm_new_session, scope, chat_id, click["tool"], project, "", "",
+                                    os.path.basename(project.rstrip(os.sep)))
                 return toast("info", "好，用刚建的项目，说第一句吧", "已选好:新项目")
             self._in_background(self._send_new_dir_card, scope, chat_id, click["tool"])
             return toast("info", "收到，选一下项目", "已排队:选项目")

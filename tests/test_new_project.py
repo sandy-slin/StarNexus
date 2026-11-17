@@ -59,9 +59,9 @@ class CommandTest(unittest.TestCase):
     def make(self, root):
         bridge = app_mod.Bridge.__new__(app_mod.Bridge)
         bridge.settings = SimpleNamespace(policy=make_policy(root))
-        bridge.said, bridge.armed, bridge.cards = [], [], []
+        bridge.said, bridge.armed, bridge.cards, bridge.names = [], [], [], []
         bridge._say = lambda chat, text: bridge.said.append(text) or True
-        bridge._arm_new_session = lambda scope, chat, tool, cwd, *a: bridge.armed.append((tool, cwd))
+        bridge._arm_new_session = lambda scope, chat, tool, cwd, *a, **kw: (bridge.armed.append((tool, cwd)), bridge.names.append(kw.get("name", "")))
         bridge._send_new_tool_card = lambda chat: bridge.cards.append(chat)
         return bridge
 
@@ -71,6 +71,7 @@ class CommandTest(unittest.TestCase):
         asyncio.run(bridge._new_project("dm:ou_me", "oc_dm", [os.path.join(root, "p1"), "--git", "codex"]))
         self.assertEqual(bridge.armed, [("codex", os.path.join(root, "p1"))])
         self.assertTrue(os.path.isdir(os.path.join(root, "p1", ".git")))
+        self.assertEqual(bridge.names, ["p1"])
 
     def test_without_tool_asks_tool_and_remembers(self):
         root = os.path.realpath(tempfile.mkdtemp())
