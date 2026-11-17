@@ -130,6 +130,12 @@ class Upgrader:
         return res.returncode == 0 and re.search(r"^\s*state = running", res.stdout or "", re.M) is not None
 
     def restart(self) -> None:
+        """重启服务前先清掉启动守卫的「连续崩溃」计数：新版本连崩过几次之后，守卫会先睡一段才拉起，
+        换回旧版本时这一觉会让 90 秒的确认落空（launch-guard.sh 的 crashloop.state，安装器也是装完就删）。"""
+        try:
+            os.remove(os.path.join(self.home, "crashloop.state"))
+        except OSError:
+            pass
         self.sh(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{self.label}"], timeout=60)
 
     def log_size(self) -> int:

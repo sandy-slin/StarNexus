@@ -173,6 +173,14 @@ class UpgradeFlowTest(unittest.TestCase):
         self.assertEqual(up.tick(dry_run=True), "would_install")
         self.assertEqual(self.bridge_code(), "OLD")
 
+    def test_up15_restart_clears_guard_crash_count(self):
+        world, up = self.make(start_ok=False)
+        up.save({"installed": "1.0.1"})
+        state_file = os.path.join(self.home, "crashloop.state")
+        open(state_file, "w").write("streak=7\n")
+        up.tick()
+        self.assertFalse(os.path.exists(state_file))
+
     def test_up12_old_backups_pruned(self):
         for i in range(8):
             os.makedirs(os.path.join(self.home, f"bridge.bak-upgrade-2026010{i}-000000"))
