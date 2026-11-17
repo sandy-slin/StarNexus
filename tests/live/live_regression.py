@@ -427,6 +427,44 @@ def case_ns_card(dm: str) -> tuple:
     return False, "60 秒内没收到新会话卡"
 
 
+def case_session_perm(dm: str) -> tuple:
+    """FC-21/23/24：飞书开的会话全部授权、新群不弹权限卡；群里 /权限 只读 ⇒ 写不了；/权限 全部授权 ⇒ 又能写。"""
+    name = "lr-perm-" + time.strftime("%H%M%S")
+    path = os.path.join(WORK, name)
+    os.makedirs(path, exist_ok=True)
+    before = set(binds())
+    if not send(dm, f"/ns codex {name} {path} -- 在当前目录创建 a.txt 内容 A，完成后只回复 LR-PERM-A"):
+        return False, "发 /ns 失败"
+    chat = wait_new_group(before)
+    if not chat:
+        return False, "6 分钟内没建群"
+    if not wait_bot(chat, "LR-PERM-A", timeout=240):
+        return False, "群里没等到 LR-PERM-A"
+    if not os.path.exists(os.path.join(path, "a.txt")):
+        return False, "全部授权下 a.txt 没写出来"
+    texts = bot_texts(chat, 30)
+    if any("🔑 这个会话的权限" in t for t in texts):
+        return False, "飞书开的会话不该弹权限切换卡"
+    if not any("全部授权" in t for t in texts):
+        return False, "状态卡没写全部授权"
+    if not send(chat, "/权限 只读") or not wait_bot(chat, "改成「只读」", timeout=60):
+        return False, "群里切只读没回执"
+    send(chat, "在当前目录创建 b.txt 内容 B。如果做不到就只回复 LR-PERM-RO，做到了只回复 LR-PERM-B")
+    if not wait_bot(chat, "LR-PERM-", timeout=240):
+        return False, "只读那一轮没回"
+    time.sleep(3)
+    if os.path.exists(os.path.join(path, "b.txt")):
+        return False, "只读档下 b.txt 被写出来了"
+    if not send(chat, "/权限 全部授权") or not wait_bot(chat, "改成「全部授权」", timeout=60):
+        return False, "群里切回全部授权没回执"
+    send(chat, "在当前目录创建 c.txt 内容 C，完成后只回复 LR-PERM-C")
+    if not wait_bot(chat, "LR-PERM-C", timeout=240):
+        return False, "全部授权那一轮没回 LR-PERM-C"
+    if not os.path.exists(os.path.join(path, "c.txt")):
+        return False, "切回全部授权后 c.txt 没写出来"
+    return True, group_name(chat)
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -442,6 +480,7 @@ CASES = {
     "progress": case_progress,
     "ns_one_line": case_ns_one_line,
     "ns_card": case_ns_card,
+    "session_perm": case_session_perm,
 }
 
 
