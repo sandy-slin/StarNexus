@@ -58,6 +58,8 @@ HOOK_SOURCE = r'''#!/usr/bin/env python3
   $CARHER_APPROVAL_DIR/<指纹>.pending   已经发过卡片，别重复发
   $CARHER_APPROVAL_DIR/<指纹>.deny      卡挂着时他打了一句话 = 没批，这一步 deny 并把原话带给模型
 """
+from __future__ import annotations
+
 import hashlib
 import json
 import os

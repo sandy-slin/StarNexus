@@ -126,6 +126,38 @@ class HookRunTest(unittest.TestCase):
         self.assertEqual(self.run_hook("Bash", {"command": "rm -rf ~"}, flavor="codex")[0], "deny")
 
 
+class HookSystemPythonTest(unittest.TestCase):
+    """钩子由 `/usr/bin/env python3` 调起；launchd 下 PATH 里是 macOS 自带的 3.9。
+
+    2026-11-17 FC-06 实测：钩子里 `list[...] | None` 注解在 3.9 上一加载就 TypeError，
+    Claude 把它当非阻塞错误跳过，`sudo -n true` 没出审批卡直接执行。
+    """
+
+    SYSTEM_PY = "/usr/bin/python3"
+
+    def test_hook_runs_and_defers_sudo_under_system_python(self):
+        if not os.path.exists(self.SYSTEM_PY):
+            self.skipTest("没有系统自带 python3")
+        with tempfile.TemporaryDirectory() as root:
+            hook = os.path.join(root, "hook.py")
+            with open(hook, "w", encoding="utf-8") as handle:
+                handle.write(approval.HOOK_SOURCE)
+            directory = os.path.join(root, "approvals")
+            os.makedirs(directory)
+            with open(os.path.join(directory, "TRUSTED"), "w") as handle:
+                handle.write("1")
+            with open(os.path.join(directory, "workspaces.json"), "w", encoding="utf-8") as handle:
+                json.dump([root], handle)
+            event = {"tool_name": "Bash", "tool_input": {"command": "sudo -n true"},
+                     "cwd": root, "session_id": "s1"}
+            out = subprocess.run([self.SYSTEM_PY, hook], input=json.dumps(event), text=True,
+                                 capture_output=True, timeout=20,
+                                 env=dict(os.environ, CARHER_APPROVAL_DIR=directory))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            got = json.loads(out.stdout)["hookSpecificOutput"]
+            self.assertEqual(got["permissionDecision"], "defer")
+
+
 class ReviewerTest(unittest.TestCase):
     def test_push_and_secret_no_longer_denied_at_message_level(self):
         reviewer = Reviewer()
