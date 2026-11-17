@@ -20,7 +20,7 @@ import unicodedata
 from typing import Any, Iterable, Optional
 
 from ..reply import FENCE, card_snippet, escape_card, inline_code
-from .actions import button_rows, detail_nav_rows, do_button, jump_callback_button
+from .actions import button_rows, detail_nav_rows, do_button, jump_callback_button, newsession_value
 from .model import TOOLS, Session, short_title
 from .scan import TOOL_LABELS, Overview
 
@@ -200,6 +200,18 @@ OVERVIEW_SEEN = OverviewSeen()
 OWNER_VIEWER = "owner"
 _AUTO = object()
 SURFACE_LABELS = {"cli": "终端", "app": "App", "bridge": "飞书"}
+_HOST_APP_LABELS = {"cursor": "Cursor", "vscode": "VS Code"}
+
+
+def surface_label(sess) -> str:
+    """开在哪儿：「终端」/「App」/「飞书」；第 36 轮细分编辑器里的：「编辑器面板（Cursor）」/「终端（Cursor）」。
+
+    `opened_in` / `host_app` 由 `fleet/claude.py` 写进 extra（只用于显示，判占用/发送不看它）。
+    """
+    extra = getattr(sess, "extra", None) or {}
+    base = "编辑器面板" if extra.get("opened_in") == "ide_panel" else SURFACE_LABELS.get(sess.surface, sess.surface)
+    host = _HOST_APP_LABELS.get(extra.get("host_app", ""))
+    return f"{base}（{host}）" if host else base
 ROLE_LABELS = {"user": "🙋 你", "assistant": "🤖 它"}
 
 
@@ -287,6 +299,31 @@ def _button(label: str, value: dict, primary: bool = False) -> dict:
         "size": "medium",
         "behaviors": [{"type": "callback", "value": value}],
     }
+
+
+def _tap_row(text_md: str, value: dict, urgent: bool = False) -> dict:
+    """总览里左对齐的一行（第 36 轮 11-16 主人「列表都向左靠起」）：交互容器 + 一段 markdown。
+
+    按钮上的字飞书固定居中 ⇒ 换成 `interactive_container`（字段照官方文档
+    https://open.feishu.cn/document/feishu-cards/card-json-v2-components/containers/interactive-container ）。
+    点它回调的 `action.value` 就是这里的 `value`（同按钮，见卡片回传交互文档），`resolve_fleet_click` 不用改。
+    `text_md` 必须已经转义过（`escape_card`）—— 它是 markdown，不是按钮那种纯文字。
+    `urgent`（等你批准 / 等你回答）⇒ 蓝边 + 浅蓝底，顶替原来的主按钮。
+    """
+    node = {
+        "tag": "interactive_container",
+        "width": "fill",
+        "horizontal_align": "left",
+        "has_border": True,
+        "border_color": "blue" if urgent else "grey",
+        "corner_radius": "8px",
+        "padding": "6px 12px 6px 12px",
+        "behaviors": [{"type": "callback", "value": value}],
+        "elements": [_md(text_md)],
+    }
+    if urgent:
+        node["background_style"] = "blue-50"
+    return node
 
 
 def _row(buttons: list) -> dict:
@@ -564,7 +601,7 @@ def main_project(sessions: list) -> str:
     return max(sorted(set(projects), key=projects.index), key=projects.count)
 
 
-def group_heading(tool: str, items: list, shown: list, clean=None) -> str:
+def group_heading(tool: str, items: list, shown: list, clean=None, brand: str = "") -> str:
     """分组标题：把一组里**一样的那几样**（工具名、项目）提到这里来。
 
     例 `🤖 **Claude** · carher-admin（6 个）`。一个工具跨几个项目时写成
@@ -580,7 +617,8 @@ def group_heading(tool: str, items: list, shown: list, clean=None) -> str:
     label = TOOL_LABELS.get(tool, tool)
     rows = shown or items
     main = main_project(rows)
-    bits = [f"🤖 **{escape_card(label)}**"]
+    # 第 36 轮：有这一家的品牌图标（`brand` = img_key，画在面板标题的 icon 上，见 `_panel`）⇒ 不再写 🤖
+    bits = [f"**{escape_card(label)}**" if brand else f"🤖 **{escape_card(label)}**"]
     text = clip_cells(_safe_clean(clean, main), HEADING_PROJECT_CELLS) if main else ""
     if text:  # 脱敏失败 ⇒ 空串 ⇒ 不写项目，别留一个「 · （1 个）」
         kinds = len({project_of(s.cwd) for s in rows})
@@ -808,9 +846,10 @@ def group_summary(items: list, seen_at: Optional[float] = None) -> str:
     return "没有在跑的"
 
 
-def panel_title(tool: str, items: list, shown: list, clean=None, seen_at: Optional[float] = None) -> str:
+def panel_title(tool: str, items: list, shown: list, clean=None, seen_at: Optional[float] = None,
+                brand: str = "") -> str:
     """例「🤖 **Claude** · carher-admin（6 个）· 🟢 1 个在跑」。前半截就是原来的 `group_heading`。"""
-    return f"{group_heading(tool, items, shown, clean)}· {group_summary(items, seen_at)}"
+    return f"{group_heading(tool, items, shown, clean, brand)}· {group_summary(items, seen_at)}"
 
 
 def more_button_label(hidden: list, seen_at: Optional[float] = None) -> str:
@@ -835,13 +874,21 @@ def overflow_note(hidden: list, seen_at: Optional[float] = None) -> str:
     return f"{'⚠️ ' if extra else ''}还有 {len(hidden)} 个这张卡放不下{what}，在电脑上看"
 
 
-def _panel(title: str, expanded: bool, elements: list) -> dict:
-    """折叠面板：客户端本地展开 / 收起，不走回调（字段照主会话 2026-11-08 真发通过的那张）。"""
+def _panel(title: str, expanded: bool, elements: list, brand: str = "") -> dict:
+    """折叠面板：客户端本地展开 / 收起，不走回调（字段照主会话 2026-11-08 真发通过的那张）。
+
+    `brand`（第 36 轮）= 这一家品牌图标的 img_key ⇒ 放在**标题 markdown 自己的 `icon`**（前缀图标，
+    `custom_icon`）。header 的 `icon` 已经是右边的展开箭头，一个 header 只有一个 icon 位。
+    2026-11-16 真发：这种写法飞书接受（code=0）；未知字段会被 200621 拒，所以它是认识的字段。
+    """
+    head = {"tag": "markdown", "content": title}
+    if brand:
+        head["icon"] = {"tag": "custom_icon", "img_key": brand}
     return {
         "tag": "collapsible_panel",
         "expanded": bool(expanded),
         "header": {
-            "title": {"tag": "markdown", "content": title},
+            "title": head,
             "width": "fill",
             "vertical_align": "center",
             "icon": dict(PANEL_ICON),
@@ -851,6 +898,35 @@ def _panel(title: str, expanded: bool, elements: list) -> dict:
         "vertical_spacing": "8px",
         "elements": elements,
     }
+
+
+def _brand_key(tool: str) -> str:
+    """这一家的品牌图标 img_key（`fleet/brand_icons.py`）；没有 / 出任何错 ⇒ ""，标题照旧写 🤖。"""
+    try:
+        from .brand_icons import key_for
+
+        return key_for(tool)
+    except Exception:  # noqa: BLE001 —— 图标是锦上添花，总览绝不能因为它画不出来
+        return ""
+
+
+def _startable_tools() -> list:
+    """本机装了的那几家（`newsession.available_tools`）。出任何错 ⇒ []：总览不能因为它出不来。"""
+    try:
+        from .newsession import available_tools
+
+        return list(available_tools())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def newsession_row_label(tool: str) -> str:
+    return f"➕ 新开一个 {NEWSESSION_TOOL_NAMES.get(tool, tool)}"
+
+
+def _newsession_row(tool: str) -> dict:
+    """面板第一行「➕ 新开一个 Claude Code」：点了发一张**工具已定**的新会话卡（`begin` 带 `t`）。"""
+    return _tap_row(escape_card(newsession_row_label(tool)), newsession_value("begin", tool=tool))
 
 
 def build_overview_card(view: Overview, redact=None, expand: str = "",
@@ -917,6 +993,10 @@ def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[
     clean = redact or (lambda s: s)
     groups = {tool: sort_for_overview(items, seen_at) for tool, items in view.by_tool().items()}
     expand = expand if expand in TOOLS and groups.get(expand) else ""
+    # 第 36 轮 11-16 主人「新会话放在每个分类会话的上方，用户就不用去选择了」⇒ 顶上那个通用「➕ 新会话」拿掉，
+    # 每个面板第一行是「➕ 新开一个 <这家>」（工具已定）。装了但一个会话都没有的那家也画一个面板，只放这一行。
+    # `available_tools` 只是 which + 几个 isfile（本机实测 0.9ms）⇒ 每张卡现查一次，不缓存。
+    can_start = _startable_tools()
 
     def build(rows: int, wide: int) -> str:
         """`rows`：普通组列几行；`wide`：被展开的那一组列几行。"""
@@ -926,20 +1006,29 @@ def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[
             elements.append(_md("一个会话都没读到。", small=True))
         for tool in TOOLS:
             items = groups.get(tool) or []
+            start_row = [_newsession_row(tool)] if tool in can_start else []
             if not items:
+                if start_row:
+                    brand = _brand_key(tool)
+                    name = NEWSESSION_TOOL_NAMES.get(tool, tool)
+                    head = f"**{escape_card(name)}** · 还没有会话" if brand else f"🤖 **{escape_card(name)}** · 还没有会话"
+                    elements.append(_panel(head, False, start_row, brand))
                 continue
             opened = tool == expand
             cap = wide if opened else rows
             shown = [_cleaned(s, clean) for s in items[:cap]]
             main = main_project(shown)
             tags = dup_tags(shown, row_names(shown, main, seen_at))
-            inner: list = []
+            inner: list = list(start_row)
             for sess, tag in zip(shown, tags):
                 label = row_label(sess, shared_project=main, with_tool=False, dup_tag=tag, seen_at=seen_at)
-                # 🔴 只有「等你」的那几行用醒目的主按钮。原来是「有进程或在跑」就主按钮
+                if from_phone(sess):
+                    label = f"{PHONE_MARK} {label}"
+                # 🔴 只有「等你」的那几行醒目（蓝边浅蓝底）。原来是「有进程或在跑」就主按钮
                 # ⇒ 终端里闲着的会话也是蓝的，一屏全蓝，等于没有重点（2026-11-06 UX 侦察）。
-                inner.append(_button(label, fleet_value("open", tool, sess.id),
-                                     primary=display_status(sess, seen_at) in _URGENT))
+                # 11-16「列表都向左靠起」⇒ 一行是左对齐的交互容器，不再是按钮（按钮字固定居中）
+                inner.append(_tap_row(escape_card(label), fleet_value("open", tool, sess.id),
+                                      urgent=display_status(sess, seen_at) in _URGENT))
                 # 「等你」⇒ 紧跟一句它在问什么，省掉「点进详情才看得见」那一下（第 17 轮）。
                 # 🔴 必须紧跟在**它自己**那个按钮后面：上下两行都在等你时才分得清谁问的。
                 asked = overview_pending_line(sess, clean)
@@ -953,8 +1042,11 @@ def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[
                 inner.append(_button(more_button_label(hidden, seen_at), fleet_value("more", tool)))
             # 🔴 展开与否看**整组**（不只是列出来的那几行）：藏着的那几个要他管，也得展开让他看见那个按钮
             expanded = opened or any(_busy(s, seen_at) for s in items)
-            elements.append(_panel(panel_title(tool, items, shown, clean, seen_at), expanded, inner))
+            brand = _brand_key(tool)
+            elements.append(_panel(panel_title(tool, items, shown, clean, seen_at, brand), expanded, inner, brand))
         legend = status_legend(view.sessions, seen_at)
+        if any(from_phone(s) for s in view.sessions):
+            legend = (legend + "　" if legend else "") + PHONE_LEGEND
         if legend:
             elements.append(_md(legend, small=True))
         if gone:
@@ -1123,7 +1215,7 @@ def build_detail_card(sess: Session, messages: list, redact=None, note: str = ""
     pending = pending_elements(sess, clean)
 
     def build(chars: int) -> str:
-        where = f"{TOOL_LABELS.get(sess.tool, sess.tool)} · {SURFACE_LABELS.get(sess.surface, sess.surface)}"
+        where = f"{TOOL_LABELS.get(sess.tool, sess.tool)} · {surface_label(sess)}"
         # 第 32 轮：详情卡也用细分后的说法（等你批准 / 等你回答 / 出错了）；不判「跑完没看」——点进来就是在看了
         where += f" · {inline_code(project_of(sess.cwd))} · {display_label(sess)}"
         if sess.age_text:
@@ -1259,3 +1351,221 @@ def build_unsettled_card(sess_or_target: Any, redact=None) -> dict:
         ]),
     ]
     return json.loads(_card("↩︎ 已撤销", "indigo", elements))
+
+
+# ---------- 第 36 轮「➕ 新会话」：工具 → 项目 → 第一句话（回车就开） ----------
+#
+# 11-16 主人「交互太复杂了」⇒ 简化成：**一行两个下拉（工具 | 项目）+ 一个输入框**，最快 = 点「➕ 新会话」→ 打一句回车。
+# 换工具 / 换项目都**原地换卡**（fleet-ops-release.md 第六节第一条）。规矩照「↑ 最近问过」那张（`bridge/history.py`）：
+# - 第一句话 = **单行**输入框、**不在 form 里**、带 `behaviors` 回调 ⇒ 回车就发；
+# - 两个下拉都设 `initial_option`（= 当前默认那个选项的 **value**）：不设的话手机上只显示 placeholder，看不出默认选的是谁。
+#   字段名见飞书文档 https://open.feishu.cn/document/feishu-cards/card-json-v2-components/interactive-components/single-select-dropdown-menu
+#   （「initial_option：下拉选择组件的初始选项的内容，覆盖 placeholder」）；本机 Lark messenger.asar 里 select 组件按
+#   `option.value === initialOption` 找初始项 ⇒ 填 value 不填显示名；
+# - 「同时在电脑上打开窗口」开关拿掉：Claude / Codex 一律开，Cursor 一律不开（11-16 主人拍板），卡上只留一行小字说明；
+# - 下拉的值里**没有路径、没有原话**：工具是枚举、项目是下标 `p<i>`（`actions.resolve_newsession_click` + app 再核一次）。
+NEWSESSION_INPUT = "ns_text"
+NEWSESSION_MAX_CHARS = 1000        # 飞书卡片输入框上限（同 history.MAX_CHARS）；服务端再判一次
+NEWSESSION_MAX_PROJECTS = 20       # 下拉里最多几个项目（最近用过的在前）
+NEWSESSION_TOOL_NAMES = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor"}
+# 卡上那一行小字（只一行）。Cursor 不开窗口、Codex / Cursor 从手机只读 —— 群里第一句还会再发完整权限行（`app._rights_line`）
+NEWSESSION_HINTS = {
+    "claude": "回车后电脑上会打开一个窗口接着这个会话，回复发到群里",
+    "codex": "回车后电脑上会打开一个窗口接着这个会话（手机发的话只读）",
+    "cursor": "Cursor 在后台跑（只读），回复发到群里",
+}
+NEWSESSION_PROJECT_CELLS = 28      # 半屏宽的下拉，项目名截短一点
+PHONE_MARK = "📱"
+PHONE_LEGEND = "📱 从手机开的"
+
+
+def from_phone(sess: Session) -> bool:
+    """这个会话是不是从手机「➕ 新会话」开的（判断在 B 的 `newsession.started_from_phone`）。读不出 ⇒ 不标。"""
+    try:
+        from .newsession import started_from_phone
+
+        return bool(started_from_phone(sess.tool, sess.id, sess.title or ""))
+    except Exception:  # noqa: BLE001 —— 标记是锦上添花，总览不能因为它出不来
+        return False
+
+
+def newsession_open_window(tool: str) -> bool:
+    """开不开电脑上的窗口：Claude / Codex 一律开，Cursor 一律不开（11-16 主人拍板，卡上不再有开关）。"""
+    return tool in ("claude", "codex")
+
+
+def _ns_select(placeholder: str, options: list, initial: str, op: str, nonce: str) -> dict:
+    """form 外的单选下拉。`options`：[(显示名, value)]；`initial` = 当前默认那个的 value。"""
+    node = {
+        "tag": "select_static", "width": "fill",
+        "placeholder": {"tag": "plain_text", "content": placeholder},
+        "options": [{"text": {"tag": "plain_text", "content": text}, "value": value} for text, value in options],
+        "behaviors": [{"type": "callback", "value": {"act": "nsess", "op": op, "n": nonce}}],
+    }
+    if initial and any(value == initial for _, value in options):
+        node["initial_option"] = initial
+    return node
+
+
+def build_newsession_card(nonce: str, tools: list, tool: str, projects: list, proj: Optional[int],
+                          warn: str = "", fixed: bool = False) -> dict:
+    """新会话卡（dict，回调里原地换卡直接用）：一行【工具 ▾】【项目 ▾】+ 一个「第一句话，回车就开」。
+
+    `projects`：[(显示名, 最近用过)]，**只有显示名**，路径在服务端；`proj`：选中的下标（None = 还没选）。
+    `tools`：本机装了的那几家（`newsession.available_tools()`），没装的不显示。
+    `fixed`（11-16）：从总览面板里「➕ 新开一个 X」进来的 ⇒ 工具已定，**不画工具下拉**，
+    标题写「➕ 新开一个 Claude Code」，只剩项目下拉 + 输入框。
+    """
+    if fixed and tools and tool in tools:
+        return _newsession_fixed_card(nonce, tool, projects, proj, warn)
+    elements: list = []
+    if not tools:
+        elements.append(_md("这台电脑上没找到 Claude Code、Codex 或 Cursor，装好之后再来。"))
+        elements.extend(button_rows([do_button("sessions", "🖥 回到总览")]))
+        return json.loads(_card("➕ 新会话", "grey", elements))
+    tool_sel = _ns_select("工具", [(NEWSESSION_TOOL_NAMES.get(t, t), t) for t in tools], tool, "tsel", nonce)
+    columns = [{"tag": "column", "width": "weighted", "weight": 2, "elements": [tool_sel]}]
+    if projects:
+        opts = [(clip_cells(name, NEWSESSION_PROJECT_CELLS), f"p{i}")
+                for i, (name, _recent) in enumerate(projects[:NEWSESSION_MAX_PROJECTS])]
+        initial = f"p{proj}" if proj is not None and 0 <= proj < len(opts) else ""
+        columns.append({"tag": "column", "width": "weighted", "weight": 3,
+                        "elements": [_ns_select("项目", opts, initial, "proj", nonce)]})
+    elements.append({"tag": "column_set", "horizontal_spacing": "8px", "columns": columns})
+    if not projects:
+        elements.append(_md("手机能用的目录里一个项目都没扫到，先点「📂 换项目」看看。", small=True))
+    if warn:
+        elements.append(_md(f"⚠️ {escape_card(warn)}"))
+    # 第一句话：单行、不在 form 里、带回调 ⇒ 回车就开
+    elements.append({
+        "tag": "input", "name": NEWSESSION_INPUT, "width": "fill", "max_length": NEWSESSION_MAX_CHARS,
+        "placeholder": {"tag": "plain_text", "content": "第一句话，回车就开"},
+        "behaviors": [{"type": "callback", "value": {"act": "nsess", "op": "send", "n": nonce}}],
+    })
+    hint = NEWSESSION_HINTS.get(tool)
+    if hint:
+        elements.append(_md(hint, small=True))
+    return json.loads(_card("➕ 新会话", "blue", elements))
+
+
+def _newsession_fixed_card(nonce: str, tool: str, projects: list, proj: Optional[int], warn: str) -> dict:
+    """工具已定的新会话卡：【项目 ▾】（默认最近用过）+ 输入框。字段规矩同 `build_newsession_card`。"""
+    elements: list = []
+    if projects:
+        opts = [(clip_cells(name, NEWSESSION_PROJECT_CELLS * 2), f"p{i}")
+                for i, (name, _recent) in enumerate(projects[:NEWSESSION_MAX_PROJECTS])]
+        initial = f"p{proj}" if proj is not None and 0 <= proj < len(opts) else ""
+        elements.append(_ns_select("项目", opts, initial, "proj", nonce))
+    else:
+        elements.append(_md("手机能用的目录里一个项目都没扫到，先点「📂 换项目」看看。", small=True))
+    if warn:
+        elements.append(_md(f"⚠️ {escape_card(warn)}"))
+    elements.append({
+        "tag": "input", "name": NEWSESSION_INPUT, "width": "fill", "max_length": NEWSESSION_MAX_CHARS,
+        "placeholder": {"tag": "plain_text", "content": "第一句话，回车就开"},
+        "behaviors": [{"type": "callback", "value": {"act": "nsess", "op": "send", "n": nonce}}],
+    })
+    hint = NEWSESSION_HINTS.get(tool)
+    if hint:
+        elements.append(_md(hint, small=True))
+    return json.loads(_card(newsession_row_label(tool), "blue", elements))
+
+
+def build_newsession_started_card(tool: str, project: str, prompt_preview: str) -> dict:
+    """回车之后原地换成这张：**没有输入框**（再回车就是又开一个）。`prompt_preview` 调用方先脱敏。"""
+    name = NEWSESSION_TOOL_NAMES.get(tool, tool)
+    lines = [f"正在电脑上新开 **{escape_card(name)}** 会话（{escape_card(project)}）……"]
+    if prompt_preview:
+        lines.append("第一句：" + escape_card(short_title(prompt_preview, 60)))
+    elements = [_md("\n".join(lines)),
+                _md("开好了会在这里说一声，并给它建一个群。", small=True)]
+    elements.extend(button_rows([do_button("sessions", "🖥 回到总览")]))
+    return json.loads(_card("⏳ 正在开新会话", "wathet", elements))
+
+
+def build_newsession_cancelled_card() -> dict:
+    elements = [_md("好，不开了。")]
+    elements.extend(button_rows([do_button("sessions", "🖥 回到总览")]))
+    return json.loads(_card("➕ 新会话", "grey", elements))
+
+
+# ---------- 第 37 轮：Claude 会话群工具栏的回卡（🧠 模型 / 📜 进度） ----------
+#
+# 工具栏点击不带参数，要选项的一律回一张卡（`docs/r37/contract-toolkit.md`）。
+TOOLBAR_RELAY_MODEL_NOTE = "终端开着的会话换不了模型和思考强度，在电脑上敲 /model。"
+TOOLBAR_PROGRESS_MESSAGES = 4
+TOOLBAR_DEFAULT_LABEL = "跟电脑上一样（不指定）"
+
+
+def _tkm_select(placeholder: str, options: list, initial: str, op: str, nonce: str) -> dict:
+    from .actions import toolbar_model_value
+
+    node = {
+        "tag": "select_static", "width": "fill",
+        "placeholder": {"tag": "plain_text", "content": placeholder},
+        "options": [{"text": {"tag": "plain_text", "content": text}, "value": value} for text, value in options],
+        "behaviors": [{"type": "callback", "value": toolbar_model_value(op, nonce)}],
+    }
+    if initial and any(value == initial for _, value in options):
+        node["initial_option"] = initial
+    return node
+
+
+def build_toolbar_model_card(label: str, nonce: str, model: str = "", effort: str = "",
+                             relay: bool = False, note: str = "") -> dict:
+    """「🧠 模型」卡：模型下拉 + 思考强度下拉，选了按群记住，下一轮起生效。
+
+    `relay=True`：这个会话正开在电脑终端里 ⇒ **不画下拉**，只说换不了（relay 只能往它输入队列里放话，
+    `/model` 送进去也不会被当命令执行，见 `docs/r37/claude-group-shortcuts-design.md` 1.1）。
+    下拉的值只有下标（`m<i>` / `e<i>` / `d`），模型名不进卡片值。
+    """
+    from ..policy import MODEL_CHOICES
+    from .chatbind import EFFORT_CHOICES
+
+    head = f"🧠 {escape_card(label)}" if label else "🧠 模型"
+    if relay:
+        elements = [_md(TOOLBAR_RELAY_MODEL_NOTE)]
+        if note:
+            elements.append(_md(escape_card(note), small=True))
+        return json.loads(_card(head, "grey", elements))
+    model_opts = [(TOOLBAR_DEFAULT_LABEL, "d")] + [
+        (f"{lab} · {name}", f"m{i}") for i, (name, lab, _why) in enumerate(MODEL_CHOICES)]
+    effort_opts = [(TOOLBAR_DEFAULT_LABEL, "d")] + [
+        (f"{lab}（{name}）· {why}", f"e{i}") for i, (name, lab, why) in enumerate(EFFORT_CHOICES)]
+    m_init = next((f"m{i}" for i, (n, _l, _w) in enumerate(MODEL_CHOICES) if n == model), "d")
+    e_init = next((f"e{i}" for i, (n, _l, _w) in enumerate(EFFORT_CHOICES) if n == effort), "d")
+    now = f"现在：模型 **{escape_card(model or '不指定')}** · 思考强度 **{escape_card(effort or '不指定')}**"
+    elements = [
+        _md(now),
+        {"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1,
+             "elements": [_tkm_select("模型", model_opts, m_init, "model", nonce)]},
+            {"tag": "column", "width": "weighted", "weight": 1,
+             "elements": [_tkm_select("思考强度", effort_opts, e_init, "effort", nonce)]},
+        ]},
+        _md("选了只记在这个群上，下一句起生效。电脑上终端开着它时不生效（那时用电脑上的设置）。", small=True),
+    ]
+    if note:
+        elements.append(_md(escape_card(note), small=True))
+    return json.loads(_card(head, "blue", elements))
+
+
+def build_toolbar_progress_card(sess: Session, messages: list, redact=None, note: str = "") -> str:
+    """「📜 进度」：最近几条 + 它在等你什么。只读 jsonl 尾巴，不往会话里送任何话。
+
+    先脱敏整段再截断（同 `build_detail_card`）。
+    """
+    clean = redact or (lambda s: s)
+    elements: list = []
+    shown = list(messages or [])[-TOOLBAR_PROGRESS_MESSAGES:]
+    if not shown:
+        elements.append(_md("最近没读到它说过的话。"))
+    for msg in shown:
+        who = "你" if getattr(msg, "role", "") == "user" else "它"
+        text = short_title(clean(str(getattr(msg, "text", "") or "")), 300)
+        elements.append(_md(f"**{who}**：{escape_card(text)}"))
+    elements.extend(pending_elements(sess, clean))
+    if note:
+        elements.append(_md(escape_card(note), small=True))
+    elements.append(_md("只是看一眼，没打扰它、没花一轮。", small=True))
+    return _card(f"📜 {session_label(sess, clean)}", "wathet", elements)

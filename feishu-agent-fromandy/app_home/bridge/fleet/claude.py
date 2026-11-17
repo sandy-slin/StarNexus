@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import dataclasses as _dc
 import datetime as _dt
 import json
 import logging
@@ -141,6 +142,65 @@ WHY_STOP_TERMINAL = "终端里的会话只能在终端里停，从外面停会�
 WHY_STOP_APP = "要停它，也只能在 App 里点停止。"
 WHY_STOP_BRIDGE_CHAT = "这是飞书对话里正在跑的那一轮，回到那个对话点「⏹ 停下」。"
 WHY_STOP_IDLE = "它现在没在跑，不用停。"
+
+# 第 36 轮：Cursor / VS Code 里 Anthropic 官方 Claude Code 扩展的面板（entrypoint=claude-vscode）。
+# 原来落进「来路不明」⇒ 详情卡说「脚本或别的程序」。它和终端一样是**有人占着**：从手机 --resume 会分叉。
+WHY_SEND_IDE = "它开在编辑器（Cursor / VS Code）的 Claude 面板里，从手机发进去会分叉成两段对话。到编辑器里接着说；关掉那个对话后点 🔄 刷新，就能从手机接着聊。"
+WHY_STOP_IDE = "编辑器面板里的会话只能在面板里停。"
+WHY_RELAY_IDE = "编辑器（Cursor / VS Code）面板里的会话送不进去，到编辑器里和它说吧。"
+# 有 claude 在跑、却没在 ~/.claude 留注册表 ⇒ 手机这边列不出来。实测（第 36 轮）：继承了
+# CLAUDE_CODE_CHILD_SESSION=1 的交互 claude 不写注册表也不写 jsonl（官方 env-vars 文档同说）。
+# 从 Claude 的 Bash 工具里 `cursor .` 打开的 Cursor 窗口，终端会继承这个变量。
+NOTE_UNREGISTERED = ("有 {n} 个 Claude 在跑但没留会话记录，手机看不到。多半是那个终端（比如 Cursor 的）"
+                     "是从 Claude 里打开的；在那个终端里运行 unset CLAUDE_CODE_CHILD_SESSION 后重开 claude。")
+
+# entrypoint 取值（2.1.325 二进制 `function N(e)` / `Gh()`）：cli、sdk-cli、sdk-ts、sdk-py、mcp、
+# claude-vscode、claude-desktop、claude-desktop-3p、local-agent、remote*…… 它原样来自环境变量
+# CLAUDE_CODE_ENTRYPOINT，不校验 ⇒ 实测 `CLAUDE_CODE_ENTRYPOINT="cli FOO=1"` 就原样写进注册表和 jsonl。
+ENTRY_IDE = ("claude-vscode",)
+# 不是会话的子命令：`claude mcp serve` 之类常驻，不该算「没留记录的会话」
+_NON_SESSION_SUBCOMMANDS = frozenset((
+    "mcp", "update", "upgrade", "doctor", "config", "install", "setup-token", "plugin", "plugins",
+    "migrate-installer", "auth", "login", "logout", "agents", "daemon", "rc", "remote-control",
+))
+# 起来多久还没注册表才算（注册表实测 0.2~1.7 秒内写；留足余量，也躲开 `claude --version` 这类一闪而过的）
+_UNREGISTERED_MIN_SEC = 60
+# 往上找几层父进程认宿主编辑器（claude ← zsh ← 编辑器的 pty host）
+_HOST_HOPS = 12
+_HOST_MARKS = (
+    ("cursor", ("/Cursor.app/", "Cursor Helper", "\\Cursor.exe")),
+    ("vscode", ("/Visual Studio Code.app/", "Code Helper", "\\Code.exe")),
+)
+
+
+def norm_entrypoint(value: Any) -> str:
+    """注册表 / jsonl 里的 entrypoint → 第一个词。脏值（`claude-desktop-3p CLAUDE_CODE_...=1 ...`、
+    `cli FOO=1`）原来精确匹配失败，被归成「来路不明」。不是字符串 ⇒ 空串。"""
+    if not isinstance(value, str):
+        return ""
+    parts = value.split()
+    return parts[0] if parts else ""
+
+
+def _is_claude_argv0(args: str) -> bool:
+    head = (args or "").split(" ", 1)[0]
+    return head in ("claude", "claude.exe") or head.endswith(("/claude", "/claude.exe"))
+
+
+def _host_app(table: ProcTable, pid: int) -> str:
+    """沿父进程往上找宿主编辑器：'cursor' / 'vscode' / ''。只给卡片显示「在 Cursor 里」用，不参与任何闸门。"""
+    seen = set()
+    proc = table.get(pid)
+    for _ in range(_HOST_HOPS):
+        if proc is None or proc.ppid in seen or proc.ppid <= 1:
+            return ""
+        seen.add(proc.ppid)
+        proc = table.get(proc.ppid)
+        args = (proc.args if proc is not None else "") or ""
+        for name, marks in _HOST_MARKS:
+            if any(m in args for m in marks):
+                return name
+    return ""
 
 
 # ---------- 小工具 ----------
@@ -457,6 +517,8 @@ class ClaudeAdapter(Adapter):
         self._send_locks: dict = {}
         self._send_locks_guard = threading.Lock()
         self._last_own_write: dict = {}  # sessionId → 我们最后一次发完的时间（别把自己的写入当成「有人在用」）
+        self._last_table: Optional[ProcTable] = None
+        self.last_note = ""  # 第 36 轮：「有 N 个 Claude 在跑但没留会话记录」，list() 填；也并进 last_error 让总览显示
 
     # ---------- 进程 / 注册表 ----------
 
@@ -518,6 +580,37 @@ class ClaudeAdapter(Adapter):
                 return True
         return False
 
+    def _unregistered_live(self, table: ProcTable) -> list:
+        """在跑的**交互** claude 里，哪些在两个注册表目录里都没有 `<pid>.json` ⇒ [Proc]。
+
+        只用来在总览底下提一句（手机看不到它们），不进列表、不参与任何发送 / 停的闸门。
+        不算：`-p` / `--print`（非交互的照样写注册表；没写的多半是别的 agent 用自己的 CLAUDE_CONFIG_DIR 在跑，
+        不是主人开的窗口）、`claude mcp serve` 这类子命令、起来不到 `_UNREGISTERED_MIN_SEC` 的、桥自己起的。
+        """
+        if table is None or table.error or not getattr(table, "has_args", True):
+            return []   # 第 38 轮：Windows 快照没有命令行，分不出 -p / 子命令 ⇒ 不提这句，免得误报
+        registered = set()
+        for _source, rec in self._registry():
+            try:
+                registered.add(int(rec["pid"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        out = []
+        for proc in table:
+            if not _is_claude_argv0(proc.args):
+                continue
+            if proc.pid in registered or proc.etime_sec < _UNREGISTERED_MIN_SEC:
+                continue
+            tokens = (proc.args or "").split()[1:]
+            if any(t in ("-p", "--print") or t.startswith("--print=") for t in tokens):
+                continue
+            if tokens and tokens[0] in _NON_SESSION_SUBCOMMANDS:
+                continue
+            if self.jobs.owns(proc.pid, table):
+                continue
+            out.append(proc)
+        return out
+
     def _is_courier_cwd(self, cwd: str) -> bool:
         """桥的信使（relay）在 `<bridge_home>/relay` 里跑。它的注册表行和 jsonl 都落在用户的 ~/.claude 里，
         🔴 第 14 轮复审：不滤掉就会以「carher-relay」排进主人的总览，点进去「接着聊」是在跟我们自己的信使说话。"""
@@ -537,17 +630,23 @@ class ClaudeAdapter(Adapter):
             if self._is_courier_cwd(str(rec.get("cwd") or "")):
                 continue
             pid = int(rec["pid"])
-            start = rec.get("procStart") or rec.get("startedAt")
+            # Windows 版写的是 procStartFt（第 38 轮）；三种任一对得上就算
+            start = (rec.get("procStart"), rec.get("procStartFt"), rec.get("startedAt"))
             if not table.same_process(pid, start):
                 continue  # 进程没了，或者 pid 被别人复用了
             proc = table.get(pid)
-            entry = str(rec.get("entrypoint") or "")
+            # 第 36 轮：先取第一个词。entrypoint 原样来自环境变量，实测会带上空格和别的变量
+            entry = norm_entrypoint(rec.get("entrypoint"))
             if self.jobs.owns(pid, table):
                 owner = "bridge"
             elif source == "bridge":
                 owner = "bridge"
             elif entry == "cli":
                 owner = "terminal"
+            elif entry in ENTRY_IDE:
+                # 编辑器里的官方扩展面板：有人占着（--resume 一样会分叉）。Session.owner 只有五种取值，
+                # 到 _running_session 里对外报成 terminal（最不能碰的那档），extra 里标出来
+                owner = "ide"
             elif entry == "claude-desktop-3p":
                 owner = "app"
             else:
@@ -666,6 +765,8 @@ class ClaudeAdapter(Adapter):
         owners = {h["owner"] for h in items}
         if "terminal" in owners:
             return WHY_SEND_TERMINAL
+        if "ide" in owners:
+            return WHY_SEND_IDE
         if "app" in owners:
             return WHY_SEND_APP
         if "unknown" in owners:
@@ -678,6 +779,8 @@ class ClaudeAdapter(Adapter):
         if any(self.jobs.owns(h["pid"], table) for h in items):
             return ""
         owners = {h["owner"] for h in items}
+        if "ide" in owners and "terminal" not in owners:
+            return WHY_STOP_IDE
         if "app" in owners and "terminal" not in owners:
             return WHY_STOP_APP
         if owners == {"bridge"}:
@@ -689,6 +792,7 @@ class ClaudeAdapter(Adapter):
     def running(self) -> list:
         self.last_error = ""
         table = self._table()
+        self._last_table = table  # list() 拿它数「在跑但没留记录」的，省一次 ps
         if table.error:
             # 没有 ps 就分不清死活（注册表里常有死进程留下的文件），宁可一个都不列
             self.last_error = "看不出 Claude 哪些在跑：" + table.error
@@ -712,7 +816,12 @@ class ClaudeAdapter(Adapter):
         status = items[0]["status"]
         # 归属按「谁最不能碰」排：终端 > App > 来路不明 > 桥
         present = {h["owner"] for h in items}
-        owner = next((o for o in ("terminal", "app", "unknown", "bridge") if o in present), "unknown")
+        owner = next((o for o in ("terminal", "ide", "app", "unknown", "bridge") if o in present), "unknown")
+        # 第 36 轮：「ide」不是 Session.owner 的合法值（model.OWNERS）。对外报 terminal ——
+        # 发送 / 停 / 通知全按「有人在电脑上占着」处理；是不是编辑器面板看 extra["opened_in"]
+        in_ide = owner == "ide"
+        if in_ide:
+            owner = "terminal"
         recs = [h["rec"] for h in items if h["rec"]]
         cwd = next((r.get("cwd") for r in recs if isinstance(r.get("cwd"), str) and r.get("cwd")), "")
         updated = 0.0
@@ -731,6 +840,14 @@ class ClaudeAdapter(Adapter):
             "pids_status": {str(h["pid"]): h["raw"] or h["status"] for h in items},
             "entrypoint": items[0]["entrypoint"],
         }
+        # 第 36 轮：开在哪儿（给卡片显示「在 Cursor 里」）。ide_panel = 编辑器里的 Claude 扩展面板；
+        # cursor / vscode = 那个编辑器的集成终端（沿父进程认出来的，认不出就不写）
+        if in_ide:
+            extra["opened_in"] = "ide_panel"
+        if owner == "terminal":
+            host = next((_host_app(table, h["pid"]) for h in items if h["owner"] in ("terminal", "ide")), "")
+            if host:
+                extra["host_app"] = host
         if any(h["raw"] == "shell" for h in items):
             extra["shell"] = True
         if len(items) > 1:
@@ -797,6 +914,9 @@ class ClaudeAdapter(Adapter):
         # （prompting 类）⇒ 被扣住」—— 现在 relay 按目标权限档挑同类的信使（`Relay.courier_for`），这一条解开了。
         # App 会话的其余条件和终端一样：有 socket、有名字（下面那几行照查）。
         # 同事 11-06 原话：「悬浮按钮有了，点了某个session 会话之后 为啥不能像我一样 有接着聊的按钮呢」。
+        if any(h["owner"] == "ide" for h in items) and not any(h["owner"] in ("terminal", "app") for h in items):
+            # 第 36 轮：编辑器面板会话没实测过会话间消息（本机没装扩展），relay.check 也不放行 ⇒ 不画按钮
+            return False, WHY_RELAY_IDE
         if owner not in ("terminal", "app"):
             # 别的脚本 / 桥自己的会话都不走这条路：会话间消息只在终端 TUI 上实测过
             return False, WHY_RELAY_NOT_TERMINAL
@@ -871,15 +991,37 @@ class ClaudeAdapter(Adapter):
                     seen.add(sid)
                     continue
                 if ps_failed and sess.can_send:
-                    sess.can_send = False
-                    sess.why_not_send = WHY_SEND_UNKNOWN
+                    # 🔴 Session 是 frozen ⇒ 不能直接赋值（11-17 Windows 实机 FrozenInstanceError 指纹 7d634b74cd7d：
+                    # 抛出来被下面的 except 吞掉 ⇒ ps 一失败这条历史会话就从列表里消失了）
+                    sess = _dc.replace(sess, can_send=False, why_not_send=WHY_SEND_UNKNOWN)
                 out.append(sess)
                 added += 1
             except Exception as exc:
                 errors.append(friendly_error(exc, "有个 Claude 历史会话读不出来"))
             seen.add(sid)
+        # 第 36 轮：在跑却没留注册表的交互 claude（多半继承了 CLAUDE_CODE_CHILD_SESSION）⇒ 总览底下照实说一句
+        self.last_note = ""
+        try:
+            hidden = self._unregistered_live(self._last_table)
+        except Exception:  # noqa: BLE001 —— 锦上添花，绝不能让列表出不来
+            logger.debug("数没留记录的 claude 失败", exc_info=True)
+            hidden = []
+        if hidden:
+            self.last_note = NOTE_UNREGISTERED.format(n=len(hidden))
+            errors.append(self.last_note)
         self.last_error = "；".join(e for e in errors if e)
         return out
+
+    def find(self, id: str) -> Optional[Session]:
+        """同 Adapter.find，但把「没留记录」那句提示从 last_error 里摘掉：control.find 找不到会话时
+        拿 last_error 当「读不出来」的原因，那句提示不是读失败（第 36 轮）。"""
+        sess = super().find(id)
+        note = self.last_note
+        if note and note in self.last_error:
+            # 🔴 提示句里自己就带「；」⇒ 不能按「；」切开再比，整句去掉
+            rest = self.last_error.replace("；" + note, "").replace(note + "；", "").replace(note, "")
+            self.last_error = rest.strip("；")
+        return sess
 
     def _history_session(self, sid: str, path: str, mtime: float, meta: Optional[dict], policy: Any) -> Optional[Session]:
         info = _scan_head(path)
@@ -887,13 +1029,16 @@ class ClaudeAdapter(Adapter):
         cwd = info["cwd"] or (meta or {}).get("cwd", "")
         if self._is_courier_cwd(cwd):
             return None
-        entry = info["entrypoint"]
+        # 第 36 轮：脏值（`claude-desktop-3p CLAUDE_CODE_...=1 ...`）原来精确匹配失败 ⇒ App 会话被标成「终端」
+        entry = norm_entrypoint(info["entrypoint"])
         is_app = meta is not None or entry == "claude-desktop-3p"
         title = ((meta or {}).get("title") or info["custom_title"] or info["ai_title"] or info["first"])
         why = self._why_not_send_idle(sid, cwd, path, meta, entry, policy)
         extra: dict = {"live": False}
         if entry:
             extra["entrypoint"] = entry
+        if entry in ENTRY_IDE:
+            extra["opened_in"] = "ide_panel"
         if meta and meta.get("status_category"):
             extra["app_status"] = meta["status_category"]
         return Session(
@@ -932,7 +1077,7 @@ class ClaudeAdapter(Adapter):
             return self._send_locks.setdefault(sid, threading.Lock())
 
     def send(self, id: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
-             approval_dir: str = "") -> ActionResult:
+             approval_dir: str = "", model: str = "", effort: str = "") -> ActionResult:
         """只有**没进程占着**才发：`claude -p --resume <id> --output-format json`。
 
         `policy` 不传就用构造时给的。工具白名单 = `policy.allowed_tools()`，红线 = `disallowed_tools()`。
@@ -942,6 +1087,7 @@ class ClaudeAdapter(Adapter):
         0 次拒绝）。认证键另外从 settings.json 的 env 里只挑出来塞进子进程环境（launchd 起的桥
         环境里没有它们，丢了就是「Not logged in」）。审批钩子用 `--settings` 单独带进来，
         `approval_dir` 是这次发送的批准目录（钩子靠 CARHER_APPROVAL_DIR 找它）。
+        `model` / `effort`（第 37 轮「🧠 模型」卡，按群记的）：非空且在白名单里才带 `--model` / `--effort`。
         """
         if not _is_session_id(id):
             return ActionResult(False, "会话编号不对。", str(id or ""))
@@ -952,13 +1098,17 @@ class ClaudeAdapter(Adapter):
         if not lock.acquire(blocking=False):
             return ActionResult(False, WHY_SEND_BRIDGE_BUSY, id)
         try:
+            if model or effort:
+                return self._send_locked(id, text, timeout, self._get_policy(policy), approval_dir,
+                                         model=model, effort=effort)
             return self._send_locked(id, text, timeout, self._get_policy(policy), approval_dir)
         except Exception as exc:  # 绝不抛给上层
             return ActionResult(False, friendly_error(exc), id)
         finally:
             lock.release()
 
-    def _send_locked(self, sid: str, text: str, timeout: float, policy: Any, approval_dir: str = "") -> ActionResult:
+    def _send_locked(self, sid: str, text: str, timeout: float, policy: Any, approval_dir: str = "",
+                     model: str = "", effort: str = "") -> ActionResult:
         # 🔴 spawn 之前现查一次：用户可能刚在终端里打开它（卡片上的 can_send 可能是几分钟前的）
         table = self._table()
         if table.error:
@@ -987,7 +1137,7 @@ class ClaudeAdapter(Adapter):
             # 可改 / 全授权档靠审批钩子挡越界写和红线命令；钩子没带上就只给只读档发
             return ActionResult(False, WHY_SEND_NO_HOOK, sid)
 
-        argv = self._send_argv(sid, text, policy, hook)
+        argv = self._send_argv(sid, text, policy, hook, model=model, effort=effort)
         env = self._send_env(approval_dir if hook else "")
         spawned: list = []
 
@@ -1107,11 +1257,17 @@ class ClaudeAdapter(Adapter):
             env["CARHER_APPROVAL_DIR"] = approval_dir
         return env
 
-    def _send_argv(self, sid: str, text: str, policy: Any, hook: Optional[dict] = None) -> list:
+    def _send_argv(self, sid: str, text: str, policy: Any, hook: Optional[dict] = None,
+                   model: str = "", effort: str = "") -> list:
         """和 runner.py 同一个形状：prompt 紧跟 `-p`，白名单 / 红线放最后（这两个参数吃多个值）。
 
         以「-」开头的话会被当成参数 ⇒ 前面垫一个空格（模型看不出差别）。
+        `model` / `effort`：第 37 轮按群选的。这里**再过一遍白名单**（`chatbind.clean_model` /
+        `clean_effort`），不认识的直接不带 —— 拼错的名字会让每一轮都失败。
         """
+        from .chatbind import clean_effort, clean_model
+
+        model, effort = clean_model(model), clean_effort(effort)
         prompt = " " + text if text.startswith("-") else text
         # --settings 只带钩子 + 认证用的顶层键（apiKeyHelper 只能走 settings）；不带任何权限规则
         _, auth_top = self._auth()
@@ -1136,6 +1292,10 @@ class ClaudeAdapter(Adapter):
             # 用户的 MCP 服务也不起（白名单里本来就没有它们的工具）
             "--strict-mcp-config",
         ]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
         if extra:
             argv += ["--settings", json.dumps(extra, ensure_ascii=False)]
         for tool in policy.allowed_tools():

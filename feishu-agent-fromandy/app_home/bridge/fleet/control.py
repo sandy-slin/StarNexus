@@ -193,7 +193,7 @@ class FleetControl:
     # ---------- 发 / 停 ----------
 
     def send(self, tool: str, sid: str, text: str, *, policy: Any = None, approval_dir: str = "",
-             timeout: float = 600, relay: bool = False) -> ActionResult:
+             timeout: float = 600, relay: bool = False, model: str = "", effort: str = "") -> ActionResult:
         """按家分派。三家的 send 都在锁里**再查一次**有没有人占着，这里不重复查。
 
         `relay=True`：走「进会话聊天」那条路（adapter 的 `relay()`）。Codex / Cursor 的
@@ -203,6 +203,10 @@ class FleetControl:
         adapter = self.fleet.adapter(tool)
         if adapter is None:
             return ActionResult(False, WHY_NO_ADAPTER, sid)
+        # 🔴 第 36 轮复审 Y1：手机上新建、又在电脑上开了窗口 ⇒ 窗口里的进程起来之前的空窗内不发（防分叉）
+        from . import newsession as _ns
+        if _ns.window_just_opened(sid):
+            return ActionResult(False, _ns.WHY_WINDOW_JUST_OPENED, sid)
         try:
             if tool == "claude":
                 # 🔴 **终端里开着的会话只能走 relay**。`send()` 那条路是 `claude -p --resume`，
@@ -217,7 +221,9 @@ class FleetControl:
                         return adapter.relay(sid, text, timeout=timeout)
                     if why:
                         return ActionResult(False, why, sid)
-                return adapter.send(sid, text, timeout=timeout, policy=policy, approval_dir=approval_dir)
+                # 第 37 轮：按群选的模型 / 思考强度只在这条路（`-p --resume`）上带；relay 换不了
+                prefs = {k: v for k, v in (("model", model), ("effort", effort)) if v}
+                return adapter.send(sid, text, timeout=timeout, policy=policy, approval_dir=approval_dir, **prefs)
             # 🔴 Codex / Cursor **一律按只读发**，不跟随手机上的档位。
             # 2026-11-04 安全审查：它们没有审批钩子，红线（删家目录、改桥的配置、写 App 数据库）
             # 和写边界都只在 Claude 那条路上生效。本机 ~/.codex/config.toml 是

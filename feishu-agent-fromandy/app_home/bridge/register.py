@@ -60,6 +60,19 @@ _BASE_SCOPES = (
     # 2. 流式输出（第 17 轮角色 F 的方案）：建卡片实体 + 反复推全量文本。
     #    F 实测现有 13 项 scope 里 cardkit 一项都没有。
     "cardkit:card:write",
+    # 3. 第 36 轮：总览卡用 Claude / Codex / Cursor 自己的图标（`fleet/brand_icons.py`）。
+    #    卡片里的图要先 `POST /im/v1/images` 换成 img_key。11-16 本机实测没这项 ⇒
+    #    code=99991672「[im:resource:upload, im:resource]」。
+    #    🔴 必须要 `im:resource`，**不能**挑窄的 `im:resource:upload`：11-16 实测 add_scopes 对
+    #    `im:resource:upload` 回 code=0 success，但 `/application/v6/scopes` 里**永远查不到**它（静默丢弃），
+    #    发了两次版也不生效；同一接口加 `im:resource` 立刻出现 grant_status=1，20 秒后上传成功。
+    #    加进来 ⇒ `menu_heal` 指纹变 ⇒ 老机器下次启动自己补申请 + 发版（主人 11-10：发版自动审批）。
+    "im:resource",
+    # 4. 第 37 轮：Claude 会话群输入框上方的快捷工具栏（`fleet/toolkit.py`）。
+    #    `GET/POST /im/v1/toolkits` 只认 `im:chat` 这一项（11-16 实测 99991672 的 permission_violations
+    #    只列了它，没有更窄的 `im:chat.toolkit:*`，见 docs/r37/toolkit-readonly-probe.md）。
+    #    它比建群那几项宽（能读写机器人所在的所有群），但没有替代项。
+    "im:chat",
 )
 # 这台机器需要的全部权限面：单聊 3 项 + 建群清单里推荐开的那一项（去重、保序）。
 WANT_SCOPES = list(dict.fromkeys([*_BASE_SCOPES, *(need[2] for need in _GROUP_NEEDS)]))

@@ -24,8 +24,26 @@
 - 🔴 **只在同一台机器上降级要拦住**：`build_id` 不一样就更新，不比大小 —— 回滚时服务端
   挂回旧包，同事那边要跟着回滚。但**同一个 build_id 装过一次就不再装**（`_state`），
   不然装失败会变成每 10 分钟重装一次。
-- Windows 那条路还没在真机上跑过（`run_installer` 的 `WINDOWS_UNVERIFIED`）⇒ 第 30 轮起 `check()` 在
-  Windows 上**不下载**，返回 `manual_only=True` 交给提醒那一侧（原来下载完才抛，每 6 小时白下 1.4MB）。
+- 第 30~37 轮 Windows 只提醒不装（`manual_only`）。第 38 轮（主人原话「windows 你要搞定，让他们能够自动更新」）
+  起 Windows 和 Mac 走同一条路：下载 → 核 sha256 → 空闲时装 → 安装器自己换新码、拉起、60 秒没连上就换回。
+  Windows 怎么跑安装器、为什么这么跑，见 `run_installer` 的 Windows 分支和 `_windows_installer_argv`。
+  ⚠️ 这条路**没在真 Windows 上跑过**（只在 Mac 的 pwsh 7 台架上跑过安装器那几段）。
+
+## Windows 自动更新（第 38 轮）
+
+- 不能直接跑 `.bat`：bat 头末尾是 `pause`（`build.sh` HEAD），后台跑会挂在那儿等回车直到超时。
+  照 bat 头自己的做法：powershell 读出 `##CARHER-PS1` 之后那段，当 scriptblock 跑（`_PS_BOOT`）。
+- 只给本进程 `-ExecutionPolicy Bypass`，不改系统执行策略；`-NonInteractive` ⇒ 万一走到 `Read-Host` 立刻失败，
+  不挂住；不提权（安装器全程只写 `%LOCALAPPDATA%` 和当前用户自己的计划任务 / HKCU）。
+- 不弹窗：`CREATE_NO_WINDOW`。🔴 不能用 `DETACHED_PROCESS`：没有控制台的 powershell 再起 python / pip
+  这些控制台程序时，**每个都会新开一个看得见的黑窗口**。
+- 输出写 `logs/selfupdate-install.log`，不接管道（Mac 11-09 SIGPIPE 那次，见 skill fleet-ops-release 第三节）。
+- 安装器在自动更新时（`CARHER_AUTO_UPDATE=1`）**只结束桥的 python**，不动外面那层 `run-agent.ps1` 循环，
+  循环 5 秒后用新码把它拉起来（`install-windows.ps1` 的 `Invoke-CarherSoftRestart`）。所以安装器是桥的子进程也没关系：
+  Windows 上结束父进程不会带走子进程。再加 `CREATE_BREAKAWAY_FROM_JOB` 尽量脱离计划任务的作业对象
+  （作业不许脱离时 CreateProcess 报拒绝访问 ⇒ 去掉这一位再起一次）。
+- 老版本（11-09 ~ 11-16 那几版）的 updater 在 Windows 上**代码里**就返回 `manual_only`，latest.json 里写什么都改不了它
+  ⇒ 那几台要重新双击一次新安装包（或在 PowerShell 里跑一行命令），之后才走这条自动路。
 
 ## 自动上报（第 30 轮，用户原话「不可能靠人来报」）
 
@@ -78,7 +96,42 @@ _MAX_BYTES = 8 * 1024 * 1024  # 包就 1.1MB；再大一定是出了别的事，
 # 装失败的同一个版本，隔这么久才再试一次
 _RETRY_AFTER_SEC = 6 * 60 * 60
 
-WINDOWS_UNVERIFIED = "Windows 上的自动更新还没在真机上跑过"
+WINDOWS_UNVERIFIED = "Windows 上的自动更新还没在真机上跑过"   # 第 38 轮起不再抛；留着给老测试 import
+
+# ---------- Windows 怎么跑安装器（见文件头「Windows 自动更新」） ----------
+
+# 照 bat 头（build.sh HEAD）那一行：读自己 → 找 `##CARHER-PS1` → 后面整段当 scriptblock 跑。
+# 退出码：安装器 `Die` 是 `exit 1`、没接住的错误 trap 里 break ⇒ 这里 catch 成 1；正常跑完 ⇒ 0。
+# 🔴 不能写 `exit $LASTEXITCODE`：那是安装器里**最后一个原生命令**的退出码（比如探测 python 的那一下），和装没装上无关。
+# 🔴 这串里不许出现 `bridge.app` / `run-agent.ps1`：安装器按命令行认旧进程去结束，认错了会把自己结束掉。
+_PS_BOOT = (
+    "$c=[IO.File]::ReadAllText($env:CARHER_SELF,[Text.Encoding]::UTF8);"
+    "$i=$c.IndexOf('#'+'#CARHER-PS1');if($i -lt 0){exit 9};"
+    "try{& ([scriptblock]::Create($c.Substring($i)))}catch{exit 1};exit 0"
+)
+# Windows 的 CreateProcess 标志（subprocess 只在 Windows 上导出这些常量 ⇒ 写数值，Mac 上的测试也能 import）
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_DETACHED_PROCESS = 0x00000008   # 🔴 不用（见文件头）；列在这里给测试断言「没用它」
+# Windows 安装器开头抢不到 `Local\CarHerFeishuAgent.install` 这把锁（另一个安装窗口在跑，多半是他正手动重装）时退出 3：
+# 不算装失败（不记 fail、不进 6 小时冷却），下一拍再试（install-windows.ps1 的 INSTALL-LOCK 段）
+WIN_INSTALLER_BUSY_RC = 3
+
+
+def _windows_powershell() -> str:
+    """系统自带的 Windows PowerShell 5.1（和安装器 `$psExe` 同一个），找不到退回 PATH 上的。"""
+    root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
+    if root:
+        exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if os.path.exists(exe):
+            return exe
+    return "powershell.exe"
+
+
+def _windows_installer_argv() -> list[str]:
+    return [_windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-WindowStyle", "Hidden", "-Command", _PS_BOOT]
 
 # ---------- 上报（见文件头「自动上报」） ----------
 
@@ -435,10 +488,7 @@ class SelfUpdater:
                 or not isinstance(part.get("file"), str):
             self.last_error = "新版本的信息不全（缺文件名或校验值）"
             return None
-        if installer_key() == "windows":
-            # 🔴 第 30 轮：Windows 装不了（`WINDOWS_UNVERIFIED`），原来下载完才知道 ⇒ 每 6 小时白下一次。
-            # 现在不下载，把「有新版、要人自己装」交给调用方（提醒那一侧 / 「更新」的回话）。
-            return dict(info, manual_only=True)
+        # 第 38 轮：Windows 不再 `manual_only`，和 Mac 一样往下走（见文件头「Windows 自动更新」）
         return info
 
     # ---------- 下载 + 核对 ----------
@@ -464,7 +514,7 @@ class SelfUpdater:
         if self._runner is not None:
             return self._runner(path)
         if platform.system() == "Windows":
-            raise RuntimeError(WINDOWS_UNVERIFIED)
+            return self._run_installer_windows(path)
         # 🔴 **重装这条路一句都不问**（2026-11-06 核过 install-mac.sh）：配置已经在
         # ⇒ 沿用原机器人（`EXIST_ID`）、沿用上次的目录（`KEEP_WS`），`read` 那几行都走不到。
         # 真要问起来也不会挂住：stdin 给 /dev/null ⇒ read 立刻失败，安装器报错退出，
@@ -482,11 +532,7 @@ class SelfUpdater:
         # 第一次 echo 就吃 SIGPIPE 死掉 ⇒ 「连上了就删 bridge.prev / 没连上就换回旧版」那段**永远跑不到**
         # ⇒ 自动回退形同虚设。本机实测：子进程在父进程死后写管道，跑不到结尾。
         # 改成写日志文件：文件描述符跟着安装器走，旧桥死了照样写得进去。
-        log_path = os.path.join(os.path.dirname(self.state_path) or ".", "logs", "selfupdate-install.log")
-        try:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        except OSError:
-            log_path = os.devnull
+        log_path = self._install_log_path()
         with open(os.devnull, "rb") as devnull, open(log_path, "w", encoding="utf-8") as out:
             proc = subprocess.run(  # noqa: S603 —— path 是刚校验过 sha256 的文件
                 ["/bin/bash", path],
@@ -506,11 +552,50 @@ class SelfUpdater:
         return subprocess.CompletedProcess(getattr(proc, "args", ["/bin/bash", path]),
                                            getattr(proc, "returncode", 1), tail, "")
 
+    def _install_log_path(self) -> str:
+        log_path = os.path.join(os.path.dirname(self.state_path) or ".", "logs", "selfupdate-install.log")
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        except OSError:
+            log_path = os.devnull
+        return log_path
+
+    def _run_installer_windows(self, path: str) -> subprocess.CompletedProcess:
+        """Windows：powershell 跑 .bat 里的 PS 正文（见文件头「Windows 自动更新」）。
+
+        和 Mac 那支同一套纪律：stdin 给空、输出写文件（绝不接管道）、`CARHER_AUTO_UPDATE=1`。
+        安装成功时它会结束**这个进程**（桥的 python）、让外面那层循环用新码拉起 ⇒ 下面的返回不一定跑得到，
+        结果靠 `update_state.json`（`installing` / `rolled_back`）在新进程里落定（`_reconcile`）。
+        """
+        env = dict(os.environ, CARHER_AUTO_UPDATE="1", CARHER_SELF=os.path.abspath(path))
+        argv = _windows_installer_argv()
+        log_path = self._install_log_path()
+        flags = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
+        with open(os.devnull, "rb") as devnull, open(log_path, "w", encoding="utf-8") as out:
+            def _go(creationflags: int):
+                return subprocess.run(  # noqa: S603 —— path 是刚校验过 sha256 的文件
+                    argv, stdin=devnull, stdout=out, stderr=subprocess.STDOUT, env=env,
+                    timeout=20 * 60, creationflags=creationflags,
+                )
+            try:
+                proc = _go(flags | _CREATE_BREAKAWAY_FROM_JOB)
+            except OSError:
+                # 计划任务的作业对象不许脱离 ⇒ CreateProcess 拒绝访问。不脱离照样能装（安装器只结束 python，不动作业里那层循环）
+                logger.info("安装器脱离不了计划任务的作业，留在作业里跑")
+                proc = _go(flags)
+        tail = ""
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                tail = fh.read()[-2000:]
+        except OSError:
+            pass
+        return subprocess.CompletedProcess(argv, getattr(proc, "returncode", 1), tail, "")
+
     def update_now(self, info: dict) -> tuple[bool, str]:
         """下载 + 核对 + 装。返回 (成功?, 给人看的一句话)。"""
         build = info["build_id"]
         if info.get("manual_only"):
-            # 这台不能自己装（Windows）⇒ 不下载、不记失败
+            # 第 38 轮起 check() 不再给这个标记；留着防外面有人手拼（不下载、不记失败）
             return False, f"这台要自己装：{self.download_url(info)}"
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -524,6 +609,7 @@ class SelfUpdater:
                 # 安装成功时这个进程会被安装器换掉，下面那几行（记成功、清临时目录）不一定跑得到；
                 # 先记一笔「在装」，失败分支会覆盖成 fail。
                 # 第 32 轮：记上从哪版来 ⇒ 重启后还是这一版 = 没装上（`_reconcile`）
+                before = self._state().get(build)
                 self._remember(build, "installing", **{"from": self.current_build()})
                 proc = self.run_installer(path)
         except Exception as exc:  # noqa: BLE001 —— 更新失败绝不能把桥带崩
@@ -534,6 +620,17 @@ class SelfUpdater:
             # 给人看的那句不带异常原文（可能是一长串英文栈）；原文进日志
             return False, "更新没装上，这一版先跳过了。原来那版照常能用，过几小时我再试一次。"
         self.installing = False
+        if proc.returncode == WIN_INSTALLER_BUSY_RC and installer_key() == "windows":
+            # 撞上另一个安装器（第 38 轮）⇒ 这次什么都没动：把「在装」那笔撤掉（恢复原来那条），不记 fail
+            state = self._state()
+            if isinstance(before, dict):
+                state[build] = before
+            else:
+                state.pop(build, None)
+            self._write_state(state)
+            logger.info("另一个安装器在跑，这次不装 %s，下一拍再试", build)
+            self.last_error = "另一个安装窗口还在跑"
+            return False, "另一个安装窗口还在跑，等它装完我再自己试。"
         if proc.returncode != 0:
             tail = (proc.stdout or "")[-300:] or (proc.stderr or "")[-300:]
             logger.error("安装包退出码 %s build=%s", proc.returncode, build)
@@ -557,7 +654,7 @@ class SelfUpdater:
         if info is None:
             return None
         if info.get("manual_only"):
-            logger.info("有新版 %s，这台（Windows）要人自己装，不下载", info["build_id"])
+            # 第 38 轮起 check() 不再给这个标记（同 update_now 那条）
             return None
         if not self.is_idle():
             logger.info("有新版 %s，但现在有活在跑，等空闲再装", info["build_id"])

@@ -23,6 +23,7 @@ import logging
 import os
 import signal as _signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,16 @@ DEFAULT_WHY_NOT_SEND = "这个会话现在不能从手机上发消息。"
 DEFAULT_WHY_NOT_STOP = "这个会话不是从手机上开的，不能从这里停。"
 
 PS_TIMEOUT_SEC = 3.0
+
+# 🔴 第 38 轮（11-17 Windows 实机报错指纹 c72d89e0ffb8 / faf1402711e3 / c0141181d01e，当天 12 次、2 台）：
+#   Windows 上没有 ps / lsof，原来照样去起 ⇒ 每轮总览都 FileNotFoundError + ERROR 日志（报错上报一直在报）。
+#   ⇒ Windows 上一律不起这两个命令：进程表用 kernel32（Toolhelp 快照 + GetProcessTimes），查不了就安静地返回「看不清」。
+#   测试改这个变量来模拟 Windows（on_windows() 每次现读）。
+_IS_WINDOWS = sys.platform.startswith("win")
+
+
+def on_windows() -> bool:
+    return _IS_WINDOWS
 
 
 # ---------- 报错：给手机一句人话，原文只进日志 ----------
@@ -253,6 +264,33 @@ class RunResult:
 
 # ---------- 子进程 ----------
 
+# 起不来的子进程 ⇒ 日志用哪句（每句都是源码常量，报错上报才会原样带上「是哪个程序」）。
+# 只认这几个名字；别的一律「其他程序」（名字可能是用户自己配的路径，不往外发）。
+_SPAWN_FAIL_LOGS = {
+    "claude": "起子进程失败 程序=claude",
+    "codex": "起子进程失败 程序=codex",
+    "cursor-agent": "起子进程失败 程序=cursor-agent",
+    "agent": "起子进程失败 程序=cursor-agent",   # Cursor 新版的命令名
+    "cursor": "起子进程失败 程序=cursor",
+    "ps": "起子进程失败 程序=ps",
+    "lsof": "起子进程失败 程序=lsof",
+    "git": "起子进程失败 程序=git",
+    "node": "起子进程失败 程序=node",
+    "powershell": "起子进程失败 程序=powershell",
+    "open": "起子进程失败 程序=open",
+    "osascript": "起子进程失败 程序=osascript",
+}
+_SPAWN_FAIL_OTHER = "起子进程失败 程序=其他程序"
+
+
+def _spawn_fail_log(name: str) -> str:
+    base = (name or "").lower()
+    for ext in (".exe", ".cmd", ".bat", ".ps1"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    return _SPAWN_FAIL_LOGS.get(base, _SPAWN_FAIL_OTHER)
+
+
 
 class SubprocessRunner:
     """所有子进程的唯一出口。测试注入假的，绝不起真 CLI。
@@ -286,7 +324,14 @@ class SubprocessRunner:
                 errors="replace",
             )
         except (OSError, ValueError) as exc:
-            return RunResult(returncode=-1, error=friendly_error(exc, f"没能启动 {os.path.basename(str(argv[0])) if argv else '?'}"))
+            name = os.path.basename(str(argv[0])) if argv else "?"
+            # 报错上报只发**源码常量**模板（errreport），所以按程序名挑一句常量日志 ——
+            # 11-17 Windows 上 9 次 FileNotFoundError 只看得到「没能启动 %s」，不知道是哪个程序。
+            try:
+                logger.error(_spawn_fail_log(name), exc_info=exc)
+            except Exception:  # noqa: BLE001
+                pass
+            return RunResult(returncode=-1, error=friendly_error(exc, f"没能启动 {name}"))
         if on_spawn is not None:
             try:
                 on_spawn(proc.pid)
@@ -363,6 +408,10 @@ def parse_proc_start(value: Any) -> tuple:
         return ()
     if isinstance(value, (int, float)):
         num = float(value)
+        if num > 1e16:
+            # Windows 版 Claude 注册表写的是 procStartFt（第 38 轮）：按 FILETIME（1601 起的 100ns 数）换算。
+            # ⚠️ 只从 claude 二进制里读到字段名、没见过 Windows 上的真值，「是 FILETIME」是推断
+            return (num / 1e7 - 11644473600.0,)
         return (num / 1000.0 if num > 1e11 else num,) if num > 0 else ()
     text = str(value).strip()
     if not text:
@@ -491,9 +540,11 @@ class ProcTable:
     读失败（没有 ps、超时）⇒ 空表 + `error` 一句话，不抛。
     """
 
-    def __init__(self, procs: Iterable[Proc] = (), error: str = "") -> None:
+    def __init__(self, procs: Iterable[Proc] = (), error: str = "", has_args: bool = True) -> None:
         self._by_pid = {p.pid: p for p in procs}
         self.error = error
+        # Windows 快照里 args 只有程序名、没有命令行 ⇒ 靠命令行下判断的地方（「没留会话记录的 claude」那句）要跳过
+        self.has_args = has_args
 
     # ---------- 构造 ----------
 
@@ -532,6 +583,8 @@ class ProcTable:
 
     @classmethod
     def snapshot(cls, runner: Optional[SubprocessRunner] = None, timeout: float = PS_TIMEOUT_SEC) -> "ProcTable":
+        if on_windows():
+            return cls._windows_snapshot()
         runner = runner or SubprocessRunner()
         try:
             result = runner.run(PS_ARGV, timeout=timeout, env=_ps_env())
@@ -545,6 +598,14 @@ class ProcTable:
             logger.warning("ps 退出码 %s，读不到进程列表", result.returncode)
             return cls(error="读不到进程列表（系统命令没跑成）")
         return cls.parse(result.stdout)
+
+    @classmethod
+    def _windows_snapshot(cls) -> "ProcTable":
+        try:
+            return cls(_win_procs(), has_args=False)
+        except Exception as exc:  # noqa: BLE001 —— 读不到就是「看不清」，不报错（每 10 秒一轮，报了也只是刷屏）
+            _note_win_failure_once(exc)
+            return cls(error="这台电脑上读不到进程列表")
 
     # ---------- 查询 ----------
 
@@ -590,15 +651,118 @@ class ProcTable:
         Claude 注册表里的 UTC ctime 串。对不上、读不出来一律 False —— 宁可说「不在跑」，
         也不能把复用了 pid 的别的进程认成会话。
         """
+        if isinstance(proc_start, (list, tuple)):
+            # 几种写法任一对得上就算（Windows 的 procStartFt 和 Mac 的 procStart 不会同时有，startedAt 兜底）
+            return any(self.same_process(pid, v) for v in proc_start if v not in (None, ""))
         proc = self.get(pid)
         if proc is None:
             return False
-        if isinstance(proc_start, str) and normalize_lstart(proc_start) == proc.lstart:
+        if isinstance(proc_start, str) and proc.lstart and normalize_lstart(proc_start) == proc.lstart:
             return True
         actual = proc.started_at
         if not actual:
             return False
         return any(_same_second(cand, actual) for cand in parse_proc_start(proc_start))
+
+
+# ---------- Windows：不起 ps，直接问 kernel32 ----------
+# ⚠️ 下面这段只在 Mac 上用桩测过「不起 ps / 失败不报错 / 时间格式和 ps 一致」，ctypes 调用本身没在真 Windows 上跑过。
+# args 只有程序名（claude.exe / node.exe…）：Toolhelp 快照不带命令行，要命令行得读别的进程内存，不做。
+#   ⇒ 判活（注册表 pid + 启动时间）照常；靠命令行认的（Cursor 命令行对话、Codex.app）在 Windows 上认不出 = 看不清。
+
+_WIN_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_WIN_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_win_failure_noted = False
+
+
+def _note_win_failure_once(exc: BaseException) -> None:
+    global _win_failure_noted
+    if _win_failure_noted:
+        return
+    _win_failure_noted = True
+    try:
+        logger.warning("Windows 上读进程列表失败，会话死活先当看不清（%s）", type(exc).__name__)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def format_lstart(epoch: float) -> str:
+    """epoch 秒 → 和 `LC_ALL=C ps -o lstart=` 压空白后同一种写法（本地时间，英文星期/月份，不随系统语言变）。"""
+    tm = time.localtime(int(epoch))
+    return (f"{_WIN_WEEKDAYS[tm.tm_wday]} {_WIN_MONTHS[tm.tm_mon - 1]} {tm.tm_mday} "
+            f"{tm.tm_hour:02d}:{tm.tm_min:02d}:{tm.tm_sec:02d} {tm.tm_year}")
+
+
+def _win_kernel32():
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    return ctypes, wintypes, k32
+
+
+def _win_start_epoch(pid: int) -> float:
+    """进程创建时间（epoch 秒）；打不开（系统进程 / 已退出）⇒ 0。"""
+    ctypes, wintypes, k32 = _win_kernel32()
+    handle = k32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return 0.0
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not k32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return 0.0
+        ft = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        return ft / 1e7 - 11644473600.0 if ft else 0.0
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _win_lstart_of(pid: int) -> str:
+    start = _win_start_epoch(pid)
+    return format_lstart(start) if start > 0 else ""
+
+
+def _win_procs() -> list:
+    ctypes, wintypes, k32 = _win_kernel32()
+
+    class _Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    k32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_Entry))
+    k32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_Entry))
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)   # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    rows = []
+    try:
+        entry = _Entry()
+        entry.dwSize = ctypes.sizeof(_Entry)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            rows.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), str(entry.szExeFile)))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    if not rows:
+        raise OSError("empty process snapshot")
+    now = time.time()
+    procs = []
+    for pid, ppid, exe in rows:
+        start = _win_start_epoch(pid) if pid > 4 else 0.0
+        procs.append(Proc(pid=pid, ppid=ppid, stat="", lstart=format_lstart(start) if start > 0 else "",
+                          etime_sec=max(0, int(now - start)) if start > 0 else 0, args=exe))
+    return procs
 
 
 # ---------- 桥自己起的进程 ----------
@@ -615,6 +779,11 @@ class Job:
 
 def _ps_lstart_of(pid: int) -> str:
     """只查一个 pid 的 lstart；不在 / 读失败 ⇒ 空串。"""
+    if on_windows():
+        try:
+            return _win_lstart_of(int(pid))
+        except Exception:  # noqa: BLE001
+            return ""
     try:
         out = subprocess.run(
             ["ps", "-ww", "-o", "lstart=", "-p", str(int(pid))],

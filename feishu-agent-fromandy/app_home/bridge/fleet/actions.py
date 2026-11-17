@@ -312,3 +312,113 @@ def build_buttons_card(buttons: Iterable[dict], note: str = "") -> str:
         {"schema": "2.0", "config": {"wide_screen_mode": True}, "body": {"elements": elements}},
         ensure_ascii=False,
     )
+
+
+# ---------- 第 36 轮「➕ 新会话」：从手机在电脑上新开一个 Claude / Codex / Cursor 会话 ----------
+#
+# 回调值只认 `{"act":"nsess","op":<NEWSESSION_OPS>, "n":<序号>, "t":<工具>}` 这几个键：
+# - `n`：这张新会话卡的随机序号。选了哪个工具、哪个项目、开不开窗口全记在服务端
+#   （`Bridge._newsession_drafts`），卡片值里**没有路径、没有原话** —— 伪造一个值最多是「换一个已列出来的选项」。
+# - `t`：只在 begin / tool 两个 op 上有，必须是 `model.TOOLS` 里的一个（枚举）。
+# - 项目下拉的选项值是 `p<下标>`（`action.option`，不在 value 里），下标对的是服务端记的那份列表。
+NEWSESSION_ACT = "nsess"
+# 11-16 简化后卡上只发 begin / tsel（工具下拉，选中的工具在 `action.option` 里，同 proj）/ proj / send；
+# tool / win / no 留着认：之前发出去的老卡还在聊天里（win 在 app 里已是空操作）
+NEWSESSION_OPS = ("begin", "tool", "tsel", "proj", "win", "send", "no")
+NEWSESSION_LABEL = "➕ 新会话"
+_NS_NONCE_MAX = 32
+
+
+def newsession_value(op: str, nonce: str = "", tool: str = "") -> dict:
+    if op not in NEWSESSION_OPS:
+        raise ValueError(f"不认识的新会话 op：{op!r}")
+    value = {"act": NEWSESSION_ACT, "op": op}
+    if nonce:
+        value["n"] = str(nonce)
+    if tool:
+        value["t"] = str(tool)
+    return value
+
+
+def newsession_button(label: str = NEWSESSION_LABEL, tool: str = "", primary: bool = False) -> dict:
+    """「➕ 新会话」入口（总览顶上 / 每组里 / 帮助后面）。点了只是发一张新会话卡，不起任何进程。"""
+    return _button(label, newsession_value("begin", tool=tool), primary)
+
+
+def resolve_newsession_click(value: Any) -> Optional[dict]:
+    """回调 value → {"op","n","t"}；形状不对（多键、op 不认识、序号不是短十六进制、工具不认识）⇒ None。
+
+    序号对不对得上服务端那张草稿由调用方查（同 `resolve_continue_click`）。
+    """
+    from .model import TOOLS
+
+    if not isinstance(value, dict) or value.get("act") != NEWSESSION_ACT:
+        return None
+    op = value.get("op")
+    if op not in NEWSESSION_OPS:
+        return None
+    allowed = {"act", "op", "n"} | ({"t"} if op in ("begin", "tool") else set())
+    if set(value) - allowed:
+        return None
+    nonce = value.get("n", "")
+    if op == "begin":
+        if nonce:
+            return None
+    elif not (isinstance(nonce, str) and 0 < len(nonce) <= _NS_NONCE_MAX
+              and all(c in "0123456789abcdef" for c in nonce)):
+        return None
+    tool = value.get("t", "")
+    if op == "tool" and not tool:
+        return None
+    if tool and (not isinstance(tool, str) or tool not in TOOLS):
+        return None
+    return {"op": op, "n": nonce or "", "t": tool or ""}
+
+
+# ---------- 第 37 轮：会话群工具栏「🧠 模型」卡 ----------
+#
+# 卡上两个下拉（模型 / 思考强度）。回调值只有 `{"act": "tkm", "op": "model"|"effort", "n": <序号>}`：
+# - `n`：这张卡的随机序号，app 那边按群记着（`Bridge._toolbar_model_cards`），对不上就拒；
+# - 选中的是哪个在 `action.option` 里，形状只认 `m<下标>` / `e<下标>` / `d`（= 不指定），
+#   下标对的是 `policy.MODEL_CHOICES` / `chatbind.EFFORT_CHOICES` ⇒ 卡上的值里**没有模型名**，
+#   伪造一个值最多是「换成另一个已列出的选项」。
+TOOLBAR_MODEL_ACT = "tkm"
+TOOLBAR_MODEL_OPS = ("model", "effort")
+_TKM_NONCE_MAX = 32
+
+
+def toolbar_model_value(op: str, nonce: str) -> dict:
+    if op not in TOOLBAR_MODEL_OPS:
+        raise ValueError(f"不认识的模型卡 op：{op!r}")
+    return {"act": TOOLBAR_MODEL_ACT, "op": op, "n": str(nonce)}
+
+
+def resolve_toolbar_model_click(value: Any) -> Optional[dict]:
+    """回调 value → {"op","n"}；多键 / op 不认识 / 序号不是短十六进制 ⇒ None。序号对不对得上由 app 查。"""
+    if not isinstance(value, dict) or value.get("act") != TOOLBAR_MODEL_ACT:
+        return None
+    if set(value) != {"act", "op", "n"}:
+        return None
+    op, nonce = value.get("op"), value.get("n")
+    if op not in TOOLBAR_MODEL_OPS:
+        return None
+    if not (isinstance(nonce, str) and 0 < len(nonce) <= _TKM_NONCE_MAX
+            and all(c in "0123456789abcdef" for c in nonce)):
+        return None
+    return {"op": op, "n": nonce}
+
+
+def resolve_toolbar_model_option(op: str, option: Any) -> Optional[str]:
+    """下拉选中的 `action.option` → 模型名 / 强度名；`d` ⇒ 空串（不指定）；认不出 ⇒ None。"""
+    from ..policy import MODEL_CHOICES
+    from .chatbind import EFFORT_CHOICES
+
+    if not isinstance(option, str) or len(option) > 4:
+        return None
+    if option == "d":
+        return ""
+    prefix, choices = ("m", MODEL_CHOICES) if op == "model" else ("e", EFFORT_CHOICES)
+    if not option.startswith(prefix) or not option[1:].isdigit():
+        return None
+    idx = int(option[1:])
+    return choices[idx][0] if 0 <= idx < len(choices) else None

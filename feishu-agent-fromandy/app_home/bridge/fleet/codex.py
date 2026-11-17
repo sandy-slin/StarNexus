@@ -71,6 +71,7 @@ import urllib.parse
 from typing import Any, Optional
 
 from .model import (
+    on_windows,
     ActionResult,
     Adapter,
     FleetJobs,
@@ -497,6 +498,9 @@ class CodexAdapter(Adapter):
         if not paths:
             return {}, ""
         files = list(paths)[:MAX_LOCKS]
+        if on_windows() and not self.lsof_bin:
+            # 第 38 轮：Windows 没有 lsof（11-17 实机指纹 faf1402711e3）⇒ 不起它，有锁文件的一律「说不准」，也不报错
+            return {tid: None for tid in paths.values()}, ""
         try:
             res = self.runner.run([self._lsof(), "-F", "pn", *files], timeout=self.lsof_timeout)
         except Exception as exc:

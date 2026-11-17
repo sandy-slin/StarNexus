@@ -269,6 +269,16 @@ class GroupSetup:
             "chat_type": "private",
             "group_message_type": "chat",
         }
+        # 第 37 轮：Claude 会话群建群时直接带上快捷工具栏（fleet/toolkit.py；没建好 ⇒ []，不带）。
+        # 只给 Claude 群：create 拿不到 tool，按 chatbind.group_name 起的「Claude · 」前缀认。
+        if safe.startswith("Claude · "):
+            try:
+                from .toolkit import toolkit_ids
+                tk = [int(x) for x in toolkit_ids()]
+            except Exception:  # noqa: BLE001 —— 工具栏出问题不能挡建群
+                tk = []
+            if tk:
+                body["toolkit_ids"] = tk
         out = self._authed("POST", "/im/v1/chats" + query, body)
         code = _code(out)
         chat_id = ((out.get("data") or {}).get("chat_id") or "") if not code else ""

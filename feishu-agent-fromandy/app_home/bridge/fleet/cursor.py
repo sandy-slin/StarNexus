@@ -88,6 +88,7 @@ from .model import (
     parse_lstart,
     short_title,
     resolve_lsof,
+    on_windows,
 )
 
 logger = logging.getLogger("feishu-bridge.fleet.cursor")
@@ -786,6 +787,8 @@ class CursorAdapter(Adapter):
         pids = [str(int(p)) for p in pids]
         if not pids:
             return {}
+        if on_windows():
+            return None   # 第 38 轮：Windows 没有 lsof ⇒ 不起它，按「看不清」处理，不报错
         try:
             result = self.runner.run(
                 [resolve_lsof(), "-a", "-p", ",".join(pids), "-d", "cwd", "-Fpn"], timeout=LSOF_TIMEOUT_SEC

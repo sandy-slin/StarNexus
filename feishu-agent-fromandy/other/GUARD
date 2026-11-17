@@ -100,6 +100,13 @@ if [ "$streak" -ge "$CRASH_STREAK" ]; then
     else
       log "crashloop report failed, will retry next round"
     fi
+    # 第 38 轮：顺带把**崩溃本身**（异常类型 + bridge/ 里的栈帧，见 bridge/errreport.py）报上去。
+    # 放后台、不等它：上报绝不能拖住守卫；它自己有超时、同一指纹每天只发一次。
+    # 崩在 import 阶段时桥里的钩子还没装上，只有这一路报得出来。
+    if [ "${CARHER_NO_REPORT:-0}" = 0 ] && [ -f "$HOME_DIR/bridge/errreport.py" ]; then
+      ( cd "$HOME_DIR" && "$1" -m bridge.errreport --home "$HOME_DIR" \
+          --crash-log "$HOME_DIR/logs/agent.log" >/dev/null 2>&1 ) &
+    fi
   fi
   save "$last_exec"
   # 停服务（bootout）时别让这一觉拖住：收到 TERM 就连 sleep 一起结束

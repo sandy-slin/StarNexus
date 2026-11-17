@@ -75,6 +75,30 @@ GROUP_PREFIX = "group:"
 # 🔴 人的 open_id 长这样。它**不是** chat_id，绑进来就等于把单聊当群用（11-05 踩过）。
 _OPEN_ID_PREFIX = "ou_"
 
+# 「🧠 模型」卡上的思考强度。取值以本机 `claude --help` 为准（CLI 2.1.325，11-16 实测）：
+#   --effort <level>  Effort level for the current session (low, medium, high, xhigh, max)
+# 这个字符串进 `claude --effort` 的 argv ⇒ 白名单，磁盘上读出来的也要再过一遍。
+EFFORT_CHOICES = (
+    ("low", "低", "最快，省额度"),
+    ("medium", "中", "日常"),
+    ("high", "高", "难一点的活"),
+    ("xhigh", "很高", "更仔细，慢一些"),
+    ("max", "最高", "最慢"),
+)
+EFFORT_LEVELS = tuple(name for name, _, _ in EFFORT_CHOICES)
+
+
+def clean_model(value: Any) -> str:
+    """只认 `policy.MODEL_CHOICES` 里的名字；别的一律空串（= 不指定）。"""
+    from ..policy import known_model
+
+    return value if isinstance(value, str) and known_model(value) else ""
+
+
+def clean_effort(value: Any) -> str:
+    return value if isinstance(value, str) and value in EFFORT_LEVELS else ""
+
+
 # ensure_group 的四种结果。调用方要按它说人话 —— 「没权限」和「飞书报错」是两件事：
 # 前者要用户去后台开 scope（主会话写的那份清单），后者等一会儿再点就好。
 REUSED = "reused"          # 这个会话已经有群了，直接用（点两次不建两个群）
@@ -96,6 +120,11 @@ class Bound:
     name: str
     created_at: float
     on: bool = True  # False = 主人解绑过，只关转发，群和这条记录都留着
+    # 第 37 轮「🧠 模型」卡：按群记住的模型 / 思考强度。空串 = 不指定（跟电脑上一样）。
+    # 只在**无主会话**那条路（`claude -p --resume`）上生效（`ClaudeAdapter._send_argv`）；
+    # 终端开着的会话（relay）换不了。旧文件没有这两个键 ⇒ 默认空串。
+    model: str = ""
+    effort: str = ""
 
     @property
     def label(self) -> str:
@@ -222,17 +251,20 @@ class ChatBinds:
             created = 0.0
         return Bound(chat_id=chat_id, tool=tool, id=sid,
                      name=_clean_name(row.get("name"))[:MAX_NAME_CHARS],
-                     created_at=created, on=bool(row.get("on", True)))
+                     created_at=created, on=bool(row.get("on", True)),
+                     model=clean_model(row.get("model")), effort=clean_effort(row.get("effort")))
 
     def _save(self) -> bool:
         with self._lock:
-            payload = {
-                "binds": {
-                    b.chat_id: {"tool": b.tool, "id": b.id, "name": b.name,
-                                "created_at": b.created_at, "on": b.on}
-                    for b in self._by_chat.values()
-                }
-            }
+            payload = {"binds": {}}
+            for b in self._by_chat.values():
+                row = {"tool": b.tool, "id": b.id, "name": b.name, "created_at": b.created_at, "on": b.on}
+                # 没选过就不写这两个键：旧版本桥读到多出来的键也不会出错，但没必要多写
+                if b.model:
+                    row["model"] = b.model
+                if b.effort:
+                    row["effort"] = b.effort
+                payload["binds"][b.chat_id] = row
         try:
             directory = os.path.dirname(self._path)
             if directory:
@@ -319,6 +351,10 @@ class ChatBinds:
                 if (value.tool, value.id) == (bound.tool, bound.id) and old != chat_id:
                     self._by_chat[old] = _replace(value, on=False)
                     displaced.append(old)
+            # 「🧠 模型」是**按群**记的：这个群改绑到别的会话，选过的模型 / 强度跟着群走
+            prev = self._by_chat.get(chat_id)
+            if prev is not None and (prev.model or prev.effort):
+                bound = _replace(bound, model=prev.model, effort=prev.effort)
             self._by_chat[chat_id] = bound
             self._prune_locked()
         self._save()
@@ -337,6 +373,26 @@ class ChatBinds:
             if bound is None:
                 return None
             bound = _dc_replace(bound, name=_clean_name(name)[:MAX_NAME_CHARS])
+            self._by_chat[chat_id] = bound
+        self._save()
+        return bound
+
+    def set_prefs(self, chat_id: str, *, model: Optional[str] = None,
+                  effort: Optional[str] = None) -> Optional[Bound]:
+        """「🧠 模型」卡上选了 ⇒ 记到这个群上。`None` = 这一项不动；空串 = 改回不指定。
+
+        值不在白名单里 ⇒ 当成空串（不指定），不会把一个拼错的名字塞进 argv。
+        """
+        with self._lock:
+            bound = self._by_chat.get(chat_id)
+            if bound is None:
+                return None
+            kw = {}
+            if model is not None:
+                kw["model"] = clean_model(model)
+            if effort is not None:
+                kw["effort"] = clean_effort(effort)
+            bound = _dc_replace(bound, **kw)
             self._by_chat[chat_id] = bound
         self._save()
         return bound

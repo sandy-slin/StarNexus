@@ -91,6 +91,7 @@ from .claude import (
     _FROM_NAME_RE,
     _content_text,
     _is_session_id,
+    norm_entrypoint,
     _read_tail,
     _parse_lines,
 )
@@ -724,7 +725,7 @@ class Relay:
                 pid = int(rec.get("pid") or 0)
             except (TypeError, ValueError):
                 continue
-            if not table.same_process(pid, rec.get("procStart") or rec.get("startedAt")):
+            if not table.same_process(pid, (rec.get("procStart"), rec.get("procStartFt"), rec.get("startedAt"))):
                 continue
             live.append((source, pid, rec))
         mine = [(pid, rec) for source, pid, rec in live if rec.get("sessionId") == sid and source == "user"]
@@ -734,9 +735,10 @@ class Relay:
         # 🔴 2026-11-06 第 13 轮：App 会话原来在这里一律拒（第 12 轮实测会被扣住）。现在按目标权限档挑同类信使，
         # 被扣的原因没了 ⇒ 放行。别的入口（sdk-cli = 脚本 / 桥自己）照旧不走这条路。
         _RELAYABLE = ("cli", "claude-desktop-3p")
-        if all(str(rec.get("entrypoint") or "") not in _RELAYABLE for _pid, rec in mine):
+        # 第 36 轮：entrypoint 先取第一个词（实测会带空格和别的变量，如 `cli FOO=1`）
+        if all(norm_entrypoint(rec.get("entrypoint")) not in _RELAYABLE for _pid, rec in mine):
             return Decision(False, WHY_NOT_TERMINAL)
-        mine = [(pid, rec) for pid, rec in mine if str(rec.get("entrypoint") or "") in _RELAYABLE]
+        mine = [(pid, rec) for pid, rec in mine if norm_entrypoint(rec.get("entrypoint")) in _RELAYABLE]
         # 同一个会话开在好几个终端里时，谁都能收，取第一个有名字的
         pid, rec = next(((p, r) for p, r in mine if str(r.get("name") or "").strip()), mine[0])
         proc = table.get(pid)
