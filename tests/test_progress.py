@@ -204,6 +204,14 @@ class WaitCardFinishTest(unittest.TestCase):
         self.assertIn("⏹ 已停下", text)
         self.assertNotIn("没等到", text)
 
+    def test_waiting_approval_says_approval(self):
+        from bridge.fleet.claude import WHY_SEND_DEFERRED
+        from bridge.fleet.model import ActionResult
+
+        text = self.finish_with(ActionResult(False, WHY_SEND_DEFERRED, "s1", delivered=True))
+        self.assertIn("在等你批准", text)
+        self.assertNotIn("没等到", text)
+
     def test_timeout_still_warns(self):
         from bridge.fleet.model import ActionResult
 

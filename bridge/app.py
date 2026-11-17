@@ -452,6 +452,8 @@ class _FleetWaitCard:
             head = "✅ 它回了"
         elif _stopped_by_owner(result):
             head = "⏹ 已停下"
+        elif _waiting_approval(result):
+            head = "🔒 在等你批准，看下面的审批卡"
         elif result is not None and getattr(result, "delivered", False):
             head = "⚠️ 没等到它正常回复，看下面那条"
         else:
@@ -463,6 +465,13 @@ class _FleetWaitCard:
 def _stopped_by_owner(result) -> bool:
     """这一轮是主人点「停下」停的（不是超时、报错）⇒ 不按「没正常回完」的警告说。"""
     return result is not None and str(getattr(result, "text", "") or "").startswith("这一轮已按你的要求停下")
+
+
+def _waiting_approval(result) -> bool:
+    """这一轮停在审批钩子上（那一步还没做）⇒ 按「等你批准」说，不按「没正常回完」的警告说。"""
+    from .fleet.claude import WHY_SEND_DEFERRED
+
+    return result is not None and str(getattr(result, "text", "") or "").endswith(WHY_SEND_DEFERRED)
 
 
 def _fmt_wait(seconds: float) -> str:
@@ -3449,6 +3458,8 @@ class Bridge:
                 "想看它停下前做到哪，点「看看它现在」。" + tail,
                 [look] + buttons,
             )
+        elif _waiting_approval(result):
+            self._say_with_buttons(chat_id, f"🔒 {target.label} {result.text}" + tail, buttons)
         elif result.delivered:
             # 消息**已经进了会话**，只是没正常回完（超时 / 被停 / 等确认 / 报错）。
             # 不能说「没发进去」—— 用户会重发，在他真实的会话里重复执行一次。
@@ -4752,6 +4763,8 @@ class Bridge:
                                           result.text or "")
             if choice:
                 self._send_buttons(target_chat_id, choice)
+        elif _waiting_approval(result):
+            self._say(target_chat_id, f"🔒 会话已经开了，{target.label} {result.text}{tail}")
         else:
             self._say(target_chat_id, f"⚠️ 会话已经开了，但这一句没正常回完：{result.text}{tail}")
         self._send_buttons(target_chat_id, self._talk_buttons(target.tool, target.id))
