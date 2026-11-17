@@ -212,6 +212,8 @@
 
 18:40 发现并修复：从私聊新开会话时，第一轮回复已贴进新群，推送器又补推一条“做完一轮”摘要，内容重复。改为首轮也登记成已转发（提交 94f81ab，单元测试 FirstTurnNotRepushedTest），部署后 18:44 新群里没有重复推送。
 
+18:54–19:09 用部署后的代码（含 94f81ab）重跑整套真机回归，12 条全部 PASS：ns_claude、ns_codex、group_relay、find、model_effort、long_reply、image、stop、choices、codex_trusted、term_stop、progress。
+
 剩余：FC-08 审批卡 @林森 的新截图、私聊常驻菜单（💻 会话 / 🧠 模型 / ⚡ 常用 / ⏹ 停下）和 /find 的客户端复核。<font color="red">18:49 电脑锁屏，界面验收暂停；解锁后继续这三项。</font>
 
 ## 9. 需要林森关注
