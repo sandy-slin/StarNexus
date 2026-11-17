@@ -4475,9 +4475,8 @@ class Bridge:
         args = parts[1:] if command in COMMANDS else []
         state = self._newsession_state()
         if args and args[0].lower() in ("cancel", "取消"):
-            had = state.disarm(scope)
-            self._say_with_buttons(chat_id, "好，不建了。" if had else "现在没有在新建的会话。",
-                                   [_do_button("sessions")])
+            state.disarm(scope)
+            self._say_with_buttons(chat_id, "好，不建了。", [_do_button("sessions")])
             return True
         if getattr(self, "fleet", None) is None:
             self._say(chat_id, "会话总控这次没起来，重启一下服务再试。")

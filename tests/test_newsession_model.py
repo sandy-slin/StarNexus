@@ -105,6 +105,21 @@ class ArmTest(unittest.TestCase):
         self.assertNotIn("dm:x", bridge._newsession_models())
 
 
+class CancelReplyTest(unittest.TestCase):
+    def test_cancel_before_armed_still_confirms(self):
+        bridge = make_bridge()
+        handled = asyncio.run(bridge._handle_newsession_command("dm:x", "oc", "/newsession cancel"))
+        self.assertTrue(handled)
+        self.assertEqual(bridge.sent[-1], "好，不建了。")
+
+    def test_cancel_after_armed_clears_state(self):
+        bridge = make_bridge()
+        bridge._newsession_state().arm("dm:x", "codex", "/tmp")
+        asyncio.run(bridge._handle_newsession_command("dm:x", "oc", "/newsession cancel"))
+        self.assertEqual(bridge.sent[-1], "好，不建了。")
+        self.assertIsNone(bridge._newsession_state().peek("dm:x")[0])
+
+
 class FakeWaitCard:
     def __init__(self, *args, **kwargs):
         pass
