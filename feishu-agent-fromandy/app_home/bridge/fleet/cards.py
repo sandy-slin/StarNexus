@@ -3,7 +3,9 @@
 卡片约束照 `bridge/menu.py`（踩过的）：schema 2.0、**没有** action 容器、按钮回调走
 `behaviors: [{"type":"callback","value":{...}}]`，整张卡远小于 30KB（这里压到 < 20KB）。
 
-回调只认 `{"act":"fleet","op":"open|send|stop|refresh","tool":...,"id":...}` 和
+回调只认 `{"act":"fleet","op":"open|send|go|stop|refresh|settle|unsettle","tool":...,"id":...}`、
+`{"act":"fleet","op":"snooze","tool":...,"id":...,"q":<16 位十六进制>}`（推送卡上「1 小时后再提醒」）、
+`{"act":"fleet","op":"more","tool":...}`（总览上展开一组，不带 id）和
 `{"act":"relay","op":"talk|no",...}`（进对话模式的那次确认），
 并且 (tool, id) 必须在**最近一次扫描结果**里出现过 —— 伪造的 id 进不来
 （`resolve_fleet_click` / `resolve_relay_click`）。
@@ -13,19 +15,28 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import unicodedata
 from typing import Any, Iterable, Optional
 
 from ..reply import FENCE, card_snippet, escape_card, inline_code
-from .actions import detail_nav_rows, jump_callback_button
+from .actions import button_rows, detail_nav_rows, do_button, jump_callback_button
 from .model import TOOLS, Session, short_title
 from .scan import TOOL_LABELS, Overview
 
 # `go`：详情卡上「接着聊」**已经跳进群**的那一下（按钮同时带 open_url，见 `build_detail_card` 的 group_link）。
 # 和 send 走同一条路，只是单聊里不再补「➡️ 进群说话」。
-OPS = ("open", "send", "go", "stop", "refresh")
+# `more`：总览上「还有 N 个没列出来」那个按钮（第 28 轮）⇒ 原地换卡、把这一组全列出来。只带 tool，不带 id。
+# `settle` / `unsettle`：详情卡上「✓ 结束」和结束后那张卡上的「撤销」（第 33 轮，`fleet/settled.py`）。
+# `snooze`：「等你」推送卡上「1 小时后再提醒」（第 33 轮）。只有它可以多带一个 `q`（它在问什么的指纹）。
+OPS = ("open", "send", "go", "stop", "refresh", "more", "settle", "unsettle", "snooze")
+_SIG_MAX = 16
 RELAY_OPS = ("talk", "no")  # 进对话模式那张确认卡：确认 / 算了
 MAX_CARD_BYTES = 20 * 1024
+# 一张卡最多 200 个组件（飞书官方文档）。「全部列出来」那一组可能有几十行 ⇒ 字节之外还得数组件。
+MAX_CARD_COMPONENTS = 200
+# 折叠面板标题右边那个小箭头（主会话 2026-11-08 真发过、飞书接受的写法）
+PANEL_ICON = {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"}
 # 总览一个工具最多列几行。瘦身后一行只剩「状态点 + 名字 + 多久前」（旧的一行还带工具名和
 # 项目名），同样的字节能多列几行 ⇒ 6 提到 8。再多手机上就要一直划了，而且更早的会话
 # 本来也不是他要找的（底下有「还有 N 个更早的没列出来」）。
@@ -41,6 +52,153 @@ STATUS_LABELS = {
     "stopped": "⏸ 挂起",
     "unknown": "❔ 看不出",
 }
+
+# ---------- 卡片上显示的状态（第 32 轮，照 T3 手机列表）----------
+#
+# `Session.status` 是 adapter 读出来的「进程在干什么」；卡片上要的是「要不要我管、管什么」，
+# 所以多分几种（`display_status`）。读不到的一律退回原来那几种，**不猜**：
+# - 「等你」能读出它在问什么（`pending`）才拆成「等你批准 / 等你回答」，读不出就还是「🟡 等你」
+# - 「出错了」只认 adapter 真读到的失败信号（`Session.last_turn == "failed"`）
+# - 「跑完了你还没看」要知道上一次给这个人发总览卡是什么时候（`seen_at`）；不知道就不显示
+DISPLAY_LABELS = {
+    "approve": "🟡 等你批准",
+    "ask": "❓ 等你回答",
+    "waiting": "🟡 等你",
+    "failed": "⚠️ 出错了",
+    "running": "🟢 在跑",
+    "unseen": "✅ 跑完了，你还没看",
+    **{k: v for k, v in STATUS_LABELS.items() if k not in ("running", "waiting")},
+}
+# 排序：数字小的排前面。等你批准 > 等你回答 > 出错了 > 在跑 > 跑完没看 > 闲着（tasks-r32 第 4 条）。
+# 读不出在问什么的「等你」跟「等你回答」并列（都是要他现在就管的）。
+DISPLAY_RANK = {"approve": 0, "ask": 1, "waiting": 1, "failed": 2, "running": 3, "unseen": 4,
+                "idle": 5, "stopped": 6, "unknown": 7}
+# 要他管的（组要展开、标题要点数）
+NEEDS_YOU = ("approve", "ask", "waiting", "failed", "running", "unseen")
+# 点数时的说法（标题 / 折叠面板 / 「还有 N 个」按钮共用一份，别各写各的）
+_COUNT_WORDS = {
+    "approve": "个等你批准",
+    "ask": "个等你回答",
+    "waiting": "个在等你",
+    "failed": "个出错了",
+    "running": "个在跑",
+    "unseen": "个跑完了你还没看",
+}
+# 「还有 N 个」按钮上一行只有 48 格 ⇒ 用短说法（只这一处用）
+_SHORT_WORDS = dict(_COUNT_WORDS, unseen="个跑完没看")
+
+
+# 「出错了」只标最近这么久之内的那一轮。本机实测 Claude 历史里有几天前测坏 key 留下的
+# `authentication_failed` 收尾 —— 那种会话他早不管了，天天挂一个 ⚠️ 等于狼来了。
+FAILED_FRESH_SEC = 24 * 3600
+
+
+def display_status(sess: Session, seen_at: Optional[float] = None, now: Optional[float] = None) -> str:
+    """一个会话在卡片上算哪种状态（`DISPLAY_LABELS` 的键）。
+
+    `seen_at`：上一次给**这个人**发总览卡的时间（epoch 秒）；None ⇒ 不知道 ⇒ 不判「跑完没看」。
+    """
+    status = sess.status
+    if status == "waiting":
+        pending = getattr(sess, "pending", None)
+        if pending is None:
+            return "waiting"
+        if pending.tool == "AskUserQuestion":
+            return "ask"
+        return "approve" if pending.tool else "waiting"
+    if status != "idle":
+        return status if status in DISPLAY_LABELS else "unknown"
+    turn = getattr(sess, "last_turn", "")
+    turn_at = getattr(sess, "last_turn_at", 0) or 0
+    if turn == "failed":
+        now = time.time() if now is None else now
+        return "failed" if now - turn_at < FAILED_FRESH_SEC else "idle"
+    if turn == "done" and seen_at and turn_at > float(seen_at):
+        return "unseen"
+    return "idle"
+
+
+def display_label(sess: Session, seen_at: Optional[float] = None) -> str:
+    return DISPLAY_LABELS[display_status(sess, seen_at)]
+
+
+def sort_for_overview(sessions: list, seen_at: Optional[float] = None) -> list:
+    """按 `DISPLAY_RANK` 排；同一档里保持原来的先后（扫描已经按活的在前、最近的在前排过）。"""
+    return sorted(sessions or (), key=lambda s: DISPLAY_RANK.get(display_status(s, seen_at), 9))
+
+
+def _count_parts(sessions: list, seen_at: Optional[float], kinds=NEEDS_YOU, bold: bool = False,
+                 with_dot: bool = True, words: Optional[dict] = None) -> list:
+    """「🟡 2 个等你批准」「⚠️ 1 个出错了」…… 按优先级排，没有的不写。"""
+    counts: dict = {}
+    for sess in sessions or ():
+        kind = display_status(sess, seen_at)
+        counts[kind] = counts.get(kind, 0) + 1
+    out = []
+    for kind in sorted(kinds, key=lambda k: DISPLAY_RANK[k]):
+        n = counts.get(kind, 0)
+        if not n:
+            continue
+        text = f"{n} {(words or _COUNT_WORDS)[kind]}"
+        if bold:
+            text = f"**{text}**"
+        if with_dot:
+            text = DISPLAY_LABELS[kind].split(" ", 1)[0] + " " + text
+        out.append(text)
+    return out
+
+
+class OverviewSeen:
+    """「上一次给这个人发总览卡是什么时候」—— 只记在内存（tasks-r32：记不到就不显示，不要猜）。
+
+    桥重启就清空 ⇒ 重启后第一张总览不会有「跑完没看」，第二张起才有。
+    `viewer` 用发卡的那个 chat_id（单聊就是这个人）。记的是**那次扫描的时间**（`Overview.at`）：
+    扫描之后才结束的那一轮，那张卡上本来就没有它。
+
+    用法（app.py 那边）：
+        seen = OVERVIEW_SEEN.before(chat_id, view.at)        # 造卡前：这张卡之前的那一次
+        card = build_overview_card(view, ..., seen_at=seen)
+        …发出去之后… OVERVIEW_SEEN.mark(chat_id, view.at)
+    「看全部」原地换卡用的是同一次扫描（`control.last`）⇒ `before(chat_id, last.at)` 拿到的还是
+    造原卡时那个值，换出来的卡上「跑完没看」不会因为刚发过一次就全没了。
+    """
+
+    KEEP = 4  # 每个人留最近几次；「看全部」只会回头找上一张
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._marks: dict = {}
+
+    def before(self, viewer: str, at: Any = None) -> Optional[float]:
+        """严格早于 `at` 的最近一次发卡时间；`at` 不给 = 最近一次。一次都没记过 ⇒ None。"""
+        if not viewer:
+            return None
+        try:
+            limit = float(at) if at else float("inf")
+        except (TypeError, ValueError):
+            limit = float("inf")
+        with self._lock:
+            marks = [m for m in self._marks.get(str(viewer), ()) if m < limit]
+        return max(marks) if marks else None
+
+    def mark(self, viewer: str, at: Any) -> None:
+        try:
+            at = float(at or 0)
+        except (TypeError, ValueError):
+            return
+        if not viewer or not at > 0:
+            return
+        with self._lock:
+            marks = sorted(set(self._marks.get(str(viewer), ())) | {at})[-self.KEEP:]
+            self._marks[str(viewer)] = marks
+
+
+OVERVIEW_SEEN = OverviewSeen()
+# 桥只给主人一个人发总览（`owner_open_ids`）⇒ 不传 `viewer` 时都记在这一个键上
+OWNER_VIEWER = "owner"
+_AUTO = object()
 SURFACE_LABELS = {"cli": "终端", "app": "App", "bridge": "飞书"}
 ROLE_LABELS = {"user": "🙋 你", "assistant": "🤖 它"}
 
@@ -62,11 +220,22 @@ def resolve_fleet_click(value: Any, known: Iterable[tuple]) -> Optional[dict]:
     """
     if not isinstance(value, dict) or value.get("act") != "fleet":
         return None
-    if set(value) - {"act", "op", "tool", "id"}:
-        return None
     op = value.get("op")
+    allowed = {"act", "op", "tool", "id"} | ({"q"} if op == "snooze" else set())
+    if set(value) - allowed:
+        return None
     if op not in OPS:
         return None
+    sig = value.get("q", "")
+    if op == "snooze" and not (isinstance(sig, str) and len(sig) <= _SIG_MAX
+                               and all(c in "0123456789abcdef" for c in sig)):
+        return None
+    if op == "more":
+        # 「展开这一组」：只认 act/op/tool 三个键、tool 必须是已知的那几家；带 id 的一律不认
+        tool = value.get("tool")
+        if set(value) != {"act", "op", "tool"} or not isinstance(tool, str) or tool not in TOOLS:
+            return None
+        return {"op": "more", "tool": tool, "id": ""}
     if op == "refresh" and "id" not in value and "tool" not in value:
         return {"op": "refresh", "tool": "", "id": ""}
     tool, sid = value.get("tool"), value.get("id")
@@ -76,6 +245,8 @@ def resolve_fleet_click(value: Any, known: Iterable[tuple]) -> Optional[dict]:
         return None
     if (tool, sid) not in set(known):
         return None
+    if op == "snooze":
+        return {"op": op, "tool": tool, "id": sid, "q": sig}
     return {"op": op, "tool": tool, "id": sid}
 
 
@@ -266,9 +437,9 @@ def clip_cells(text: Any, cells: int) -> str:
 # ---------- 总览的行和分组标题 ----------
 
 
-def status_dot(sess: Session) -> str:
+def status_dot(sess: Session, seen_at: Optional[float] = None) -> str:
     """状态只留那个点（「在跑 / 闲着」那两个字挪到卡片底下的图例里，一行省 6 格）。"""
-    return STATUS_LABELS.get(sess.status, sess.status).split(" ", 1)[0]
+    return display_label(sess, seen_at).split(" ", 1)[0]
 
 
 def session_name(sess: Session, cells: int = OVERVIEW_ROW_CELLS) -> str:
@@ -284,7 +455,7 @@ def session_name(sess: Session, cells: int = OVERVIEW_ROW_CELLS) -> str:
 
 
 def _row_parts(sess: Session, shared_project: str, dup_tag: str,
-               cells: int = OVERVIEW_ROW_CELLS) -> tuple:
+               cells: int = OVERVIEW_ROW_CELLS, seen_at: Optional[float] = None) -> tuple:
     """(状态点, 名字, 后面那几段)。只给卡片那种样子用。
 
     格子怎么分（🔴 **名字优先**，2026-11-05 体验审查改的）：
@@ -293,7 +464,7 @@ def _row_parts(sess: Session, shared_project: str, dup_tag: str,
     3. 剩下的才归项目名；不够放 `不知道哪个项目` 那么宽也没关系，它只是个提示
     4. 项目名剪完还有富余 ⇒ 全给名字（短项目名的行名字能更长）
     """
-    head = status_dot(sess)
+    head = status_dot(sess, seen_at)
     project = project_of(sess.cwd)
     show_project = bool(project and project != shared_project)
     if show_project and not sess.cwd:
@@ -323,13 +494,13 @@ def _row_parts(sess: Session, shared_project: str, dup_tag: str,
     return head, name, tail + fixed
 
 
-def _standalone_label(sess: Session, cells: int) -> str:
+def _standalone_label(sess: Session, cells: int, seen_at: Optional[float] = None) -> str:
     """一行自己说清楚：「工具 · 项目 · 状态 · 多久前｜标题」（文字兜底用，没有分组标题和图例兜着）。
 
     🔴 状态写成字（「闲着」）不写成点：纯文字消息底下没有图例，光一个 `⚪` 认不出来。
     """
     bits = [TOOL_LABELS.get(sess.tool, sess.tool), project_of(sess.cwd),
-            STATUS_LABELS.get(sess.status, sess.status).split(" ", 1)[-1]]
+            display_label(sess, seen_at).split(" ", 1)[-1]]
     if sess.age_text:
         bits.append(sess.age_text)
     label = SEP.join(bits)
@@ -339,7 +510,7 @@ def _standalone_label(sess: Session, cells: int) -> str:
 
 
 def row_label(sess: Session, *, shared_project: str = "", with_tool: bool = True,
-              dup_tag: str = "", cells: int = 0) -> str:
+              dup_tag: str = "", cells: int = 0, seen_at: Optional[float] = None) -> str:
     """总览里的一行。
 
     `with_tool=False` + `shared_project`：工具名和项目已经在分组标题上了 ⇒ 行里只留
@@ -353,22 +524,22 @@ def row_label(sess: Session, *, shared_project: str = "", with_tool: bool = True
     `cells`：这一行最多几格；不传按上面两种样子各自的默认（卡片 48，文字兜底 72）。
     """
     if with_tool:
-        return _standalone_label(sess, cells or FALLBACK_ROW_CELLS)
+        return _standalone_label(sess, cells or FALLBACK_ROW_CELLS, seen_at)
     cells = cells or OVERVIEW_ROW_CELLS
-    head, name, tail = _row_parts(sess, shared_project, dup_tag, cells)
+    head, name, tail = _row_parts(sess, shared_project, dup_tag, cells, seen_at)
     label = SEP.join([f"{head} {name}"] + tail)
     # 兜底再剪一刀：名字有下限 ⇒ 项目名 / 多久前特别长时整行可能超，超了宁可丢尾巴
     return clip_cells(label, cells)
 
 
-def row_names(sessions: list, shared_project: str = "") -> list:
+def row_names(sessions: list, shared_project: str = "", seen_at: Optional[float] = None) -> list:
     """这几行**真正会显示出来**的名字（已按行宽截断）。给撞车检测用。
 
     🔴 必须用截断后的名字去比：`proxy-ip-binding-admin` 和 `proxy-ip-binding-dev`
     原文不一样，截到一行里都是 `proxy-ip-binding-…`，比原文就看不出撞车。
     比的是**没补短 id 时**的名字：补了 id 名字会再短一点，但每行尾巴已经不一样了。
     """
-    return [_row_parts(s, shared_project, "")[1] for s in sessions or ()]
+    return [_row_parts(s, shared_project, "", seen_at=seen_at)[1] for s in sessions or ()]
 
 
 def dup_tags(sessions: list, names: list) -> list:
@@ -424,56 +595,73 @@ def _live(sess: Session) -> bool:
     return bool(sess.pids) or sess.status in ("running", "waiting")
 
 
-def overview_headline(sessions: list) -> str:
+# 标题里加粗的那几种：要他**现在**就动手的
+_URGENT = ("approve", "ask", "waiting")
+
+
+def overview_headline(sessions: list, seen_at: Optional[float] = None) -> str:
     """总览第一句。🔴 先说「几个在等你」—— 那是主人掏出手机最想知道的。
 
     原来是「电脑上现在开着 **19** 个会话」：分不出几个在干活、几个卡住、几个在等他点头
     （2026-11-06 UX 侦察）。手机上几秒钟扫一眼，要的是**要不要我管**。
-    只数开着的；闲着的不进标题（那只是噪音）。
+
+    第 32 轮：按 `DISPLAY_RANK` 点数（等你批准 > 等你回答 > 出错了 > 在跑 > 跑完没看），
+    要他现在动手的那几种加粗。「出错了」「跑完没看」可能是没开着的历史会话，照样点数 ——
+    那正是他要知道的。剩下开着但闲着的写「N 个开着闲着」；其余闲着的不进标题（噪音）。
     """
-    waiting = sum(1 for s in sessions if s.status == "waiting")
-    running = sum(1 for s in sessions if s.status == "running")
-    live = sum(1 for s in sessions if _live(s))
-    if not live:
+    sessions = list(sessions or ())
+    kinds = [display_status(s, seen_at) for s in sessions]
+    urgent = _count_parts([s for s, k in zip(sessions, kinds) if k in _URGENT], seen_at, bold=True)
+    rest_parts = _count_parts([s for s, k in zip(sessions, kinds) if k not in _URGENT], seen_at)
+    idle_live = sum(1 for s, k in zip(sessions, kinds) if k not in NEEDS_YOU and _live(s))
+    parts = urgent + rest_parts
+    if idle_live:
+        parts.append(f"{idle_live} 个开着闲着")
+    if not parts:
         return "电脑上现在没有开着的会话。"
-    parts = []
-    if waiting:
-        parts.append(f"🟡 **{waiting} 个在等你**")
-    if running:
-        parts.append(f"🟢 {running} 个在跑")
-    rest = live - waiting - running
-    if rest > 0:
-        parts.append(f"{rest} 个开着闲着")
     return "，".join(parts) + "。"
 
 
-def hidden_rows_note(hidden: list) -> str:
+def overview_fallback_lines(sessions: list, clean=None, seen_at: Optional[float] = None,
+                            limit: int = 12) -> list:
+    """卡片发不出去时那条纯文字消息的行（给 app.py 的 `_fleet_overview` 用）。
+
+    和卡片同一套：按 `DISPLAY_RANK` 排、状态**写成字**（`row_label` 的独立样子，底下没有图例）、
+    等你的紧跟一句它在问什么（`overview_pending_line`）。标题先整段脱敏再截断（`_cleaned`）。
+    """
+    clean = clean or (lambda s: s)
+    lines: list = []
+    for sess in sort_for_overview(sessions, seen_at)[:limit]:
+        cleaned = _cleaned(sess, clean)
+        lines.append(row_label(cleaned, seen_at=seen_at))
+        asking = overview_pending_line(cleaned, clean)
+        if asking:
+            lines.append("  " + asking)
+    return lines
+
+
+def _hidden_extra(hidden: list, seen_at: Optional[float], short: bool = False) -> list:
+    """藏起来的那几个里要他管的：「2 个等你批准」「1 个出错了」…（不带点，按优先级）。"""
+    return _count_parts(hidden, seen_at, with_dot=False, words=_SHORT_WORDS if short else None)
+
+
+def hidden_rows_note(hidden: list, seen_at: Optional[float] = None) -> str:
     """「还有 N 个没列出来」—— 🔴 要照实说里面有什么，别一律叫「更早的」。
 
     原来写死「还有 11 个更早的没列出来」，实测那 11 个里有 2 个在跑、2 个在等你
     （2026-11-06 UX 侦察）。现在「等你」已经排到最前，一般不会被藏；但组里「等你」多于
     一屏能列的行数时，照样可能有藏着的 —— 那时这一句必须点名。
     """
-    waiting = sum(1 for s in hidden if s.status == "waiting")
-    running = sum(1 for s in hidden if s.status == "running")
-    extra = []
-    if waiting:
-        extra.append(f"其中 {waiting} 个在等你")
-    if running:
-        extra.append(f"{running} 个在跑")
+    extra = _hidden_extra(hidden, seen_at)
     if extra:
-        return f"⚠️ 还有 {len(hidden)} 个没列出来（{'，'.join(extra)}），在电脑上看"
+        return f"⚠️ 还有 {len(hidden)} 个没列出来（其中 {'，'.join(extra)}），在电脑上看"
     return f"还有 {len(hidden)} 个更早的没列出来"
 
 
-def status_legend(sessions: list) -> str:
-    """卡片底下那行图例：只写**这张卡上出现过的**状态，没出现的不占地方。"""
-    seen = []
-    for sess in sessions:
-        text = STATUS_LABELS.get(sess.status, sess.status)
-        if text not in seen:
-            seen.append(text)
-    return SEP.join(seen)
+def status_legend(sessions: list, seen_at: Optional[float] = None) -> str:
+    """卡片底下那行图例：只写**这张卡上出现过的**状态，没出现的不占地方；按优先级排。"""
+    kinds = {display_status(s, seen_at) for s in sessions or ()}
+    return SEP.join(DISPLAY_LABELS[k] for k in sorted(kinds, key=lambda k: DISPLAY_RANK.get(k, 9)))
 
 
 def _safe_clean(clean, text: str) -> str:
@@ -553,10 +741,34 @@ def _card(title: str, template: str, elements: list) -> str:
     )
 
 
+# 不算组件的那几种 `tag`：按钮 / 标题里的文字对象、图标 —— 它们是组件的属性，不是组件
+_NOT_COMPONENTS = {"plain_text", "lark_md", "standard_icon", "custom_icon"}
+
+
+def _components(node: Any) -> int:
+    """一张卡里有几个组件（带 `tag` 的 dict，文字对象和图标不算；面板标题那个 markdown 算上，宁多勿少）。"""
+    if isinstance(node, dict):
+        mine = 1 if "tag" in node and node.get("tag") not in _NOT_COMPONENTS else 0
+        return mine + sum(_components(v) for v in node.values())
+    if isinstance(node, list):
+        return sum(_components(v) for v in node)
+    return 0
+
+
+def _fits(blob: str) -> bool:
+    """放得下 = 不超 20KB，而且组件数不超飞书的上限（「全部列出来」那一组几十行时才会碰到）。"""
+    if len(blob.encode("utf-8")) > MAX_CARD_BYTES:
+        return False
+    try:
+        return _components(json.loads(blob)) <= MAX_CARD_COMPONENTS
+    except ValueError:
+        return False
+
+
 def _fit(build, rows: int) -> str:
-    """超了 20KB 就少放几行，直到放得下。"""
+    """超了 20KB（或组件太多）就少放几行，直到放得下。"""
     blob = build(rows)
-    while len(blob.encode("utf-8")) > MAX_CARD_BYTES and rows > 1:
+    while not _fits(blob) and rows > 1:
         rows -= 1
         blob = build(rows)
     return blob
@@ -572,40 +784,181 @@ def _cleaned(sess: Session, clean) -> Session:
         return dataclasses.replace(sess, title="")
 
 
-def build_overview_card(view: Overview, redact=None) -> str:
+def _busy(sess: Session, seen_at: Optional[float] = None) -> bool:
+    """这一组要不要默认展开：等你批准 / 等你回答 / 出错了 / 在跑 / 跑完没看 ⇒ 展开；
+    闲着 / 挂起 / 看不出 ⇒ 收起（第 28 轮用户原话；第 32 轮加了后三种）。"""
+    return display_status(sess, seen_at) in NEEDS_YOU
+
+
+_ALL_SAME = {"idle": "都闲着", "stopped": "都挂起了", "unknown": "都看不出在干什么"}
+
+
+def group_summary(items: list, seen_at: Optional[float] = None) -> str:
+    """折叠面板标题末尾那一截：收起时一眼看出这组要不要管。
+
+    有要他管的 ⇒ 照实点数（按 `DISPLAY_RANK`，同 `overview_headline`）；
+    一个都没有 ⇒「都闲着」「都挂起了」，混着几种 ⇒「没有在跑的」。数的是**整组**，不只是列出来的那几行。
+    """
+    parts = _count_parts(items, seen_at)
+    if parts:
+        return "，".join(parts)
+    kinds = {display_status(s, seen_at) for s in items}
+    if len(kinds) == 1:
+        return _ALL_SAME.get(next(iter(kinds)), "没有在跑的")
+    return "没有在跑的"
+
+
+def panel_title(tool: str, items: list, shown: list, clean=None, seen_at: Optional[float] = None) -> str:
+    """例「🤖 **Claude** · carher-admin（6 个）· 🟢 1 个在跑」。前半截就是原来的 `group_heading`。"""
+    return f"{group_heading(tool, items, shown, clean)}· {group_summary(items, seen_at)}"
+
+
+def more_button_label(hidden: list, seen_at: Optional[float] = None) -> str:
+    """「还有 N 个没列出来」那个按钮（第 28 轮：原来是一句死字，点了没用）。藏着要他管的照样点名。"""
+    extra = _hidden_extra(hidden, seen_at, short=True)
+    # 🔴 按钮上的字手机竖屏一行放得下（≤ 48 格）：藏着要他管的那种写短一点（「其中」「没列出来」省掉），
+    # 还超就从优先级低的那头一截截丢 —— 「点开看全部」不能被剪掉，那是这个按钮是干什么的。
+    if extra:
+        for n in range(len(extra), 0, -1):
+            bits = extra[:n]
+            label = f"⚠️ 还有 {len(hidden)} 个（{'，'.join(bits)}），点开看全部"
+            if display_width(label) <= OVERVIEW_ROW_CELLS:
+                return label
+        return f"⚠️ 还有 {len(hidden)} 个，点开看全部"
+    return f"还有 {len(hidden)} 个更早的没列出来，点开看全部"
+
+
+def overflow_note(hidden: list, seen_at: Optional[float] = None) -> str:
+    """点了「看全部」之后**还是**放不下的那几个（卡片 20KB / 200 个组件）。这里只能叫他回电脑上看。"""
+    extra = _hidden_extra(hidden, seen_at)
+    what = f"（其中 {'，'.join(extra)}）" if extra else ""
+    return f"{'⚠️ ' if extra else ''}还有 {len(hidden)} 个这张卡放不下{what}，在电脑上看"
+
+
+def _panel(title: str, expanded: bool, elements: list) -> dict:
+    """折叠面板：客户端本地展开 / 收起，不走回调（字段照主会话 2026-11-08 真发通过的那张）。"""
+    return {
+        "tag": "collapsible_panel",
+        "expanded": bool(expanded),
+        "header": {
+            "title": {"tag": "markdown", "content": title},
+            "width": "fill",
+            "vertical_align": "center",
+            "icon": dict(PANEL_ICON),
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "vertical_spacing": "8px",
+        "elements": elements,
+    }
+
+
+def build_overview_card(view: Overview, redact=None, expand: str = "",
+                        seen_at: Any = _AUTO, viewer: str = OWNER_VIEWER, settled: Any = _AUTO) -> str:
     """总览：按工具分组，一行一个会话（点一行进详情），最后是读失败的说明 + 刷新。
 
     用户原话「文字太多 手机上显示不全」⇒ 一组里**一样的那几样**（工具名、项目）在
     分组标题上说一次，行里只留状态点 + 会话名 + 多久前（`row_label` / `group_heading`）。
-    """
-    clean = redact or (lambda s: s)
-    groups = view.by_tool()
 
-    def build(rows: int) -> str:
+    第 28 轮：每组是一个**折叠面板**。有在跑 / 等你的 ⇒ 默认展开；全闲着 ⇒ 收起，标题上写清
+    「（5 个）· 都闲着」。每组最多列 `MAX_ROWS_PER_TOOL` 行，多出来的是一个「点开看全部」按钮
+    （op=more）⇒ 回调原地换成 `expand=<那个工具>` 的这张卡：那一组展开、全列出来，别的组照旧。
+    全列出来超 20KB / 200 个组件时少放几行，最后一句写清「还有 N 个放不下，在电脑上看」。
+
+    第 32 轮：状态按 `display_status` 分得更细（等你批准 / 等你回答 / 出错了 / 跑完没看），
+    每组按 `DISPLAY_RANK` 重排。`seen_at` = 上一次给这个人发总览卡的时间（`OVERVIEW_SEEN.before`）；
+    不传 ⇒ 自己查 `OVERVIEW_SEEN`（`viewer` 名下、早于这次扫描的那一次），造完普通卡就把这次记上；
+    「看全部」（`expand`）用的是同一次扫描，只查不记。显式传 None ⇒ 不判「跑完没看」，也不记。
+
+    🔴 记的是「造好了这张卡」不是「飞书说发到了」：卡片发不出去时 app.py 会退成文字，
+    那条文字里同样是这些会话，他照样看到了。
+
+    第 33 轮：主人点过「✓ 结束」的会话不列（`settled`，默认 `fleet.settled.active()`；显式 None ⇒ 不藏）。
+    有新动静的自己回来（`SettledStore.split` 顺手删掉它的记录）。底部写一句「已结束 N 个」。
+    """
+    record = seen_at is _AUTO and not expand
+    if seen_at is _AUTO:
+        seen_at = OVERVIEW_SEEN.before(viewer, getattr(view, "at", 0) or None)
+    view, gone = _drop_settled(view, settled)
+    try:
+        return _build_overview_card(view, redact, expand, seen_at, gone)
+    finally:
+        if record:
+            OVERVIEW_SEEN.mark(viewer, getattr(view, "at", 0))
+
+
+SETTLED_NOTE = "✓ 已结束 {n} 个（有新动静会自己回来）"
+
+
+def _drop_settled(view: Overview, settled: Any) -> tuple:
+    """(去掉已结束的那份 Overview, 藏了几个)。记录读不出 / 出任何错 ⇒ 原样、0 —— 总览绝不能因为它出不来。"""
+    import dataclasses
+
+    if settled is None:
+        return view, 0
+    try:
+        if settled is _AUTO:
+            from .settled import active
+
+            settled = active()
+        shown, gone = settled.split(list(view.sessions or ()))
+        if not gone:
+            return view, 0
+        return dataclasses.replace(view, sessions=shown), gone
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("feishu-bridge.fleet").exception("读「已结束」记录失败，这次全列出来")
+        return view, 0
+
+
+def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[float],
+                         gone: int = 0) -> str:
+    clean = redact or (lambda s: s)
+    groups = {tool: sort_for_overview(items, seen_at) for tool, items in view.by_tool().items()}
+    expand = expand if expand in TOOLS and groups.get(expand) else ""
+
+    def build(rows: int, wide: int) -> str:
+        """`rows`：普通组列几行；`wide`：被展开的那一组列几行。"""
         elements: list = []
-        elements.append(_md(overview_headline(view.sessions) + "点一行看最近几条、接着聊或停下。"))
-        if not view.sessions:
+        elements.append(_md(overview_headline(view.sessions, seen_at) + "点一行看最近几条、接着聊或停下。"))
+        if not view.sessions and not gone:
             elements.append(_md("一个会话都没读到。", small=True))
         for tool in TOOLS:
             items = groups.get(tool) or []
             if not items:
                 continue
-            shown = [_cleaned(s, clean) for s in items[:rows]]
+            opened = tool == expand
+            cap = wide if opened else rows
+            shown = [_cleaned(s, clean) for s in items[:cap]]
             main = main_project(shown)
-            tags = dup_tags(shown, row_names(shown, main))
-            elements.append({"tag": "hr"})
-            elements.append(_md(group_heading(tool, items, shown, clean)))
+            tags = dup_tags(shown, row_names(shown, main, seen_at))
+            inner: list = []
             for sess, tag in zip(shown, tags):
-                label = row_label(sess, shared_project=main, with_tool=False, dup_tag=tag)
+                label = row_label(sess, shared_project=main, with_tool=False, dup_tag=tag, seen_at=seen_at)
                 # 🔴 只有「等你」的那几行用醒目的主按钮。原来是「有进程或在跑」就主按钮
                 # ⇒ 终端里闲着的会话也是蓝的，一屏全蓝，等于没有重点（2026-11-06 UX 侦察）。
-                elements.append(_button(label, fleet_value("open", tool, sess.id),
-                                        primary=sess.status == "waiting"))
-            if len(items) > rows:
-                elements.append(_md(hidden_rows_note(items[rows:]), small=True))
-        legend = status_legend(view.sessions)
+                inner.append(_button(label, fleet_value("open", tool, sess.id),
+                                     primary=display_status(sess, seen_at) in _URGENT))
+                # 「等你」⇒ 紧跟一句它在问什么，省掉「点进详情才看得见」那一下（第 17 轮）。
+                # 🔴 必须紧跟在**它自己**那个按钮后面：上下两行都在等你时才分得清谁问的。
+                asked = overview_pending_line(sess, clean)
+                if asked:
+                    inner.append(_md(asked, small=True))
+            hidden = items[cap:]
+            if hidden and opened:
+                # 已经是「看全部」了还放不下 ⇒ 再给一个按钮也只是同一张卡，照实叫他回电脑上看
+                inner.append(_md(overflow_note(hidden, seen_at), small=True))
+            elif hidden:
+                inner.append(_button(more_button_label(hidden, seen_at), fleet_value("more", tool)))
+            # 🔴 展开与否看**整组**（不只是列出来的那几行）：藏着的那几个要他管，也得展开让他看见那个按钮
+            expanded = opened or any(_busy(s, seen_at) for s in items)
+            elements.append(_panel(panel_title(tool, items, shown, clean, seen_at), expanded, inner))
+        legend = status_legend(view.sessions, seen_at)
         if legend:
             elements.append(_md(legend, small=True))
+        if gone:
+            elements.append(_md(SETTLED_NOTE.format(n=gone), small=True))
         if view.notes:
             elements.append({"tag": "hr"})
             elements.append(_md("\n".join(
@@ -614,7 +967,24 @@ def build_overview_card(view: Overview, redact=None) -> str:
         elements.append(_button("🔄 刷新", fleet_value("refresh")))
         return _card("🖥 电脑上的会话", "blue", elements)
 
-    return _fit(build, MAX_ROWS_PER_TOOL)
+    if not expand:
+        return _fit(lambda rows: build(rows, rows), MAX_ROWS_PER_TOOL)
+    # 展开的那一组：别的组照普通卡的样子放（普通卡放得下几行就几行），剩下的地方全给这一组。
+    base = MAX_ROWS_PER_TOOL
+    while base > 1 and not _fits(build(base, base)):
+        base -= 1
+    if not _fits(build(base, base)):
+        return build(base, base)  # 一行都放不下（只有极端的超长说明才会）⇒ 和普通卡同样的结局
+    total = len(groups.get(expand) or [])
+    # 二分：这一组最多能放几行（行数越多越大，单调）
+    lo, hi = min(base, total), total
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits(build(base, mid)):
+            lo = mid
+        else:
+            hi = mid - 1
+    return build(base, lo)
 
 
 # ---------- 「等你」时它在问什么（第 8 轮）----------
@@ -631,6 +1001,12 @@ _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
 # 🔴 第 2 步（手机上点选项回答）**不做**：relay 发的是会话间消息，能不能当 AskUserQuestion 的答案
 # 没验过、很可能不能。所以这里不挂按钮，明说要回电脑上点 —— 别给一个点了没用的按钮。
 PENDING_FOOT = "要在电脑上点：手机上还答不了这一步。"
+
+# 总览里「它在问什么」那一句的预算。比详情卡**窄得多**：总览一屏要放 8 行 × 3 家，
+# 这一句只是让他在列表上就看出「是不是我现在就得管」，看全文点进去就是（详情卡那段不变）。
+OVERVIEW_PENDING_CHARS = 48
+OVERVIEW_PENDING_OPTIONS = 4
+OVERVIEW_OPTION_CHARS = 10
 
 
 def _pending_tool_label(name: str) -> str:
@@ -688,6 +1064,43 @@ def pending_elements(sess: Session, clean) -> list:
         return []
 
 
+def overview_pending_line(sess: Session, clean) -> str:
+    """总览里紧跟在那一行底下的一句「它在问你…」；没有 / 读不出来 ⇒ 空串。
+
+    第 17 轮（`docs/iteration/r14-redundant-taps.md` 第 5 条）：原来「等你」在列表上只有一个
+    🟡 点，**它在问什么要点进详情才看得到**（看一眼要 1 下）。同一段话点一下就出现在同一张
+    卡的下一层 ⇒ 隐私上没有差别（第 7 轮「卡上不放内容」的理由是隐私 + 卡片大小），
+    而大小这边自己有上限（上面那三个常量 + `_fit` 的收缩循环照旧兜底）。
+
+    🔴 顺序和详情卡一样：**先整段脱敏、再截断、最后转义**（`_clip`）。
+    🔴 出任何错都只是**这一句不显示**（同 `pending_elements`）—— 总览绝不能因为它发不出去。
+    """
+    pending = getattr(sess, "pending", None)
+    if sess.status != "waiting" or pending is None:
+        return ""
+    try:
+        questions = tuple(pending.questions or ())
+        if questions:
+            first = questions[0]
+            text = _clip(clean, first.question, OVERVIEW_PENDING_CHARS)
+            if not text:
+                return ""
+            opts = [_clip(clean, label, OVERVIEW_OPTION_CHARS)
+                    for label, _desc in tuple(first.options or ())[:OVERVIEW_PENDING_OPTIONS]]
+            line = f"❓ 它在问你：{text}"
+            if opts:
+                line += "　" + " ".join(f"{_CIRCLED[i]} {o}" for i, o in enumerate(opts) if o)
+            more = len(questions) - 1
+            return line + (f"（还有 {more} 道题）" if more > 0 else "")
+        what = _pending_tool_label(pending.tool)
+        summary = short_title(clean(pending.summary or ""), OVERVIEW_PENDING_CHARS)
+        if summary:
+            what += " " + escape_card(inline_code(summary), keep_format=True)
+        return f"⏸ 它在等你确认：{what}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def build_detail_card(sess: Session, messages: list, redact=None, note: str = "",
                       talking: bool = False, group_link: str = "") -> str:
     """详情：最近 4 条 + [接着聊]（`can_send` 或 `can_relay`）[停下]（can_stop）[刷新]。
@@ -711,7 +1124,8 @@ def build_detail_card(sess: Session, messages: list, redact=None, note: str = ""
 
     def build(chars: int) -> str:
         where = f"{TOOL_LABELS.get(sess.tool, sess.tool)} · {SURFACE_LABELS.get(sess.surface, sess.surface)}"
-        where += f" · {inline_code(project_of(sess.cwd))} · {STATUS_LABELS.get(sess.status, sess.status)}"
+        # 第 32 轮：详情卡也用细分后的说法（等你批准 / 等你回答 / 出错了）；不判「跑完没看」——点进来就是在看了
+        where += f" · {inline_code(project_of(sess.cwd))} · {display_label(sess)}"
         if sess.age_text:
             where += f" · {sess.age_text}"
         if sess.id:
@@ -755,6 +1169,9 @@ def build_detail_card(sess: Session, messages: list, redact=None, note: str = ""
         if sess.can_stop:
             buttons.append(_button("⏹ 停下", fleet_value("stop", sess.tool, sess.id)))
         buttons.append(_button("🔄 刷新", fleet_value("refresh", sess.tool, sess.id)))
+        if _can_settle(sess):
+            # 第 33 轮：「这个我不管了」⇒ 总览不再列它。在跑 / 等你的不给（`settled.can_settle`）
+            buttons.append(_button(SETTLE_LABEL, fleet_value("settle", sess.tool, sess.id)))
         for i in range(0, len(buttons), 2):
             elements.append(_row(buttons[i:i + 2]))
         why = []
@@ -772,6 +1189,19 @@ def build_detail_card(sess: Session, messages: list, redact=None, note: str = ""
             # 同 note：拒绝理由也可能是拼出来的长串（见上面红字），一条一条剪
             elements.append(_md("\n".join(
                 escape_card(short_title(w, NOTE_CHARS), keep_format=True) for w in why), small=True))
+            # 第 17 轮：拒绝理由里**叫他去点哪个按钮**，就把那个按钮放在这张卡上。
+            # 实测（`docs/iteration/r14-redundant-taps.md` 第 6 条 + 本轮 tests/test_r17_taps.py）：
+            # 「这个项目不在手机能用的目录里…点「📂 换项目」」—— 而「换项目」不在常驻菜单里
+            # （`botmenu.MENU_TREE` 把它挪进了「全部按钮」）⇒ 照着做要 ⚡常用 → 全部按钮 →
+            # 换项目，**3 下**。放在这里就是 1 下。
+            #
+            # 🔴 只给这一个、只按**这张卡上真写了那句话**判，不按理由的来源判（三家 adapter
+            # 各有一句同义的，字面都带「换项目」）。别的「叫你去点」一律不补：
+            # - 「🔑 权限」本来就是常驻菜单一级节点（1 下），放了省不下
+            # - 「全授权」要走它自己的二次确认（`menu.build_confirm_loosen_card`），不许抄近道
+            # - 「回到那个对话点「⏹ 停下」」说的是**另一个聊天**里的停下，补了会停错东西
+            if any("换项目" in w for w in why):
+                elements.extend(button_rows([do_button("dirs")]))
         # 原来这里是一行「退出对话模式发 /cancel；发「会话」回到总览」⇒ 换成按钮（actions.py）
         elements.extend(detail_nav_rows(talking))
         return _card("🖥 " + short_title(f"{TOOL_LABELS.get(sess.tool, sess.tool)} 会话", 30), "indigo", elements)
@@ -782,3 +1212,50 @@ def build_detail_card(sess: Session, messages: list, redact=None, note: str = ""
         chars //= 2
         blob = build(chars)
     return blob
+
+
+# ---------- 结束（第 33 轮，`fleet/settled.py`）----------
+
+SETTLE_LABEL = "✓ 结束"
+
+
+def _can_settle(sess: Session) -> bool:
+    from .settled import can_settle
+
+    return can_settle(sess)[0]
+
+
+def build_settled_card(sess_or_target: Any, redact=None) -> dict:
+    """点完「✓ 结束」原地换成的卡（dict，直接放进回调响应）：「✓ 已结束 · 撤销」。
+
+    🔴 写清「只记在手机这边」：电脑上那个会话一点没动，别让他以为删掉了。
+    """
+    clean = redact or (lambda s: s)
+    label = _escape(session_label(sess_or_target, clean))
+    tool = getattr(sess_or_target, "tool", "")
+    sid = str(getattr(sess_or_target, "id", "") or "")
+    elements = [
+        _md(f"{label} 不再出现在总览里。它有新动静会自己回来。"),
+        _md("只记在手机这边，电脑上那个会话没动。", small=True),
+        _row([
+            _button("↩︎ 撤销", fleet_value("unsettle", tool, sid)),
+            do_button("sessions", "🖥 回到总览"),
+        ]),
+    ]
+    return json.loads(_card("✓ 已结束", "grey", elements))
+
+
+def build_unsettled_card(sess_or_target: Any, redact=None) -> dict:
+    """点了「撤销」之后原地换成的卡（dict）。"""
+    clean = redact or (lambda s: s)
+    label = _escape(session_label(sess_or_target, clean))
+    tool = getattr(sess_or_target, "tool", "")
+    sid = str(getattr(sess_or_target, "id", "") or "")
+    elements = [
+        _md(f"好，{label} 回到总览里了。"),
+        _row([
+            _button("👀 看看它", fleet_value("open", tool, sid), primary=True),
+            do_button("sessions", "🖥 回到总览"),
+        ]),
+    ]
+    return json.loads(_card("↩︎ 已撤销", "indigo", elements))

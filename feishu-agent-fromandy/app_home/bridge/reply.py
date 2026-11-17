@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 logger = logging.getLogger("feishu-bridge.reply")
@@ -43,9 +44,12 @@ _SETTLED = {
     "approved": ("✅ 已同意", "green", "已经让它接着做了"),
     "denied": ("🚫 没让它做", "grey", "这一步跳过了"),
     "paused": ("⏸ 会话已暂停，没批", "red", "先点「继续」看清楚，再重新发一次要求"),
+    "superseded": ("🚫 已作废，这一步没做", "grey", "你后来发了新消息，还要做就再说一次"),
+    # 第 32 轮：卡挂着时他打了一句话 = 回答这张卡（没批），说明换成他那句话（调用方传 note）
+    "replied": ("🚫 没让它做", "grey", "你回了话，按你说的来"),
 }
 
-def build_settled_card(outcome: str, now=None) -> dict:
+def build_settled_card(outcome: str, now=None, note: str = "") -> dict:
     """审批卡点完后的替换卡：标题 + 一行北京时间，**没有按钮**。
 
     放进卡片回调响应体的 `card: {"type": "raw", "data": <这个 dict>}`，飞书原地替换原卡。
@@ -53,7 +57,8 @@ def build_settled_card(outcome: str, now=None) -> dict:
     """
     from datetime import datetime, timedelta, timezone
 
-    title, template, note = _SETTLED[outcome]
+    title, template, default_note = _SETTLED[outcome]
+    note = note or default_note
     moment = now or datetime.now(timezone.utc)
     hm = moment.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M")
     return {
@@ -135,6 +140,12 @@ def chunk_text(text: str, limit: int) -> list[str]:
     return chunks
 
 
+# 「收到」用哪个表情。飞书的 emoji_type 是枚举名，不是 unicode。
+# 🔴 用 `OnIt`（「在办」）而不是 `DONE`（「完成」）：这个表情的意思是**我收到了、开始干**，
+# 不是「干完了」—— 贴 DONE 会让他以为已经做完（而这一轮可能要跑几分钟）。
+ACK_EMOJI = "OnIt"
+
+
 class Replier:
     """只管发文本。第一版刻意不用卡片。
 
@@ -145,6 +156,13 @@ class Replier:
 
     def __init__(self, client, max_chars: int) -> None:
         self._client = client
+        # 消息 id → 「在办」表情的 reaction_id。办完撤掉要用（见 `unack`）。
+        self._acks: dict[str, str] = {}
+        # 🔴 第 19 轮：贴表情的 HTTP 还在路上的那几条，和「在路上时已经办完、回来就要撤」的那几条。
+        # ack 跑在后台线程、unack 跑在事件循环那边 ⇒ 两边要一把锁。
+        self._acking: set[str] = set()
+        self._undo_on_arrival: set[str] = set()
+        self._ack_lock = threading.Lock()
         # 配置里写 0 / 负数 / 小到没法用的值，都落回一个能用的下限：
         #   - 0 和负数会让 chunk_text 死循环（见那里的红字）
         #   - 个位数会把一句话拆成几十条，等于把聊天刷爆
@@ -158,6 +176,114 @@ class Replier:
             )
             requested = MIN_SAFE_CHARS
         self._max_chars = min(requested, TEXT_SAFE_CHARS)
+
+    def ack(self, message_id: str) -> bool:
+        """给主人刚发的那条消息贴一个「收到」的表情。送达返回 True。
+
+        用户原话：「我发消息后最后有个反应 比如 get 符号 你可以参考 openclaw」。
+        手机上发一句话要等十几秒到几分钟，这段时间屏幕上什么都没有 ⇒ 他分不出
+        「收到了正在干」和「根本没收到」。今天那几次「没反应」的调查成本，
+        一半花在这个区分上。一个表情是最便宜的「我收到了」。
+
+        🔴 **失败一律吞掉**：没权限 / 超时 / 接口拒绝，都只是少一个表情，
+        绝不影响这一轮（同 `_greet_in_background`：少一条说明 ≠ 整个功能没了）。
+        🔴 权限是 `im:message.reactions:write_only`（第 18 轮才申请的，
+        老用户要等自愈补上，见 `register.py` 那段红字）—— 所以**没权限是常态**，
+        不是异常，日志按 info 记、不按 error。
+        """
+        if not message_id:
+            return False
+        # 🔴 第 19 轮：同一条已经挂着 / 正在贴 ⇒ 不再贴。
+        # 飞书会重推同一个 message_id（`on_message` 里「事件循环还没起来、不记去重」那条路），
+        # 原来第二次会再 create 一个，并把第一个的 reaction_id 覆盖掉 ⇒ 第一个永远撤不掉。
+        with self._ack_lock:
+            if message_id in self._acks or message_id in self._acking:
+                return True
+            self._acking.add(message_id)
+            self._undo_on_arrival.discard(message_id)
+        try:
+            return self._ack_send(message_id)
+        finally:
+            with self._ack_lock:
+                self._acking.discard(message_id)
+                undo = message_id in self._undo_on_arrival
+                self._undo_on_arrival.discard(message_id)
+            if undo:
+                # 🔴 贴还在路上的时候这一轮就办完了（秒回的命令、很快的一轮）：
+                # unack 那时拿不到 reaction_id、什么都没做 ⇒ 这里补撤，不然这条永远挂着「在办」。
+                self.unack(message_id)
+
+    def _ack_send(self, message_id: str) -> bool:
+        try:
+            from lark_oapi.api.im.v1 import (
+                CreateMessageReactionRequest,
+                CreateMessageReactionRequestBody,
+                Emoji,
+            )
+
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    CreateMessageReactionRequestBody.builder()
+                    .reaction_type(Emoji.builder().emoji_type(ACK_EMOJI).build())
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.im.v1.message_reaction.create(request)
+        except Exception:  # noqa: BLE001 —— 见上面红字
+            logger.info("「收到」表情没贴上（不影响这一轮）", exc_info=True)
+            return False
+        ok = bool(getattr(response, "success", lambda: False)())
+        if not ok:
+            logger.info("「收到」表情被拒：code=%s（多半是权限还没批下来）",
+                        getattr(response, "code", "?"))
+            return False
+        # 🔴 记下 reaction_id：办完要撤掉它，而删除接口只认这个 id
+        # （`DELETE …/messages/:message_id/reactions/:reaction_id`）。
+        reaction_id = getattr(getattr(response, "data", None), "reaction_id", None)
+        if reaction_id:
+            with self._ack_lock:
+                self._acks[message_id] = reaction_id
+        return True
+
+    def pending_ack(self, message_id: str):
+        """这条消息上挂着的「在办」表情的 id；没挂 ⇒ None。"""
+        return self._acks.get(message_id) if message_id else None
+
+    def unack(self, message_id: str) -> bool:
+        """办完了，把「在办」撤掉。撤成返回 True。
+
+        用户原话：「办完了应该表情应该取消啊」—— 一直挂着的话，他回头翻聊天记录时
+        分不出哪条还在跑、哪条早就完了。
+
+        🔴 失败一律吞掉：撤不掉只是多挂一个表情，不能影响已经发出去的回答。
+        从没加上过（没权限、加失败）⇒ 什么都不做。
+        """
+        if not message_id:
+            return False
+        with self._ack_lock:
+            reaction_id = self._acks.pop(message_id, None)
+            if not reaction_id and message_id in self._acking:
+                # 贴还在路上 ⇒ 记下来，等它回来（`ack` 的 finally）再撤
+                self._undo_on_arrival.add(message_id)
+                return False
+        if not reaction_id:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+
+            request = (DeleteMessageReactionRequest.builder()
+                       .message_id(message_id).reaction_id(reaction_id).build())
+            response = self._client.im.v1.message_reaction.delete(request)
+        except Exception:  # noqa: BLE001
+            logger.info("「在办」表情没撤掉（不影响回答）", exc_info=True)
+            return False
+        ok = bool(getattr(response, "success", lambda: False)())
+        if not ok:
+            logger.info("「在办」表情撤除被拒：code=%s", getattr(response, "code", "?"))
+        return ok
 
     def send(self, chat_id: str, text: str) -> bool:
         """发一条（必要时拆多条）。返回是否全部送达。
@@ -295,6 +421,35 @@ class Replier:
             logger.error(
                 "审批卡片发送失败 code=%s msg=%s", response.code, response.msg
             )
+            return False
+        # 第 32 轮：成功时带回 message_id（真值），卡挂着时他打字 ⇒ 靠它把这张卡原地换掉。
+        # 拿不到 id 时仍回 True，调用方只把它当「发出去了」。
+        data = getattr(response, "data", None)
+        return getattr(data, "message_id", None) or True
+
+    def patch_settled_card(self, message_id: str, outcome: str, note: str = "") -> bool:
+        """把一张审批卡原地换成「已处理」卡（没有按钮）。失败返回 False，调用方要有降级。
+
+        点按钮时走的是回调响应体换卡（app._settled）；这里是**没人点、但已经有了结果**的时候
+        （卡挂着时他打了一句话）用 PATCH 换。schema 2.0 卡默认可更新（同 patch_status_card）。
+        """
+        if not message_id or not isinstance(message_id, str):
+            return False
+        from lark_oapi.api.im.v1 import (
+            PatchMessageRequest,
+            PatchMessageRequestBody,
+        )
+
+        card = build_settled_card(outcome, note=note)
+        body = PatchMessageRequestBody.builder().content(json.dumps(card, ensure_ascii=False)).build()
+        request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+        try:
+            response = self._client.im.v1.message.patch(request)
+        except Exception:  # noqa: BLE001 —— 换卡失败不能连累这一轮
+            logger.exception("审批卡原地更新抛异常")
+            return False
+        if not response.success():
+            logger.warning("审批卡原地更新失败 code=%s msg=%s", response.code, response.msg)
             return False
         return True
 

@@ -103,14 +103,40 @@ def _value_ok(value) -> bool:
     return False
 
 
+class OldConfigUnreadable(ValueError):
+    """旧配置读不懂。调用方要**说出来**并按最严的档装，不能当成「没有旧设置」。"""
+
+
+def fail_closed(new_text: str) -> str:
+    """旧配置读不懂时的新配置：档位和上限都压到只读。
+
+    🔴 第 32 轮（PRODUCT 复现）：原来读不懂就原样返回新文件（默认全授权），一句话不说、退出码 0，
+    安装器随后还把旧文件删了 ⇒ 他自己选的「只读」、加的禁止项静默变回全授权，而他以为还挡着。
+    照 T3 的取舍：读不出设置宁可停在最严那档并说清楚，也不拿默认值顶上。
+    """
+    out = []
+    for line in new_text.splitlines(keepends=True):
+        if re.match(r"^\s*mode\s*=", line):
+            line = 'mode = "readonly"\n'
+        elif re.match(r"^\s*max_mode\s*=", line):
+            line = 'max_mode = "readonly"\n'
+        out.append(line)
+    return "".join(out)
+
+
 def carry_over(old_text: str, new_text: str) -> tuple[str, list[str]]:
-    """返回（合并后的新文件内容, 带过来的键列表）。旧文件读不懂就原样返回新文件。"""
+    """返回（合并后的新文件内容, 带过来的键列表）。旧文件读不懂 ⇒ 抛 OldConfigUnreadable。"""
     try:
         old = tomllib.loads(old_text)
-    except tomllib.TOMLDecodeError:
-        return new_text, []
+    except tomllib.TOMLDecodeError as exc:
+        raise OldConfigUnreadable(str(exc)) from exc
 
     migrate = _migrating_from_old_default(old)
+    # 🔴 第 24 轮（R-install 复现）：上次迁移的通知还没送达（标记还在旧文件里）时又来一次自动更新 ⇒
+    # 新文件里没有这一行、旧文件又有 defaults_rev 不算迁移 ⇒ 标记被丢、永远不再通知、档位已是全授权。
+    # 旧文件里有标记 ⇒ 原样带过去（插的位置和迁移时一样）。
+    pending_marker = (not migrate and isinstance(old.get("agent"), dict)
+                      and str(old["agent"].get(MIGRATED_KEY) or "") == "readonly")
 
     lines = new_text.splitlines(keepends=True)
     section = ""
@@ -141,7 +167,7 @@ def carry_over(old_text: str, new_text: str) -> tuple[str, list[str]]:
             lines[index] = replacement
             carried.append(f"{section}.{key}")
     merged = "".join(lines)
-    if migrate:
+    if migrate or pending_marker:
         # 在 `[agent]` 段里插一行留痕（放在 mode 那一行后面，找不到就插在段首）
         out: list[str] = []
         done = False
@@ -156,7 +182,11 @@ def carry_over(old_text: str, new_text: str) -> tuple[str, list[str]]:
                 out.append(f'{MIGRATED_KEY} = "readonly"\n')
                 done = True
         merged = "".join(out)
-        carried.append("agent.mode→全控制（原来是上一代的默认只读）")
+        if migrate:
+            carried.append("agent.mode→全控制（原来是上一代的默认只读）")
+        elif done:
+            # 必须进 carried：`main()` 见 carried 为空就不落盘（那样标记还是丢了）
+            carried.append(f"agent.{MIGRATED_KEY}（上次的权限变更还没通知到）")
     # 新文件里压根没有那一段（老安装器写的）⇒ 把旧值追加上（只限 APPEND_IF_MISSING）
     try:
         new_sections = tomllib.loads(merged)
@@ -195,22 +225,39 @@ def main(argv: list[str]) -> int:
     except OSError as exc:
         print(f"WARN=没能读旧设置，按默认值装：{exc}")
         return 0
-    merged, carried = carry_over(old_text, new_text)
+    try:
+        merged, carried = carry_over(old_text, new_text)
+    except OldConfigUnreadable:
+        # 旧文件留着（备份成 .unreadable），新文件压到只读，说清楚怎么办
+        backup = old_path + ".unreadable"
+        try:
+            os.replace(old_path, backup)
+        except OSError:
+            backup = old_path
+        merged, carried = fail_closed(new_text), ["agent.mode→只读（旧设置读不懂，先按最严的装）"]
+        _write(new_path, merged)
+        print(f"WARN=旧设置文件读不懂，这次先按「只读」装（原文件留在 {backup}）。"
+              "要放开就在飞书里点「🔑 权限」换档。")
+        return 0
     if not carried:
         return 0
+    _write(new_path, merged)
+    print("OK=保留了你之前的设置：" + "、".join(carried))
+    return 0
+
+
+def _write(new_path: str, text: str) -> None:
     directory = os.path.dirname(new_path) or "."
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=directory, delete=False
     ) as tmp:
-        tmp.write(merged)
+        tmp.write(text)
         tmp_path = tmp.name
     try:
         os.chmod(tmp_path, os.stat(new_path).st_mode & 0o777)
     except OSError:
         pass
     os.replace(tmp_path, new_path)
-    print("OK=保留了你之前的设置：" + "、".join(carried))
-    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -69,6 +69,9 @@ logger = logging.getLogger("feishu-bridge")
 # 状态卡刷新间隔。飞书对同一用户发消息 5 QPS，单卡片实体操作上限 10 次/秒 ——
 # 15 秒一次远在限额内，同时足够让用户感觉"它在动"。
 _STATUS_REFRESH_SEC = 15
+ACK_DELAY_SEC = 1.0   # 晚这么久再贴「在办」：秒回的命令不闪（第 19 轮，见 docs/iteration/r19-ack.md）
+MENU_DEBOUNCE_SEC = 3.0   # 同一个常驻菜单键多久内的重复只算一次（第 22 轮）
+LATE_NOTICE_SEC = 180   # 消息晚到超过这么久（秒）就在回复前说一句（第 22 轮，Mac 睡眠）
 
 # 按钮点不动时给用户的话。每条都要说清**为什么**和**下一步做什么** ——
 # 只说"失败了"会让人反复点同一个按钮。
@@ -85,8 +88,19 @@ _CARD_TOASTS = {
 # lark-oapi issue #169（未修）：重连路径里 `requests.post` 没设超时且全程持锁 ⇒
 # 半开连接下永久阻塞，**进程还活着、不报错、日志直接断掉**（有人实测失联 3 天 13 小时）。
 # `auto_reconnect` 覆盖不了这种，只能从外面看。
+#
+# 🔴 第 34 轮：15 分钟只剩**最后一道兜底**（新判据拿不到证据时才靠它）。
+# 前面加了两条快判据（`stuck_reason()`，原理见 `bridge/wsfast.py` 第 34 轮那段）：
+#   ① SDK 的事件循环卡住超过 `WATCHDOG_LOOP_STALL_SEC` —— #169 那个 `requests.post` 是同步的，
+#      卡住它 = 整个循环停摆（ping 也发不出去）。这条不依赖飞书服务端。
+#   ② 当前连接 `wsfast.pong_limit()` 秒（服务端 ping 间隔 90 ⇒ 2×90+30=210 秒）没收到飞书 pong。
+# 两条都只用 monotonic（睡眠不计时），而且检测到睡醒（墙钟比进程时钟多走一截）就重新计时。
+# 有任务在跑时快判据**不动手**，等那一轮结束再判（回复走 HTTP 接口，不靠长连接，能送达）。
 WATCHDOG_SILENT_SEC = 15 * 60
-WATCHDOG_TICK_SEC = 60
+WATCHDOG_TICK_SEC = 15
+WATCHDOG_LOOP_STALL_SEC = 120
+# 两拍之间墙钟比 monotonic 多走超过这么多秒 ⇒ 判成「刚睡醒」（合盖、DarkWake 维护唤醒）
+WATCHDOG_SLEEP_JUMP_SEC = 30
 # 「等你」推送多久扫一次（复用总控扫描，三家 0.2 秒扫完）
 _NOTIFY_TICK_SEC = 10
 # 建共用扫描（`Bridge._fleet_scanner`）那一下的锁：后台线程和事件循环线程可能同时第一次用到它
@@ -227,6 +241,8 @@ def _pending_fallback(sess) -> str:
 # `receive_granted` 恒为 False ⇒ 文案永远走「要先 @」那一支 —— 权限明明开着，每个群都在教人多 @ 一次。
 # 能证明它的只有一件事：**真的收到过一条没 @ 机器人的群消息**。收到一次就落盘记下，之后都按「直接说」说。
 GROUP_MSG_PROOF_FILE = "group_msg_proven.json"
+KNOCKS_FILE = "stranger_knocks.json"   # 第 23 轮：敲门计数落盘（人只存哈希）
+KNOCKS_RESET_SEC = 24 * 3600           # 24 小时没新敲门 ⇒ 清零
 
 
 def _group_how_to_talk(report=None, here: bool = False, proven: bool = False) -> str:
@@ -399,7 +415,8 @@ def _toast_for(text: str) -> str:
     named = {
         "/mode": "看看权限", "/model": "看看模型", "/dirs": "看看有哪些项目",
         "/status": "看看现在状态", "/stop": "正在停", "/new": "开个新话题",
-        "/menu": "打开菜单", "/help": "打开帮助", "/sessions": "看看电脑上的会话",
+        "/menu": "打开菜单", "/help": "打开帮助", "/history": "调出最近问过的话", "/sessions": "看看电脑上的会话",
+        "/诊断": "看看运行状态",
     }
     if cmd in named:
         return f"收到，{named[cmd]}"
@@ -485,6 +502,21 @@ class Settings:
         )
 
 
+def _late_minutes(create_time, now: float | None = None) -> int:
+    """飞书消息的 create_time（毫秒字符串）比现在晚了几分钟；没超过阈值 / 读不出 ⇒ 0。
+
+    读不出（缺字段、坏值、未来时间）一律 0：这只是一句提示，不能让一条消息因为它出错。
+    """
+    try:
+        sent_at = int(str(create_time)) / 1000.0
+    except (TypeError, ValueError):
+        return 0
+    lag = (time.time() if now is None else now) - sent_at
+    if lag < LATE_NOTICE_SEC or lag > 7 * 24 * 3600:
+        return 0
+    return int(round(lag / 60))
+
+
 class Bridge:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -527,7 +559,7 @@ class Bridge:
         # 🔴 令牌密钥**必须落盘**。
         # 原来用 os.urandom(32) 每次启动随机生成，注释里写"重启后旧卡片失效是对的，
         # 因为 claude 会话也续不上了"—— 这个推理是错的：会话 id 存在
-        # sessions.py 里是落盘的，`--resume` 能续上。
+        # 🔴 注意：sessions.py 里的会话 id **只在内存**，重启就没了（第 24 轮复审核实）。
         # 2026-11-03 实测后果：服务重启 14 次，用户点任何一张早先的卡片都得到
         # 「这个按钮已失效或你无权操作」，而他完全不知道为什么（卡片看起来是好的）。
         # 看门狗本来就会在长连接静默时自杀重启，所以这个窗口是**常态**不是例外。
@@ -650,6 +682,7 @@ class Bridge:
         # 看门狗的时钟（会被每条消息刷新），而"已运行"要的是**进程起点**，
         # 它和"重启 N 次"一起才看得出崩溃循环（跑了 40 秒 + 重启 38 次）。
         self._started_at = time.monotonic()
+        self._started_wall = time.time()
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -705,8 +738,21 @@ class Bridge:
         self._reconnects = getattr(self, "_reconnects", 0) + 1
         logger.info("长连接断了，正在重连（第 %d 次）", self._reconnects)
 
+    def _recently_disconnected(self, window_sec: float = 600) -> bool:
+        """最近有没有本机自己看到的「断过」证据：重连过、或者这个进程刚起来。
+
+        给「晚到」提示用：只凭飞书时间戳和本机时钟的差，时钟一快就会每条都误报。
+        用墙上时钟：睡眠期间 monotonic 不走（见 `silent_for` 的红字）。
+        """
+        now = time.time()
+        last = max(getattr(self, "_last_reconnected_wall", 0.0),
+                   getattr(self, "_reconnecting_since", 0.0),
+                   getattr(self, "_started_wall", 0.0))
+        return bool(last) and 0 <= now - last <= window_sec
+
     def _on_ws_reconnected(self) -> None:
         self._reconnecting_since = 0.0
+        self._last_reconnected_wall = time.time()
         # 🔴 **不喂 `touch()`**：那个时钟只许被飞书推进来的事件喂
         # （`tests/test_interference.py::test_touch_is_only_fed_by_inbound_feishu_events`，
         # 它是 lark-oapi #169 静默卡死的唯一兜底）。连上了由 `connection_alive()` 负责判。
@@ -802,6 +848,10 @@ class Bridge:
         }
         if message_id and message_id in self._seen_messages:
             return
+        # 「在办」表情（第 18 轮，用户原话「比如 get 符号」）不在这里贴了 ——
+        # 🔴 第 19 轮 S3：原来在这里贴，下面图片 / 表情包 / 读不出正文 / 循环没起来
+        # 这几条直接 return 的路**永远不撤**。现在挪进 `_handle_then_unack`：
+        # 只有真派发出去的才贴，同一个 finally 里撤。
         # 🔴 第 15 轮：**派发成功之后才记去重**（见本函数末尾）。
         # R2 实测：原来这里先记，然后才提文字 / 派发。中间任何一步出错、或者事件循环
         # 还没起来，这条就没处理成；而飞书会**重推同一个 message_id**（官方：3 秒内要
@@ -826,6 +876,11 @@ class Bridge:
         if not text:
             if message_id:
                 self._seen_messages[message_id] = now   # 真没正文 ⇒ 处理完了，重推不必再看
+            if mtype == "post":
+                # 第 25 轮：只有截图、没写字的富文本 ⇒ 和发图片一样说一句，不静默
+                chat_for_reply = getattr(message, "chat_id", "") or ""
+                if chat_for_reply:
+                    self._say_later(chat_for_reply, "我现在只看得懂文字。把要问的打出来就行。")
             return
 
         chat_id = getattr(message, "chat_id", "") or ""
@@ -846,8 +901,18 @@ class Bridge:
             # 🔴 不记去重 ⇒ 飞书重推同一条时还能救回来（R2 实测原来这里永久丢）
             logger.error("事件循环还没起来，这一条先不处理，等飞书重推")
             return
+        late_min = _late_minutes(getattr(message, "create_time", None))
+        late_note = ""
+        if late_min:
+            # 🔴 第 22 轮（S2 Top 3）：Mac 睡着 = 掉线 11~39 分钟，醒来飞书补推，他不知道为什么这么慢。
+            logger.info("收到消息 迟到=%d 分钟", late_min)
+            # 🔴 第 24 轮（R-entry 复现）：只看两边时间戳的差，本机时钟快 3 分钟以上时**每一条**都会被说成
+            # 「晚到了、电脑睡着了」。要再有一个本机自己的证据：刚断线重连过、或者进程刚起来（睡醒被拉起）。
+            if self._recently_disconnected():
+                late_note = f"（这条晚到了约 {late_min} 分钟 —— 电脑多半刚才睡着了，现在开始处理）"
+        # 提示和回复走同一个协程、先发提示（R-entry：原来两路并行，菜单卡可能比「现在开始处理」先到）
         asyncio.run_coroutine_threadsafe(
-            self._handle(scope, chat_id, text), self._loop
+            self._handle_then_unack(scope, chat_id, text, message_id, late_note=late_note), self._loop
         )
         if message_id:
             self._seen_messages[message_id] = now   # 真派发出去了才算「处理过」
@@ -889,15 +954,83 @@ class Bridge:
         except _json.JSONDecodeError:
             return ""
         text = (content.get("text") or "").strip()
+        if not text:
+            # 🔴 第 25 轮（P-newbie 复现）：富文本（截图 + 一句话、带格式的消息）是 `post`，文字在
+            # `content[行][段].text` 里，原来只读顶层 `text` ⇒ 读出空串 ⇒ 不派发、一句话不回。
+            # 飞书 post 的 content 有两种外形：直接 `{"title":…, "content":[[…]]}`，或按语言包一层 `{"zh_cn": {…}}`。
+            bodies = [content] + [v for v in content.values() if isinstance(v, dict)]
+            parts: list[str] = []
+            for body in bodies:
+                title = body.get("title")
+                if isinstance(title, str) and title.strip():
+                    parts.append(title.strip())
+                for line in body.get("content") or []:
+                    if not isinstance(line, list):
+                        continue
+                    seg = "".join(str(el.get("text") or "") for el in line
+                                  if isinstance(el, dict) and el.get("tag") in ("text", "a", "md"))
+                    if seg.strip():
+                        parts.append(seg.strip())
+                if parts:
+                    break
+            text = "\n".join(parts).strip()
         # 群里 @ 机器人会留下 @_user_1 这类占位，去掉。
         parts = [p for p in text.split() if not p.startswith("@_user_")]
         return " ".join(parts).strip()
 
     # ---------- 真正干活 ----------
 
+    async def _handle_then_unack(self, scope: str, chat_id: str, text: str,
+                                 message_id: str, late_note: str = "") -> None:
+        """跑完这一轮，然后把那条消息上的「在办」撤掉。
+
+        用户原话：「办完了应该表情应该取消啊」。
+        🔴 撤表情放在 `finally`：出错、被 /stop 停掉、超时的那一轮也要撤 ——
+        不然恰恰是**出问题的那几条**一直挂着「在办」，而那正是他最需要看清状态的时候。
+        撤除本身是一次 HTTP，丢线程里做，不占事件循环。
+        """
+        replier = getattr(self, "replier", None)
+        ack = getattr(replier, "ack", None)
+        state = {"phase": "sleeping"}
+
+        async def ack_soon() -> None:
+            # 晚 1 秒再贴：1 秒内就回了的（/help、菜单、「会话」）回复本身就是「收到」，
+            # 再贴一个马上撤只会闪一下。不按「以 / 开头」判 ——
+            # `/Users/me/codes 里有什么` 是要跑一轮的问题。
+            await asyncio.sleep(ACK_DELAY_SEC)
+            state["phase"] = "sending"
+            await asyncio.to_thread(ack, message_id)
+
+        acking = asyncio.create_task(ack_soon()) if ack is not None and message_id else None
+        try:
+            if late_note and chat_id:
+                await asyncio.to_thread(self._say, chat_id, late_note)
+            await self._handle(scope, chat_id, text)
+        finally:
+            if acking is not None and not acking.done():
+                if state["phase"] == "sleeping":
+                    acking.cancel()          # 还没贴就办完了 ⇒ 不贴
+                else:
+                    try:
+                        await acking         # 贴的请求在路上 ⇒ 等它回来再撤
+                    except Exception:  # noqa: BLE001
+                        pass
+            unack = getattr(replier, "unack", None)
+            if unack is not None and message_id:
+                try:
+                    await asyncio.to_thread(unack, message_id)
+                except Exception:  # noqa: BLE001 —— 撤不掉只是多挂一个表情
+                    logger.info("「在办」表情没撤掉", exc_info=True)
+
     async def _handle(self, scope: str, chat_id: str, text: str) -> None:
         try:
             from .menu import is_menu_request
+
+            if text.strip() in ("↑", "最近", "最近问过", "历史"):
+                # 打一个「↑」也能调出来（和「菜单」两个字同一个思路）；这几个字不进历史（_skip 挡 <2 字和这里）
+                self._send_history_card(scope, chat_id)
+                return
+            self._remember_input(scope, text)
 
             # 「菜单」「?」这类不带斜杠的触发词也要进命令分派 ——
             # 用户在手机上打的就是这两个字，不会去打 /menu。
@@ -930,6 +1063,11 @@ class Bridge:
         # （get() 内部再过一遍白名单，所以这行本身也是闸门）。
         session.workspace = self.workspaces.get(scope)
 
+        if getattr(getattr(self, "updater", None), "installing", False):
+            # 🔴 第 25 轮（P-sre）：安装器正在换掉这个进程（约十几秒）⇒ 现在开的轮会被半路杀掉
+            self._say(chat_id, "我正在装新版，十几秒后就好。好了再发一次这句话。")
+            return
+
         # 入队要立刻说一声、带排队深度。否则用户以为机器人死了。
         if session.lock.locked():
             session.waiting += 1
@@ -937,10 +1075,110 @@ class Bridge:
 
         async with session.lock:
             session.waiting = max(0, session.waiting - 1)
-            await self._run_one(session, chat_id, text)
+            # 作废挂着的确认卡在 `_run_one` 里、审查放行之后做（见 `_supersede_pending_approvals`）。
+            # 批准后的续跑（`_continue_after_approval`）带 superseding=False，不会把自己顶掉。
+            # 用会话上的标记传、不加 _run_one 的参数：大量测试把 _run_one 换成三参数的假函数
+            session.supersede_next = True
+            # 第 32 轮：这句话本身就是对挂着那张卡的回答 ⇒ 同样用会话上的标记交给作废那一步
+            session.supersede_text = text
+            try:
+                await self._run_one(session, chat_id, text)
+            finally:
+                session.supersede_next = False
+                session.supersede_text = ""
+
+    def _supersede_pending_approvals(self, scope: str, chat_id: str) -> None:
+        """有确认卡挂着、他又发了一句新话 ⇒ 先把那张卡作废，并明说一句。
+
+        🔴 第 20 轮（S2 日志挖掘 Top 1，8 次同意里 3 次中招，11-07 15:13 还在发生）：
+        新消息 resume 同一个 claude 会话 ⇒ 被挂起的那条 tool_use 在会话里变成
+        `Tool result missing`，模型绕过去接着答。之后点旧卡「同意」照样回「好，继续」、
+        也续跑了，但**那一步再也不会跑**，`.ok` 躺在盘上 —— 他完全看不出批的事没做。
+        选「作废 + 明说」而不是「排队等他点」：往更少发生的方向走（和 /stop 同一个取舍）。
+
+        第 24 轮（R-approval）收紧：
+        - 只认盘上还**没批**的（`.asked` / `.pending`）。`_awaiting` 有值但盘上只剩 `.ok`
+          = 刚批过、续跑在排队 ⇒ 不作废、不说话（原来会把刚批的 `.ok` 清掉，还说「没做」）。
+        - 按**卡**记（令牌 nonce），不按指纹记：同一条命令之后又被问到时指纹一样，
+          按指纹记会让新卡被说成「已作废」、或让旧卡批动新卡。
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return
+        try:
+            names = os.listdir(gate.dir_for(scope))
+        except OSError:
+            names = []
+        digests = {n.rsplit(".", 1)[0] for n in names if n.endswith((".asked", ".pending"))}
+        if not digests:
+            return
+        getattr(self, "_awaiting", {}).pop(scope, None)
+        issued = getattr(self, "_issued_cards", {}).pop(scope, {})
+        card_msgs = getattr(self, "_approval_msgs", {}).pop(scope, {})
+
+        # 🔴 第 32 轮（照 T3 Code：审批挂着时打的话 = 拒绝这一步、原话当理由交给模型）：
+        # **只回第一张卡**。2026-11-09 真 claude 实测：defer 之后 `--resume` 加新话，Claude Code
+        # 会用同一个 tool_use_id **再调一次钩子** ⇒ 钩子查到 `.deny` 就 deny 并带上原话，
+        # 会话里那条 tool_result 从 `[Tool result missing due to internal error]` 变成「他没批，他说：…」。
+        # 其余的卡照旧作废。不再说「那一步没做，等这条回完再说一次」：他这句话就是回答。
+        try:
+            text = getattr(self.sessions.get(scope), "supersede_text", "") or ""
+        except Exception:  # noqa: BLE001
+            text = ""
+        first = gate.first_unanswered(scope, list(issued.values()))
+        answered = bool(text.strip()) and gate.answer_with_reply(scope, first, text)
+        if not answered:
+            gate.clear(scope)
+
+        if not hasattr(self, "_superseded"):
+            self._superseded = {}
+        voided = self._superseded.setdefault(scope, set())
+        voided.update(nonce for nonce, digest in issued.items() if digest in digests)
+        if len(voided) > 200:                     # 只在内存、重启清空；防一直不重启时无限长
+            self._superseded[scope] = set(list(voided)[-200:])
+        logger.info("新消息顶掉了 %d 张待确认的卡 scope=%s 当回答=%s", len(digests), scope[:16],
+                    str(first)[:8] if answered else "-")
+
+        # 卡片原地换掉（按钮消失）。第一张写「没让它做 · 你说：…」，其余写「已作废」。
+        replier = getattr(self, "replier", None)
+        patch = getattr(replier, "patch_settled_card", None)
+        first_patched = False
+        first_done = False
+        for nonce, digest in issued.items():
+            if digest not in digests:
+                continue
+            message_id = card_msgs.get(nonce) or ""
+            if answered and digest == first and not first_done:
+                first_done = True
+                # 卡上的原话也先脱敏、截短（手机上一眼看完）
+                from .redact import redact
+
+                said, _ = redact(" ".join(text.split()))
+                said = said if len(said) <= 60 else said[:60] + "…"
+                ok = bool(patch and patch(message_id, "replied", f"你说：{said}"))
+                first_patched = ok
+            elif patch:
+                patch(message_id, "superseded")
+        if answered and not first_patched:
+            # 换卡失败（拿不到 message_id、或飞书不让改）⇒ 一句话交代，免得那张卡的按钮看着还能点
+            self._say(chat_id, "上面那张确认卡我当你没批，按你这句话来。")
+        elif not answered:
+            self._say(chat_id, "上面那张确认卡作废了（你发了新消息），那一步没做。")
 
     async def _run_one(self, session, chat_id: str, text: str) -> None:
         scope = session.scope
+
+        # 第 32 轮：这一轮是不是「重启后接着干」（`_resume_after_restart` 在会话上挂的标记）。
+        # 只认提示语本身那一轮 —— 排在它前面的别的话不能把标记吃掉。
+        restart = None
+        marker = getattr(session, "restart_continue", None)
+        if marker and text == marker.get("prompt"):
+            restart = marker
+            session.restart_continue = None
+            if session.turns > 0:
+                # 重启后他已经先说了一句、那一轮也跑过了 ⇒ 上一轮的事由他那句接管，不再续
+                logger.info("重启续跑让位给他新说的话 scope=%s", scope[:16])
+                return
 
         # 会话被掐停了就只回原因，不执行 —— 抄 dots：发现问题直接暂停，
         # 要人明确解除（/resume）才继续。
@@ -973,13 +1211,26 @@ class Bridge:
             # 自然语言猜的意图。
             self._say(chat_id, f"🔒 {decision.reason} —— 会先问你再动手。")
 
+        if getattr(session, "supersede_next", False):
+            # 🔴 第 24 轮（R-approval 第 5 条）：原来在审查**之前**作废 ⇒ 被审查层直接拒掉的话
+            # （根本没 resume 会话）也把好好的卡作废了。现在只在「真要跑这一轮」时作废。
+            self._supersede_pending_approvals(scope, chat_id)
+
         resume = session.resume_target(self.sessions.idle_reset_sec)
+        # 第 33 轮：空闲超时开新轮 ⇒ 记下上一个会话 id，回复下面挂「↩︎ 接着上次」（只在内存，重启就没了）
+        continue_offer = self._continue_offer_prepare(session, text, resume, restart)
         if resume is None and session.turns:
-            # 刻意**不**告诉用户"开了新会话"。
-            # 他隔一小时问个新问题，根本不关心上下文被重置了 ——
-            # 多发一条系统消息只是噪音。真需要接着上次聊的人会发现指代不work，
-            # 那时候他自己会补上下文（而 /status 里能看到轮次归零了）。
+            # 刻意**不**单独发一条「开了新会话」的系统消息 —— 噪音。
+            # 第 33 轮：改成在回复下面挂一个「↩︎ 接着上次」按钮，真要接着聊的人点一下就回去。
             logger.info("会话空闲超时，开新轮：%s", scope)
+
+        # 第 32 轮：开跑就落一条「这一轮在跑」；进程被杀删不掉 ⇒ 下次启动续它（`bridge/inflight.py`）。
+        # 用户自己说的话 ⇒ continue_of=0（链清零）；重启续出来的 ⇒ 接着原来那条链数。
+        inflight = self._inflight_begin(scope, chat_id, session, text, resume, restart)
+
+        def on_session(sid: str) -> None:
+            # 🔴 跑在 runner 读子进程的循环里：同步、不 await（runner.py 文件头第 1 条）
+            self._inflight_session(scope, inflight, sid)
 
         # 进度：runner 本来就在数工具调用、记当前工具、算耗时，但以前**一个都没传出来**
         # （`on_progress` 零调用方）。现在把它喂给一张原地更新的状态卡，
@@ -1013,11 +1264,21 @@ class Bridge:
             except asyncio.TimeoutError:
                 pass
             while not stop.is_set():
-                await status.update(
-                    elapsed=int(time.monotonic() - started_at),
-                    tool_calls=latest["tool_calls"],
-                    last_tool=latest["last_tool"],
-                )
+                # 🔴 第 19 轮 S1-A4：回答卡还在一行行往外冒字 ⇒ 他已经知道它活着，
+                # 不再冒出一张「还在跑」（实测 122～135 秒两张卡同时在刷）。
+                # 回答卡停住超过一个刷新间隔（工具调用中间实测能停 107 秒）⇒ 状态卡照常出来。
+                # 🔴 第 24 轮（R-stream）：只按「回答卡在动」压的话，一直边说边干的长轮次**永远**不出状态卡 ——
+                # 而「⏹ 停下」按钮和「比平时久，可以先去忙」都只在状态卡上（相对第 19 轮之前是回归）。
+                # 到了 escalate 那条线（默认 420 秒）就不再压。
+                idle = streamer.idle_sec() if streamer is not None else None
+                elapsed_now = time.monotonic() - started_at
+                escalate = getattr(self.settings, "progress_escalate_sec", 0) or 420
+                if idle is None or idle >= _STATUS_REFRESH_SEC or elapsed_now >= escalate:
+                    await status.update(
+                        elapsed=int(time.monotonic() - started_at),
+                        tool_calls=latest["tool_calls"],
+                        last_tool=latest["last_tool"],
+                    )
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=_STATUS_REFRESH_SEC)
                 except asyncio.TimeoutError:
@@ -1025,6 +1286,7 @@ class Bridge:
 
         watch = asyncio.create_task(ticker())
         result = None  # run_turn 抛异常时状态卡收尾要知道"没结果"
+        streamer = None  # 第 19 轮：抛异常时也要把流式卡关掉，不能停在「生成中」
         try:
             # 按 mode 设全授权开关（钩子读这个文件决定要不要弹卡片）。
             # 每轮都设一次：用户切了档要立刻生效。
@@ -1032,16 +1294,55 @@ class Bridge:
             # 钩子要靠这份清单判"命令里的路径有没有伸出工作目录"。
             # 工具作用域管不到 Bash（实测 `cat <目录外文件>` 照样读到）。
             self.gate.write_workspaces(scope, policy.workspaces)
-            result = await self.runner.run_turn(
-                text,
-                session.workspace,
-                resume=resume,
-                approval_dir=self.gate.dir_for(scope),
-                on_progress=on_progress,
-                cancel=cancel,
-                policy=policy,
-            )
+            # ── 第 18 轮：流式回答（用户催过多次）──
+            # runner 那边 `on_text` 必须同步、只记不发（它跑在读子进程的循环里，
+            # 插 await 会堵死队列）。所以这里只把最新全文存进 `pending_text`，
+            # 由下面 `stream_pump` 这个独立协程按节流推给飞书。
+            streamer = self._new_streamer(chat_id)
+            pending_text = {"full": "", "sent": ""}
+
+            def on_text(full: str) -> None:
+                pending_text["full"] = full
+
+            async def stream_pump() -> None:
+                """每 0.2 秒看一眼有没有新文字。节流判据在 `StreamReply.should_push`。"""
+                while not stop.is_set():
+                    await asyncio.sleep(0.2)
+                    full = pending_text["full"]
+                    if not full or full == pending_text["sent"] or streamer.broken:
+                        continue
+                    if not streamer.live and not await streamer.start():
+                        return          # 建不出来（多半没权限）⇒ 这一轮安静走老路
+                    if await streamer.push(full):
+                        pending_text["sent"] = full
+
+            pump = asyncio.create_task(stream_pump())
+            try:
+                result = await self.runner.run_turn(
+                    text,
+                    session.workspace,
+                    resume=resume,
+                    approval_dir=self.gate.dir_for(scope),
+                    on_progress=on_progress,
+                    cancel=cancel,
+                    policy=policy,
+                    on_text=on_text,
+                    on_session=on_session,
+                )
+            finally:
+                stop.set()
+                pump.cancel()
+                try:
+                    await pump
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        except (asyncio.CancelledError, GeneratorExit):
+            # 进程在退 / 事件循环在拆 ⇒ 这一轮没做完，**留着**那条给下次启动续
+            inflight = None
+            raise
         finally:
+            # 跑完 / 失败 / 被 /stop / 停在等确认（钩子已落 .pending）⇒ 这一轮都算结束了
+            self._inflight_end(scope, inflight)
             stop.set()
             await watch
             self._cancels.pop(scope, None)
@@ -1050,15 +1351,50 @@ class Bridge:
                 tool_calls=latest["tool_calls"],
                 outcome=_outcome_of(result),
             )
+            if result is None and streamer is not None and not streamer.live:
+                try:
+                    await streamer.abandon()
+                except Exception:  # noqa: BLE001
+                    pass
+            if result is None and streamer is not None and streamer.live:
+                # 🔴 第 19 轮 S1-A3：run_turn 抛异常 ⇒ 原来回答卡一直「生成中」到飞书 10 分钟自动关
+                try:
+                    await streamer.finish("", footer="⚠️ 这一轮没跑完")
+                except Exception:  # noqa: BLE001 —— 收卡失败不能盖掉原来那个异常
+                    logger.exception("流式卡收尾失败（异常路径）")
 
         session.last_active = time.monotonic()
         session.turns += 1
         if result.session_id:
             session.claude_session_id = result.session_id
 
+        # 🔴 第 19 轮 S1-A1/A2/A3：停下 / 失败 / 等确认 这三条路原来都不收流式卡 ⇒
+        # 卡一直「生成中」、聊天列表挂着「正在回答…」，等确认那条还把同一段话再发一遍。
+        # 现在先让卡收尾；卡已经交付了正文 ⇒ 不再发同一段消息。
+        card_has_text = False
+        if not streamer.live:
+            await streamer.abandon()       # 推到一半坏了的卡：至少关掉流（第 24 轮）
+        if getattr(result, "cancelled", False) and streamer.live:
+            # 🔴 第 24 轮（R-stream 实测）：停在第二段中途 ⇒ result.text 只有第一段（runner 只认完整块），
+            # 拿它重写会把卡上已经显示的第二段抹掉、也不补发。卡上的更长 ⇒ 就用卡上的。
+            shown = streamer.shown_text()
+            if len(shown) > len(result.text or ""):
+                result.text = shown
+        if streamer.live and (getattr(result, "cancelled", False) or not result.ok
+                              or result.deferred):
+            footer = ("⏹ 停了" if getattr(result, "cancelled", False)
+                      else "⚠️ 没跑完，原因在下面" if not result.ok
+                      else "⏸ 停在这一步，看下面")
+            try:
+                card_has_text = bool(await streamer.finish(
+                    result.text if result.ok or getattr(result, "cancelled", False) else "",
+                    footer=footer)) and bool(result.text)
+            except Exception:  # noqa: BLE001 —— 收卡失败 ⇒ 照旧用消息发正文
+                logger.exception("流式卡收尾失败")
+
         if getattr(result, "cancelled", False):
             # 用户自己停的，不是故障。已经跑出来的部分照样给他。
-            if result.text:
+            if result.text and not card_has_text:
                 self.replier.send(chat_id, result.text)
             self._say(chat_id, "⏹ 停了。有别的事直接说。")
             return
@@ -1074,7 +1410,7 @@ class Bridge:
         if result.deferred:
             # 钩子把某个工具挡下来了，进程已经退出（不占资源、不会超时）。
             # 发卡片等人点；点了之后 resume 同一个 claude 会话接着跑。
-            self._ask_approval(scope, chat_id, session, result)
+            self._ask_approval(scope, chat_id, session, result, text_delivered=card_has_text)
             return
 
         body = result.text
@@ -1093,19 +1429,37 @@ class Bridge:
             self._save_paused()
             body += f"\n\n⏸ {outcome.reason}\n确认没问题的话点「继续」。"
 
-        ok = self.replier.send(chat_id, body)
+        # 🔴 流式卡能装下全文 ⇒ 让它收尾（原地变成终态卡），**不再发一条消息** ——
+        # 否则同一段话在聊天里出现两次。装不下 / 没流式 ⇒ 照旧发消息。
+        # 终态一律用 `result.text` 全文重写，不信流式累加值（delta 可能丢）。
+        ok = False
+        if streamer.live:
+            ok = await streamer.finish(body)
+            if ok:
+                logger.info("流式回答：这一轮推了 %d 帧，正文由卡片交付", streamer.pushes)
+        if not ok:
+            ok = self.replier.send(chat_id, body)
         if scope in self._paused:
             # 刚被掐停 ⇒ 下一步就是「继续」，给个按钮（文字 /resume 照样认）
             from .fleet.actions import do_button
 
             self._send_buttons(chat_id, [do_button("resume", primary=True), do_button("new")])
+        elif ok and continue_offer:
+            # 第 33 轮：这一轮是因为空闲超时才开的新会话 ⇒ 回复下面挂「↩︎ 接着上次」
+            self._continue_offer_attach(scope, chat_id, continue_offer, result.session_id)
         if not ok:
             # 发送失败必须让用户知道，否则就是「活干完了但你永远看不到」。
             logger.error("回复发送失败 chat_id=%s chars=%s", chat_id, len(body))
 
-    def _ask_approval(self, scope: str, chat_id: str, session, result) -> None:
+    def _ask_approval(self, scope: str, chat_id: str, session, result,
+                      text_delivered: bool = False) -> None:
         """发审批卡片。卡片发不出去就退化成纯文本 —— 不能让人无从得知。"""
         pending = self.gate.take_pending(scope)
+        if not pending and result.text and not text_delivered:
+            # 🔴 第 24 轮（R-stream 实测）：下面两个提前 return 原来都不发正文 ⇒ 卡装不下时卡上写着
+            # 「完整内容在下面那条消息里」，下面却什么都没有（21000 字丢了 13000）。
+            self.replier.send(chat_id, result.text)
+            text_delivered = True
         if not pending and getattr(self.gate, "last_skipped_asked", None):
             # 🔴 第 14 轮：这一步的卡**已经发过、还挂在聊天里等他点**（take_pending 的红字）。
             # 不再发第二张（现场 2026-11-06 19:29 同一指纹两张卡），也不要报「没拿到要确认的内容」。
@@ -1136,7 +1490,7 @@ class Bridge:
             )
             return
 
-        if result.text:
+        if result.text and not text_delivered:   # 流式卡已经显示了这段 ⇒ 不再发一遍
             self.replier.send(chat_id, result.text)
 
         # 记住 resume 目标。点了同意之后要接着跑的就是这个会话。
@@ -1151,11 +1505,19 @@ class Bridge:
             token = self.approvals.issue(
                 scope, item["digest"], {"digest": item["digest"], "scope": scope}
             )
+            if not hasattr(self, "_issued_cards"):
+                self._issued_cards = {}
+            self._issued_cards.setdefault(scope, {})[token.nonce] = item["digest"]
             approve_value = {"act": "approve", **token.to_value()}
             deny_value = {"act": "deny", **token.to_value()}
             sent = self.replier.send_approval_card(
                 chat_id, "要动手了，先问你一下", action, approve_value, deny_value
             )
+            if isinstance(sent, str) and sent:
+                # 第 32 轮：记下这张卡的 message_id ⇒ 卡挂着时他打字，能把它原地换成「没让它做」
+                if not hasattr(self, "_approval_msgs"):
+                    self._approval_msgs = {}
+                self._approval_msgs.setdefault(scope, {})[token.nonce] = sent
             # 记下「出了一张审批卡」：工具名 + 指纹前 8 位 + 发没发出去。不记命令原文
             # （可能带凭据）。2026-11-05 体验审查：原来日志里只有「收到点击 act=approve」，
             # 还原不出「出卡 → 同意 → 又被问」这条链（正是那次生图反复要批准的现场）。
@@ -1192,6 +1554,10 @@ class Bridge:
                 {"toast": {"type": "error", "content": _CARD_TOASTS[ApprovalStore.FORBIDDEN]}}
             )
         text = resolve_click(value)
+        # 记是哪个按钮（只记预设的 cmd / 问句键，不记正文）：第 28 轮想按真实点击给菜单卡排序时，
+        # 日志里 33 次点击一次都看不出点的是哪个
+        logger.info("菜单卡 点击 %s", (value.get("cmd") or ("问句" if value.get("say") else "?"))[:16]
+                    if isinstance(value, dict) else "?")
         if not text:
             # 只认菜单里预设过的值 —— 伪造的回调不能让 agent 跑任意指令
             return P2CardActionTriggerResponse(
@@ -1226,12 +1592,63 @@ class Bridge:
             return P2CardActionTriggerResponse(
                 {"toast": {"type": "error", "content": "服务刚重启过，先在这个聊天里发一句话再点"}}
             )
+        # 🔴 第 33 轮（用户：「原来是最快，我点最聪明，下面说变换了，上面四个按钮没变，还是最快被选中」）：
+        # 选模型 / 收紧权限原来只是当成一句命令丢后台 ⇒ 聊天里多一条「换成了…」，**这张卡原样不动**，
+        # ✅ 还停在旧的那个上。现在这两种在回调里当场切、响应体带新卡**原地刷新**（同审批卡的 `_settled`）。
+        # 放开权限不走这里：那要先弹二次确认卡（`_handle_mode` 的红字），照旧走命令。
+        refreshed = self._menu_switch_in_place(value)
+        if refreshed is not None:
+            toast, card, said = refreshed
+            body = {"toast": {"type": "info", "content": toast}}
+            if card is not None:
+                body["card"] = {"type": "raw", "data": json.loads(card)}
+            # 用户：「『🧠 换成 稳（claude-opus-5）。下一条消息开始生效』这样的提示要依然留着」
+            # ⇒ 卡原地刷新之外，聊天里照旧留一条（丢后台发：回调要 3 秒内返回）
+            if said:
+                self._say_later(chat_id, said)
+            return P2CardActionTriggerResponse(body)
         if self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._handle(scope, chat_id, text), self._loop)
 
         return P2CardActionTriggerResponse(
             {"toast": {"type": "info", "content": _toast_for(text)}}
         )
+
+    def _menu_switch_in_place(self, value: dict):
+        """模型卡 / 权限卡上点了一档 ⇒ 当场切，返回 (toast, 新卡 JSON)。不归这里管 ⇒ None。
+
+        只处理两种：换模型；切到不比现在松的档位。别的（放开权限、问句、命令）返回 None 走原路。
+        切不动（prefs 没有 / 名字不认识）也返回 None，原路会把原因说给他听。
+        """
+        from .menu import build_mode_card, build_model_card
+        from .policy import MODE_LABELS, MODE_RANK, MODEL_LABELS, known_model
+
+        prefs = getattr(self, "prefs", None)
+        if prefs is None or not isinstance(value, dict):
+            return None
+        model = value.get("model")
+        if isinstance(model, str):
+            if not known_model(model) or not prefs.set_model(model):
+                return None
+            label = MODEL_LABELS.get(model, model)
+            note = "" if prefs.last_save_ok else "（这次没存下来，重启后会回到原来那个）"
+            said = f"🧠 换成 **{label}**（{model}）。下一条消息开始生效。{note}"
+            return f"换成「{label}」了", build_model_card(self.policy), said
+        mode = value.get("mode")
+        if isinstance(mode, str) and mode in MODE_RANK:
+            current = self.policy.mode
+            if MODE_RANK[mode] > MODE_RANK.get(current, 0):
+                return None                       # 放开 ⇒ 要二次确认，走原路
+            applied, _clamped = prefs.set_mode(mode)
+            config_path = getattr(self.settings, "config_path", "") or ""
+            if config_path and os.path.exists(config_path):
+                self._erase_migration_marker(config_path)   # 同 _handle_mode：他亲手选过档了
+            label = MODE_LABELS.get(applied, applied)
+            said = f"🔑 现在是 **{label}**\n{self.policy.describe()}\n（下一条消息开始生效）"
+            if not prefs.last_save_ok:
+                said += "\n⚠️ 这次没存下来，重启后会回到配置里那一档。"
+            return f"现在是「{label}」", build_mode_card(self.policy), said
+        return None
 
     def _send_menu(self, chat_id: str, scope: str) -> None:
         from .menu import build_menu_card
@@ -1284,6 +1701,18 @@ class Bridge:
             if not text:
                 logger.warning("菜单 key 不在预设里，忽略：%r", event_key)
                 return
+
+            # 🔴 第 22 轮（S2 Top 5）：同一个键 3 秒内连点，原来每下都单独跑 ⇒ 一连串一样的总览卡
+            # （83 次点击里 11 次，11-07 18:45 `/sessions` 连 4 下）。手点和飞书重推都吃这一招。
+            # /stop 不去抖：它要么第一下就停了，要么后面那下也该再试一次。
+            now = time.monotonic()
+            if not hasattr(self, "_menu_last"):
+                self._menu_last = {}
+            last = self._menu_last.get((clicker, event_key), 0.0)
+            if now - last < MENU_DEBOUNCE_SEC and not text.startswith("/stop"):
+                logger.info("菜单点击 去抖：%.1fs 内同一个键 key=%s", now - last, event_key)
+                return
+            self._menu_last[(clicker, event_key)] = now
 
             # 单聊 chat_id 之前记过就用它；没有就用 open_id 发
             scope = f"dm:{clicker}"
@@ -1347,6 +1776,11 @@ class Bridge:
             # 「点一下就行」的按钮（退出对话 / 停下 / 继续 …）：白名单 op ⇒ 等价斜杠命令
             if value.get("act") == "do":
                 return self._on_do_click(event, clicker, value)
+            if value.get("act") == "hist":
+                return self._on_history_click(event, clicker, value)
+            # 第 33 轮「↩︎ 接着上次」：只带一个序号，要换回哪个会话记在服务端
+            if value.get("act") == "cont":
+                return self._on_continue_click(event, clicker, value)
 
             # 点击时**重新**查白名单：卡片可能在群里被别人看到，
             # 而白名单在这期间可能已经变了。比"签发时查过"更严。
@@ -1364,6 +1798,17 @@ class Bridge:
 
             scope = redeemed["payload"]["scope"]
             digest = redeemed["payload"]["digest"]
+
+            if str(value.get("nonce") or "") in getattr(self, "_superseded", {}).get(scope, set()):
+                # 🔴 第 24 轮（R-approval 第 2/3 条）：这张卡已经作废。**同意和不行都不碰 gate**：
+                # 同一条命令可能又挂了一张新卡（指纹一样），原来点旧卡同意会把新卡批掉、
+                # 点旧卡不行会把新卡清掉还说「这一轮到此结束」。
+                logger.info("点了已作废的卡 act=%s digest=%s", value.get("act"), str(digest)[:8])
+                return P2CardActionTriggerResponse(
+                    {"toast": {"type": "info",
+                               "content": "这张卡已作废（你后来发了新消息），这一步没做"},
+                     **self._settled("superseded")}
+                )
 
             if value.get("act") == "deny":
                 self.gate.clear(scope)
@@ -1394,6 +1839,13 @@ class Bridge:
                      **self._settled("paused")}
                 )
 
+            # 🔴 第 24 轮（R-approval 第 1 条，复现）：续跑要 `--resume` 同一个 claude 会话才接得上那一步。
+            # 桥记的会话 id 只在内存（sessions.py 不落盘）⇒ 重启之后、或空闲超过 30 分钟之后点同意，
+            # 原来续跑开的是一个只收到「继续」两个字的新会话 ⇒ 那一步永远不做，卡上却写「已同意」。
+            # 钩子落待办时记了 claude 自己的 session_id（claude 的会话记录在它自己的盘上，桥重启不丢）⇒
+            # 批准之前先把它取出来，续跑时强制 resume 它。
+            hook_session = self.gate.pending_session_id(scope, digest)
+
             if not self.gate.approve(scope, digest):
                 # 分两种：撞红线（说清为什么），或真的写不进去
                 reason = getattr(self.gate, "last_block_reason", "")
@@ -1418,6 +1870,18 @@ class Bridge:
                     {"toast": {"type": "error", "content": content}}
                 )
 
+            target = self._pin_resume(scope, hook_session)
+            if not target:
+                # 哪儿都拿不到能接上的会话 id ⇒ 不拿「继续」两个字去开一个新会话假装在做。
+                # `.ok` 留着（10 分钟有效）：他照提示再发一次，那一步不会再问。
+                self._awaiting.pop(scope, None)
+                logger.info("审批 同意已记下但接不上那一轮 digest=%s scope=%s", str(digest)[:8], scope[:16])
+                return P2CardActionTriggerResponse(
+                    {"toast": {"type": "info",
+                               "content": "同意记下了，但那一轮接不上了（电脑上的服务重启过）。"
+                                          "10 分钟内再发一次你的要求，这一步不会再问你"},
+                     **self._settled("approved")}
+                )
             waiting = self._awaiting.get(scope)
             logger.info("审批 同意已记下 digest=%s scope=%s 续跑=%s",
                         str(digest)[:8], scope[:16],
@@ -1435,8 +1899,8 @@ class Bridge:
             # `_awaiting` 被消费掉 ⇒ 点第二张原来只回「好，继续」然后**再无下文**。
             #
             # 用户批准的那一步**还没做**，所以正确行为是**真的接着跑**，
-            # 而不是告诉他"这一轮走完了"。会话 id 从 sessions 里取（落盘的，
-            # 重启也在），没有就从头开一轮 —— 总比什么都不做好。
+            # 而不是告诉他"这一轮走完了"。会话 id 从 sessions 里取（只在内存，
+            # 重启就没了 —— 所以上面先判了「接得上吗」，走到这里一定接得上）。
             # 容错：拿不到会话也要让批准生效（`.ok` 已经落盘了），
             # 只是没法自动续跑。卡片回调跑在飞书的 3 秒窗口里，
             # 这里抛异常会让用户看到一个技术性的报错。
@@ -1486,23 +1950,72 @@ class Bridge:
             logger.exception("造已处理卡失败 outcome=%s，只回 toast", outcome)
             return {}
 
-    def _note_stranger_knock(self, open_id: str) -> None:
-        """记一笔「有人跟这台电脑说话，但他不是主人」。只在内存里，重启清零。
+    def _knocks_path(self) -> str:
+        """敲门计数落在 config 同目录。没有 config_path（测试里造的桥）⇒ 空串 = 只留内存。
 
-        落盘的价值不大（这是「现在有没有人找错门」的信号，不是台账），
-        而写盘失败的那条路会把一个纯诊断功能变成故障源 —— 不值得。
+        刻意**不**退回 `~/.carher-feishu-agent`：第 23 轮实测，退回的话跑一遍测试就往真机写一个文件。
+        真跑的桥一定有 config_path（`Settings.load` 填的）。
         """
+        config_path = getattr(getattr(self, "settings", None), "config_path", "") or ""
+        directory = os.path.dirname(config_path)
+        return os.path.join(directory, KNOCKS_FILE) if directory else ""
+
+    def _load_knocks(self) -> dict:
+        """读落盘的敲门计数。读不到 / 坏了 / 超过 24 小时没新敲门 ⇒ 从零开始。"""
+        try:
+            with open(self._knocks_path() or os.devnull + "/x", encoding="utf-8") as handle:
+                data = json.load(handle)
+            last_at = float(data.get("last_at") or 0.0)
+            if time.time() - last_at > KNOCKS_RESET_SEC:
+                raise ValueError("过期")
+            return {"count": int(data.get("count") or 0), "last_at": last_at,
+                    "who": set(str(x) for x in (data.get("who") or [])[:10])}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {"count": 0, "last_at": 0.0, "who": set()}
+
+    def _note_stranger_knock(self, open_id: str) -> None:
+        """记一笔「有人跟这台电脑说话，但他不是主人」。
+
+        🔴 第 23 轮（S2 Top 4）：原来只在内存里 —— 实测一天重启约 24 次、有一次敲门 38 秒后就重启了，
+        计数活不到主人去看诊断卡。现在落一个小 json：只存次数、最后时间、人的**哈希**（不存 open_id 原文）。
+        原子写；写失败吞掉（它在消息入口上，不能把一个诊断功能变成故障源）。
+        """
+        import hashlib
+        import tempfile
+
         if not hasattr(self, "_knocks"):
+            self._knocks = self._load_knocks()
+        elif time.time() - self._knocks["last_at"] > KNOCKS_RESET_SEC:
             self._knocks = {"count": 0, "last_at": 0.0, "who": set()}
         self._knocks["count"] += 1
         self._knocks["last_at"] = time.time()
-        # 只留前几个，防止被刷爆内存；个数本身也是信号（一个人找错 vs 一片人探测）
+        # 只留前几个，防止被刷爆；个数本身也是信号（一个人找错 vs 一片人探测）
+        who = hashlib.sha256(("carher-knock:" + open_id).encode()).hexdigest()[:16]
         if len(self._knocks["who"]) < 10:
-            self._knocks["who"].add(open_id)
+            self._knocks["who"].add(who)
+        path = self._knocks_path()
+        if not path:
+            return
+        try:
+            directory = os.path.dirname(path)
+            os.makedirs(directory, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory,
+                                             delete=False) as tmp:
+                json.dump({"count": self._knocks["count"], "last_at": self._knocks["last_at"],
+                           "who": sorted(self._knocks["who"])}, tmp)
+                tmp_name = tmp.name
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except Exception:  # noqa: BLE001
+            logger.debug("敲门计数落盘失败（只影响诊断卡）", exc_info=True)
 
     def stranger_knocks(self) -> dict:
-        """给诊断卡用：{count, last_at, people}。没人敲过 ⇒ count=0。"""
-        got = getattr(self, "_knocks", None) or {}
+        """给诊断卡用：{count, last_at, people}。没人敲过 ⇒ count=0。重启后从盘上读回来。"""
+        if not hasattr(self, "_knocks"):
+            self._knocks = self._load_knocks()
+        got = self._knocks
+        if time.time() - float(got.get("last_at") or 0.0) > KNOCKS_RESET_SEC:
+            got = {}
         return {
             "count": int(got.get("count") or 0),
             "last_at": float(got.get("last_at") or 0.0),
@@ -1526,6 +2039,23 @@ class Bridge:
             # 群聊的 scope 后半段**就是** chat_id，可以直接用
             return scope.split(":", 1)[1]
         return ""
+
+    def _pin_resume(self, scope: str, hook_session: str) -> str:
+        """批准后续跑要 resume 的会话 id；拿不到返回空串。顺手让这个会话**不因空闲被重置**。
+
+        优先用钩子记下的那个（就是被挂起那一步所在的会话），其次桥内存里的。
+        批准 = 他明确要接着做那一步，所以空闲 30 分钟的「从头开」规则在这里不适用。
+        """
+        try:
+            session = self.sessions.get(scope)
+        except Exception:  # noqa: BLE001
+            return ""
+        waiting = (getattr(self, "_awaiting", {}) or {}).get(scope) or {}
+        target = hook_session or str(waiting.get("session_id") or "") or (session.claude_session_id or "")
+        if target:
+            session.claude_session_id = target
+            session.last_active = time.monotonic()
+        return target
 
     async def _continue_after_approval(self, scope: str) -> None:
         """批准之后 resume 同一个 claude 会话，让它接着做那一步。"""
@@ -1661,6 +2191,9 @@ class Bridge:
                 if gate is not None:
                     gate.clear(scope)
             self._say(chat_id, changed.reply)
+            return True
+        if command in {"/history", "/历史", "/最近"}:
+            self._send_history_card(scope, chat_id)
             return True
         if command in {"/help", "/h"}:
             self._say_with_buttons(chat_id, HELP, self._help_buttons())
@@ -2066,7 +2599,19 @@ class Bridge:
         unread = unread_tools(view, control)
         view = fill_unread(view, control, scanner.read_at)
         # 标题先整段脱敏再截断（同 cards 的红字）
-        lines = [row_label(_cleaned(s, _redact_text)) for s in view.sessions[:12]] \
+        # 🔴 文字兜底也要带上「它在问你…」（第 17 轮角色 E 指出）：卡片发不出去时走这条路，
+        # 而那恰恰是最需要信息的时候。详情卡那边早有 `_pending_fallback` 做同一件事，总览漏了。
+        # 用和卡片**同一个**函数（`cards.overview_pending_line`），不另拼一份 —— 两份会漂。
+        from .fleet.cards import overview_pending_line
+
+        lines = []
+        for session in view.sessions[:12]:
+            cleaned = _cleaned(session, _redact_text)
+            lines.append(row_label(cleaned))
+            asking = overview_pending_line(cleaned, _redact_text)
+            if asking:
+                lines.append("  " + asking)
+        lines = lines \
             or [self._unread_headline(view, unread) if unread else "一个会话都没读到。"]
         fallback = "🖥 电脑上的会话\n" + "\n".join("· " + line for line in lines)
         if view.notes:
@@ -3113,6 +3658,79 @@ class Bridge:
             logger.exception("问不出这个 chat 是群还是单聊 chat=%s", str(chat_id)[:12])
             return None
 
+    def _fleet_expanded_card(self, control, tool: str):
+        """「看全部」那张替换卡（dict）：最近一次扫描 + 和 `_fleet_overview` 同一套补全 / 照实改写。
+
+        没有上次的扫描、或者造卡出了错 ⇒ None（调用方退回后台扫描 + 新发一张）。
+        🔴 只读内存里的上次结果，不现扫：卡片回调 3 秒内必须返回。
+        """
+        from .fleet.cards import build_overview_card
+        from .fleet.notify import fill_unread, unread_tools
+
+        view = getattr(control, "last", None)
+        if view is None:
+            return None
+        try:
+            scanner = self._fleet_scanner()
+            unread = unread_tools(view, control)
+            view = fill_unread(view, control, getattr(scanner, "read_at", None))
+            card = self._honest_overview_card(
+                build_overview_card(view, redact=_redact_text, expand=tool), view, unread)
+            return json.loads(card) if card else None
+        except Exception:  # noqa: BLE001 —— 换不了卡就退回新发一张，别让这一下什么都没有
+            logger.exception("「看全部」造卡失败 tool=%s，退回重新扫描", tool)
+            return None
+
+    def _fleet_settled_store(self):
+        """「结束 / 稍后提醒」的记录：config 同目录 settled.json；没有 config_path ⇒ 只在内存。
+
+        绑成 `settled.active()` ⇒ 总览卡和后台推送读到的是同一份。
+        """
+        from .fleet import settled
+
+        config_path = getattr(getattr(self, "settings", None), "config_path", "") or ""
+        return settled.bind(settled.store_for(config_path))
+
+    def _fleet_mark_click(self, control, click: dict, toast):
+        """op = settle / unsettle / snooze（只被 `_on_fleet_click` 调）。3 秒内返回：只写记录 + 原地换卡。
+
+        🔴 只记在我们这边（`fleet/settled.py`），不碰 Claude / Codex / Cursor 的库。
+        """
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.cards import build_settled_card, build_unsettled_card
+        from .fleet.notify import build_snoozed_card
+        from .fleet.settled import can_settle
+
+        op, tool, sid = click["op"], click["tool"], click["id"]
+        sess = control.cached(tool, sid)
+        if sess is None:
+            return toast("error", "这张卡片过期了，点「回到总览」重新看一眼", "拒绝:缓存里没有")
+        try:
+            store = self._fleet_settled_store()
+            if op == "settle":
+                ok, why = can_settle(sess)
+                if not ok:
+                    return toast("error", why, "拒绝:在跑或等你")
+                store.settle(tool, sid)
+                card, word = build_settled_card(sess, _redact_text), "结束了，总览里不再列它"
+            elif op == "unsettle":
+                store.unsettle(tool, sid)
+                card, word = build_unsettled_card(sess, _redact_text), "撤销了"
+            else:
+                store.snooze(tool, sid, click.get("q", ""))
+                card, word = build_snoozed_card(sess, _redact_text), "好，1 小时后再提醒"
+        except Exception:  # noqa: BLE001 —— 记录 / 造卡出错不能让回调炸
+            logger.exception("总控点击 op=%s 处理失败", op)
+            return toast("error", "这一下没记上，再点一次", "记录没写上")
+        logger.info("总控点击 op=%s tool=%s 会话=%s 结果=原地换卡", op, tool, sid[:8])
+        return P2CardActionTriggerResponse({
+            "toast": {"type": "info", "content": word},
+            "card": {"type": "raw", "data": card},
+        })
+
     def _on_fleet_click(self, event, clicker: str, value: dict):
         """总控卡片上的按钮。3 秒内必须返回 ⇒ 只核验 + 记目标，扫描 / 读消息 / 停都丢后台。"""
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
@@ -3142,6 +3760,9 @@ class Bridge:
             # 用户看到的是「点了没反应」（2026-11-06 体验侦察 Top3）。补一条带按钮的消息。
             self._stale_card_notice(event, clicker)
             return toast("error", "这张卡片过期了，点「回到总览」重新看一眼", "拒绝:不在白名单或已过期")
+        if click["op"] in ("settle", "unsettle", "snooze"):
+            # 第 33 轮：结束 / 撤销 / 稍后提醒 —— 只改我们这边的记录 + 原地换卡，不扫描、不回消息
+            return self._fleet_mark_click(control, click, toast)
 
         chat_id, scope = self._click_scope(event, clicker)
         if not chat_id:
@@ -3178,6 +3799,18 @@ class Bridge:
         if op == "refresh" and not sid:
             later(self._fleet_overview(chat_id))
             return toast("info", "收到，重新看一眼", "已排队:总览")
+        if op == "more":
+            # 「还有 N 个 · 点开看全部」（第 28 轮）：**原地换卡**。3 秒内必须返回 ⇒ 不现扫，
+            # 用总控记着的最近一次扫描（`FleetControl.last`）。没有（刚重启）⇒ 退回后台扫一次、新发一张。
+            card = self._fleet_expanded_card(control, tool)
+            if card is None:
+                later(self._fleet_overview(chat_id))
+                return toast("info", "这张卡太旧了，重新看一眼，新的马上发过来", "已排队:总览(无缓存)")
+            logger.info("总控点击 op=more tool=%s 结果=原地换卡", tool)
+            return P2CardActionTriggerResponse({
+                "toast": {"type": "info", "content": "这一组全列出来了"},
+                "card": {"type": "raw", "data": card},
+            })
         if op in ("open", "refresh"):
             later(self._fleet_detail(chat_id, tool, sid, scope))
             return toast("info", "收到，正在读", "已排队:详情")
@@ -3946,6 +4579,12 @@ class Bridge:
             return
 
         applied, clamped = prefs.set_mode(target)
+        # 🔴 第 24 轮（R-install 复现）：迁移通知没送达期间 `migrated_from` 还留着；他这时自己挑了档，
+        # 下次启动 `_tell_about_migration` 会照「留下的只读只可能是旧噪音」清掉他刚选的只读 ⇒ 静默升回全授权。
+        # 他已经亲手选过档了 ⇒ 那句「升级把权限放开了」也没必要再说 ⇒ 擦掉标记。
+        config_path = getattr(self.settings, "config_path", "") or ""
+        if config_path and os.path.exists(config_path):
+            self._erase_migration_marker(config_path)
         policy = self.policy
         lines = [f"🔑 现在是 **{MODE_LABELS[applied]}**", policy.describe()]
         if applied == "trusted":
@@ -4148,11 +4787,149 @@ class Bridge:
         logger.info("按钮点击 act=do op=%s scoped=%s result=dispatched", op, bool(scope))
         return toast("info", TOASTS.get(op, "收到"))
 
+    # ---------- 「↑ 最近问过」（bridge/history.py 有调研结论） ----------
+
+    def _history(self):
+        store = getattr(self, "_input_history", None)
+        if store is None:
+            from .history import HISTORY_FILE, InputHistory
+
+            config_path = getattr(getattr(self, "settings", None), "config_path", "") or ""
+            directory = os.path.dirname(config_path)
+            store = InputHistory(os.path.join(directory, HISTORY_FILE) if directory else "")
+            self._input_history = store
+        return store
+
+    def _remember_input(self, scope: str, text: str) -> None:
+        try:
+            self._history().add(scope, text)
+        except Exception:  # noqa: BLE001 —— 记不下历史不能影响这条消息
+            logger.debug("记输入历史失败", exc_info=True)
+
+    def _send_history_card(self, scope: str, chat_id: str) -> None:
+        import json as _json_mod
+
+        from .history import build_card
+
+        where = "这个群" if scope.startswith("group:") else "这个聊天"
+        entries = self._history().entries(scope)
+        warn = self._history_hold_reason(scope, entries[0][0]) if entries else ""
+        card = _json_mod.dumps(build_card(entries, where=where, warn=warn), ensure_ascii=False)
+        sender = getattr(getattr(self, "replier", None), "send_card", None)
+        if sender is None or not sender(chat_id, card):
+            self._say(chat_id, "「最近问过」的卡片发不出去。直接打字问就好。")
+
+    def _history_hold_reason(self, scope: str, text: str) -> str:
+        """这一句**不该**一回车就发 ⇒ 返回给他看的原因；空串 = 可以直接发。
+
+        第 27 轮风险审查（RISK）：选中即发时这一下回车就是唯一的确认 ⇒ 三种情况退回「先填进框、再点发送」：
+        - 有确认卡在等：一发就会把那张卡作废（`_supersede_pending_approvals`），等批的那一步就丢了
+        - 正在「接着聊」电脑上的会话：这句会发进那个会话（全权限的终端会话也可能），而不是桥自己
+        - 全授权档 + 句子带「删/改/提交/推/部署…」：钩子不会再弹卡，当初那句的指代现在可能已经不对了
+        """
+        from .history import looks_like_write
+
+        gate = getattr(self, "gate", None)
+        try:
+            names = os.listdir(gate.dir_for(scope)) if gate is not None else []
+        except OSError:
+            names = []
+        if any(n.endswith((".asked", ".pending")) for n in names):
+            return "上面有一张确认卡在等你，这句一发出去它就作废了。"
+        control = getattr(self, "fleet", None)
+        try:
+            target, _expired = control.peek_pending_fresh(scope) if control is not None else (None, False)
+        except Exception:  # noqa: BLE001 —— 判不出就当不在对话模式（多问一次的方向在上面两条兜）
+            target = None
+        if target is not None:
+            return "你现在在「接着聊」电脑上的会话，回车后这句会发给那个会话。"
+        if getattr(getattr(self, "policy", None), "mode", "") == "trusted" and looks_like_write(text):
+            return "这句会改东西，全授权下回车后它不问就做。"
+        return ""
+
+    def _on_history_click(self, event, clicker: str, value: dict):
+        """「↑ 最近问过」卡上的点击（第 27 轮：选中即发）。
+
+        - pick：下拉里选中一句（桌面端 ↑↓ 挪高亮、回车才算选中，由客户端保证）⇒ 直接发；
+          卡原地换成「✅ 已发 · 时间 + 原话」（上面不再有下拉，免得再点开回车重发）
+        - edit / list：改一改再发 / 换一句
+        - send：改一改那张卡上的「发送」
+        """
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .history import build_card, build_sent_card, find, picked_fingerprint, submitted_text
+
+        def reply(kind: str, content: str, card=None):
+            body = {"toast": {"type": kind, "content": content}}
+            if card is not None:
+                body["card"] = {"type": "raw", "data": card}
+            return P2CardActionTriggerResponse(body)
+
+        if clicker not in self.settings.owner_open_ids:
+            return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
+        chat_id, scope = self._click_scope(event, clicker)
+        if not chat_id or not scope:
+            return reply("error", "服务刚重启过，先在这个聊天里发一句话再点")
+        store = self._history()
+        entries = store.entries(scope)
+        items = [t for t, _ in entries]
+        action = getattr(event, "action", None)
+        op = value.get("op")
+
+        def card(index: int = 0):
+            """选句卡；框里那句要是会撞上确认卡 / 接着聊 / 全授权改东西，框上面写清楚。"""
+            warn = self._history_hold_reason(scope, items[index]) if items else ""
+            return build_card(entries, index, warn=warn)
+
+        def send(text: str):
+            loop = getattr(self, "_loop", None)
+            if loop is None:
+                return reply("error", "我这边还没准备好，过几秒再点一次")
+            # 🔴 去重：同一句 10 秒内只发一次（客户端选同一项会再触发回调；手快连点两下）
+            now = time.monotonic()
+            recent = getattr(self, "_hist_sent", {})
+            self._hist_sent = recent
+            key = (scope, text)
+            if now - recent.get(key, -1e9) < 10:
+                return reply("info", "这句刚发过", build_sent_card(text))
+            recent[key] = now
+            session = self.sessions.get(scope) if getattr(self, "sessions", None) else None
+            queued = bool(session is not None and session.lock.locked())
+            logger.info("最近问过 发出 op=%s chars=%d 排队=%s", op, len(text), queued)
+
+            async def go():
+                # 回显：卡片发的话在聊天里看不见，而回答出现在最底下 ⇒ 先说一句「你问：…」
+                await asyncio.to_thread(self._say, chat_id, f"↑ 你问：{text}")
+                await self._handle(scope, chat_id, text)
+
+            asyncio.run_coroutine_threadsafe(go(), loop)
+            return reply("info", "排上了，前面还在跑" if queued else "发出去了", build_sent_card(text, queued=queued))
+
+        if op == "pick":
+            # 第 28 轮：下拉只负责把那句换进框里，发送交给框的回车（用户：回车要像编辑框一样发）
+            index = find(items, picked_fingerprint(action))
+            if index is None:
+                return reply("info", "列表有更新，重新选一下", card())
+            return reply("info", "放进框里了，回车就发", card(index))
+        if op == "list":
+            return reply("info", "选一句", card())
+        if op == "edit":
+            index = find(items, str(value.get("h") or ""))
+            if index is None:
+                return reply("info", "列表有更新，重新选一下", card())
+            return reply("info", "改好了回车就发", card(index))
+        if op == "send":
+            text = submitted_text(action)
+            return send(text) if text else reply("error", "框里是空的")
+        return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
+
     def _help_buttons(self) -> list:
         from .fleet.actions import do_button
 
         return [do_button("menu", primary=True), do_button("sessions"),
-                do_button("status"), do_button("mode")]
+                do_button("history"), do_button("status"), do_button("mode")]
 
     def _say_later(self, chat_id: str, text: str) -> None:
         """在事件循环里发，立刻返回。给 3 秒回调用。没起循环就退回同步发。"""
@@ -4250,6 +5027,10 @@ class Bridge:
         # 常驻菜单自愈（第 12 轮）：启动 1 分钟后查标记，没配好就写 + 发版；成功就退出线程。
         threading.Thread(target=self._menu_heal_loop, daemon=True, name="menu-heal").start()
         threading.Thread(target=self._selfupdate_loop, daemon=True, name="selfupdate").start()
+        # 第 32 轮：上次被重启打断的那一轮，等长连接连上后接着做（`bridge/inflight.py`）。
+        # 钩子上面已经装好；连上之前不续 —— 续了也发不出「我让它接着做」和结果。
+        threading.Thread(target=self._resume_after_restart_when_connected, args=(loop,),
+                         daemon=True, name="restart-resume").start()
 
         # 开场消息。🔴 2026-11-05 实测的缺口：**推荐路径（扫码）装完，飞书里一个字都不发。**
         # 扫码那条路直接把主人的 open_id 写进 config ⇒ 配对码那条路不走 ⇒
@@ -4270,6 +5051,217 @@ class Bridge:
         )
         loop.run_forever()
 
+    # ---------- 第 33 轮：闲太久开了新会话 ⇒ 回复下面挂「↩︎ 接着上次」（只被 _run_one / on_card_action 调） ----------
+    #
+    # 上一个会话 id 只在内存（`_continue_offers` + 会话上的 `continue_last_text`）⇒ 重启就没了，按钮也就不出。
+    # 按钮值只带一个随机序号，要换回哪个会话记在服务端 ⇒ 卡片值伪造不出「换到任意会话」（同 `rtalk`）。
+
+    def _continue_offer_prepare(self, session, text: str, resume, restart):
+        """开跑前调：这一轮是不是「因为空闲超时才开的新会话」。是 ⇒ 返回 {prev, head}，否则 None。
+
+        顺手记下这一轮他说的话（下次超时时按钮上显示的就是它）。只认他自己说的话（`_run_locally` 进来的，
+        `supersede_next` 为真）—— 批准后的「继续」、重启续跑的提示语都不算。
+        `/new` 会把 `claude_session_id` 和 `turns` 清零 ⇒ 这里自然不出。
+        """
+        try:
+            user_turn = bool(getattr(session, "supersede_next", False)) and not restart
+            prev_text = str(getattr(session, "continue_last_text", "") or "")
+            if user_turn:
+                session.continue_last_text = text
+            if not user_turn or resume is not None or not session.turns:
+                return None
+            prev = session.claude_session_id
+            if not prev:
+                return None
+            return {"prev": str(prev), "head": prev_text}
+        except Exception:  # noqa: BLE001 —— 按钮是锦上添花，不能挡住这一轮
+            logger.debug("「接着上次」准备失败", exc_info=True)
+            return None
+
+    def _continue_offer_attach(self, scope: str, chat_id: str, offer: dict, new_sid) -> None:
+        """回复已经发出去之后调：记下这次的提议、发按钮。新会话没拿到 id ⇒ 不出（点了也核不了）。"""
+        if not offer or not new_sid or str(new_sid) == offer.get("prev"):
+            return
+        import secrets
+
+        from .fleet.actions import continue_button
+
+        nonce = secrets.token_hex(6)
+        if not hasattr(self, "_continue_offers"):
+            self._continue_offers = {}
+        self._continue_offers[scope] = {"n": nonce, "prev": offer["prev"], "new": str(new_sid)}
+        head = " ".join(_redact_text(offer.get("head") or "").split())
+        logger.info("空闲超时开了新会话，挂「接着上次」 scope=%s 上一个=%s", scope[:16], offer["prev"][:8])
+        self._send_buttons(chat_id, [continue_button(nonce, head)])
+
+    def _on_continue_click(self, event, clicker: str, value: dict):
+        """点「↩︎ 接着上次」⇒ 把这个聊天的会话 id 换回上一个。**不跑任何东西**，下一句话才 resume 它。
+
+        闸门：主人 + 形状只认 `{"act","n"}` + 序号对得上服务端记的那条 +
+        现在的会话还是那次新开的（之后 `/new` 过、或又换过 ⇒ 这个按钮作废）。
+        正在跑 / 有确认卡在等 ⇒ 不换（换了会被那一轮的结果盖回去，或批准续跑接不上）。
+        """
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.actions import resolve_continue_click
+
+        def toast(kind: str, content: str, result: str):
+            logger.info("「接着上次」点击 结果=%s", result)
+            return P2CardActionTriggerResponse({"toast": {"type": kind, "content": content}})
+
+        if clicker not in self.settings.owner_open_ids:
+            return toast("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN], "拒绝:不是主人")
+        nonce = resolve_continue_click(value)
+        if not nonce:
+            return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED], "拒绝:形状不对")
+        chat_id, scope = self._click_scope(event, clicker)
+        offers = getattr(self, "_continue_offers", {})
+        offer = offers.get(scope) if scope else None
+        if not chat_id or offer is None or offer["n"] != nonce:
+            return toast("error", "这个按钮已经失效了（可能服务重启过）。要接着聊就把上次的事再说一遍", "拒绝:没有在等的")
+        session = self.sessions.get(scope)
+        if session.claude_session_id != offer["new"]:
+            offers.pop(scope, None)
+            return toast("info", "这个按钮已经失效了（之后又开过新话题）", "拒绝:会话已变")
+        if session.lock.locked():
+            return toast("info", "这一轮还在跑，等它说完再点", "拒绝:在跑")
+        if scope in getattr(self, "_awaiting", {}) or self._has_waiting_approval(scope):
+            return toast("info", "上面还有确认卡在等你，先处理它再点", "拒绝:等确认")
+        offers.pop(scope, None)
+        session.claude_session_id = offer["prev"]
+        session.last_active = time.monotonic()   # 别一换回去又被「空闲 30 分钟从头开」顶掉
+        logger.info("「接着上次」换回上一个会话 scope=%s 会话=%s", scope[:16], offer["prev"][:8])
+        self._say_later(chat_id, "好，接着上次那个话题。")
+        return toast("info", "好，接着上次", "换回")
+
+    # ---------- 第 32 轮：重启后接着干（判断在 bridge/inflight.py；只被 _run_one / run 调） ----------
+
+    def _inflight_store(self):
+        """`inflight.json` 在 config 同目录；没有 config 路径（测试里造的桥）⇒ 只在内存。"""
+        store = getattr(self, "_inflight", None)
+        if store is None:
+            from .inflight import INFLIGHT_FILE, InflightStore
+
+            config_path = getattr(getattr(self, "settings", None), "config_path", "") or ""
+            directory = os.path.dirname(config_path)
+            store = InflightStore(os.path.join(directory, INFLIGHT_FILE) if directory else "")
+            self._inflight = store
+        return store
+
+    def _inflight_begin(self, scope: str, chat_id: str, session, text: str, resume, restart):
+        """开跑写一条。失败只记日志、返回 None（续不了而已，这一轮照跑）。"""
+        try:
+            from .inflight import next_chain
+
+            continue_of, chain_started_at = 0, None
+            source_text = text
+            if restart:
+                continue_of, chain_started_at = next_chain(restart.get("entry") or {}, time.time())
+                source_text = (restart.get("entry") or {}).get("text") or ""   # 提示里说的还是他的原话
+            return self._inflight_store().start(
+                scope, chat_id, getattr(session, "workspace", "") or "", source_text,
+                claude_session_id=resume, continue_of=continue_of,
+                chain_started_at=chain_started_at,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("在跑的轮次没记下来（只影响重启后续跑）", exc_info=True)
+            return None
+
+    def _inflight_session(self, scope: str, entry, sid: str) -> None:
+        if not entry or not sid:
+            return
+        try:
+            self._inflight_store().set_session(scope, sid, entry.get("started_at"))
+        except Exception:  # noqa: BLE001
+            logger.warning("会话 id 没补进在跑记录", exc_info=True)
+
+    def _inflight_end(self, scope: str, entry) -> None:
+        if not entry:
+            return
+        try:
+            self._inflight_store().finish(scope, entry.get("started_at"))
+        except Exception:  # noqa: BLE001
+            logger.warning("在跑记录没删掉（下次启动可能多续一次）", exc_info=True)
+
+    def _resume_after_restart_when_connected(self, loop) -> None:
+        """跑在自己的线程里：等长连接连上，再把续跑丢进事件循环。
+
+        连不上就一直等（每秒看一眼），等满 30 分钟还没连上 ⇒ 这些残留按「太旧」本来也不续了。
+        """
+        from .inflight import MAX_AGE_SEC
+
+        deadline = time.monotonic() + MAX_AGE_SEC
+        while not self.connection_alive():
+            if time.monotonic() > deadline:
+                logger.info("长连接 30 分钟没连上，重启前那几轮不续了")
+                return
+            time.sleep(1)
+        try:
+            asyncio.run_coroutine_threadsafe(self._resume_after_restart(), loop)
+        except Exception:  # noqa: BLE001 —— 续跑是锦上添花，不能把桥带崩
+            logger.exception("重启续跑没排上")
+
+    def _has_waiting_approval(self, scope: str) -> bool:
+        """盘上有没有这个会话**还没批**的确认（`.pending` 钩子刚落 / `.asked` 卡已发出）。"""
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return False
+        try:
+            return any(n.endswith((".pending", ".asked")) for n in os.listdir(gate.dir_for(scope)))
+        except OSError:
+            return False
+
+    async def _resume_after_restart(self) -> None:
+        """读残留的「在跑」记录，能续的用同一个 claude 会话 + 固定提示接着做。"""
+        from .inflight import (CHAIN_STOP, CHAIN_STOP_NOTE, CONTINUE_PROMPT, RESUME,
+                               RESUMING_NOTE, head_of, plan)
+
+        store = self._inflight_store()
+        try:
+            leftovers = store.leftovers()
+        except Exception:  # noqa: BLE001
+            logger.exception("读在跑记录失败，重启前那几轮不续了")
+            return
+        jobs = []
+        for entry in leftovers:
+            scope = entry["scope"]
+            chat_id = str(entry.get("chat_id") or "") or self._chat_for(scope)
+            verdict, why = plan(entry, time.time(),
+                                has_pending=self._has_waiting_approval(scope),
+                                paused=scope in getattr(self, "_paused", {}))
+            # 先删掉旧条：续出来那一轮会自己写新的；不续的也不该下次再看到
+            store.finish(scope, entry.get("started_at"))
+            if verdict == CHAIN_STOP:
+                logger.warning("重启续跑停下 scope=%s：%s", scope[:16], why)
+                if chat_id:
+                    self._say(chat_id, CHAIN_STOP_NOTE)
+                continue
+            if verdict != RESUME or not chat_id:
+                logger.info("重启前那一轮不续 scope=%s：%s", scope[:16], why or "不知道往哪个聊天回")
+                continue
+            session = self.sessions.get(scope)
+            session.claude_session_id = entry["claude_session_id"]
+            session.last_active = time.monotonic()   # 别被「空闲 30 分钟从头开」规则顶掉
+            session.restart_continue = {"prompt": CONTINUE_PROMPT, "entry": entry}
+            if not hasattr(self, "_chat_ids"):
+                self._chat_ids = {}
+            self._chat_ids.setdefault(scope, chat_id)
+            logger.info("重启续跑 scope=%s 第 %d 次", scope[:16], int(entry.get("continue_of") or 0) + 1)
+            self._say(chat_id, RESUMING_NOTE.format(head=head_of(entry.get("text") or "")))
+            jobs.append(self._resume_one(scope, chat_id, CONTINUE_PROMPT))
+        if jobs:
+            await asyncio.gather(*jobs)
+
+    async def _resume_one(self, scope: str, chat_id: str, prompt: str) -> None:
+        """走正常那条路（串行锁、审查、流式卡照常）。🔴 发的是提示语，不是原话。"""
+        try:
+            await self._run_locally(scope, chat_id, prompt)
+        except Exception:  # noqa: BLE001
+            logger.exception("重启续跑出错 scope=%s", scope[:16])
+            self._say(chat_id, "重启后接着做的时候出错了。要继续就直接说一句，或者重新发一次你的要求。")
+
     # ---------- 会话进入「等你」⇒ 主动推卡（第 7 轮，判断在 bridge/fleet/notify.py） ----------
 
     def _menu_heal_loop(self) -> None:
@@ -4283,32 +5275,63 @@ class Bridge:
             logger.exception("常驻菜单自愈线程退出")
 
     def _selfupdate_loop(self) -> None:
-        """每 `CHECK_EVERY_SEC` 看一次有没有新版，有且空闲就装上（装完安装器自己重启服务）。
+        """启动 `FIRST_CHECK_AFTER_SEC` 后先查一次，之后每 `CHECK_EVERY_SEC` 一次；有新版且空闲就装上。
 
+        第 30 轮：原来先睡满 10 分钟 ⇒ 刚装完 / 刚重启的这台 10 分钟内不上报、也不跟版本。
         🔴 一拍失败不能让循环死掉：更新是锦上添花，桥本身照旧要能用。
         """
         from . import selfupdate
 
+        wait = selfupdate.FIRST_CHECK_AFTER_SEC
         while True:
-            time.sleep(selfupdate.CHECK_EVERY_SEC)
+            time.sleep(wait)
+            wait = selfupdate.CHECK_EVERY_SEC
             if self.updater is None:
                 return
+            self._updater_learn_app_id()
             try:
                 done = self.updater.tick()
             except Exception:  # noqa: BLE001
                 logger.exception("自动更新这一拍失败，下一拍照常")
                 continue
+            # 第 32 轮：新版没装上（重启后还是旧版 / 安装器自己退回了）⇒ 主动告诉主人一句
+            self._tell_update_not_applied()
             if done is not None and done[0]:
                 # 装成功了 ⇒ 这个进程马上会被安装器重启掉，不用自己退
                 logger.info("自动更新完成：%s", done[1])
+
+    def _tell_update_not_applied(self) -> None:
+        """只被 `_selfupdate_loop` 调。有「新版没装上」还没说过 ⇒ 往主人单聊发一句；发到了才记「说过」。
+
+        🔴 发不出去不记 ⇒ 下一拍再试（和开场消息同一条纪律：发成功才写标记）。
+        """
+        take = getattr(self.updater, "take_notice", None)
+        if take is None:
+            return
+        try:
+            notice = take()
+            if notice is None:
+                return
+            build, text = notice
+            owners = sorted(getattr(self.settings, "owner_open_ids", None) or ())
+            sent = False
+            for owner in owners:
+                sent = bool(self._say(owner, text)) or sent
+            if sent:
+                self.updater.mark_told(build)
+            else:
+                logger.info("「新版没装上」这句没发出去（没主人或发送失败），下一拍再试")
+        except Exception:  # noqa: BLE001 —— 提醒是锦上添花，不许把更新循环带崩
+            logger.exception("「新版没装上」提醒失败")
 
     def _update_on_demand(self, chat_id: str) -> None:
         """他在飞书里发「更新」⇒ 立刻查 + 装，结果如实回他。跑在自己的线程里。"""
         if self.updater is None:
             self._say(chat_id, "这台机器上的自动更新没起来，要人工重新跑一次安装包。")
             return
+        self._updater_learn_app_id()
         try:
-            info = self.updater.check()
+            info = self.updater.check(manual=True)
         except Exception:  # noqa: BLE001
             logger.exception("按需查新版失败")
             self._say(chat_id, "查新版本的时候出错了，过一会儿再发「更新」试试。")
@@ -4318,12 +5341,23 @@ class Bridge:
             current = self.updater.current_build() or "（这台没有版本号，多半是开发机）"
             self._say(chat_id, f"已经是最新的了（{current}）。" if not why else f"没查到能装的新版：{why}")
             return
+        if info.get("manual_only"):
+            # 第 30 轮：Windows 上自动装还没在真机上跑过 ⇒ 不下载，给他链接
+            self._say(chat_id, "Windows 上我还不能自己装，点这里下载："
+                               f"{self.updater.download_url(info)}，下载完双击一次就好")
+            return
         if not self.updater.is_idle():
             self._say(chat_id, f"有新版 {info['build_id']}，但现在有活在跑。等它跑完我自己装，不用你管。")
             return
         self._say(chat_id, f"正在更新到 {info['build_id']}…装完我会重启一下，期间几秒收不到消息。")
         ok, text = self.updater.update_now(info)
-        self._say(chat_id, ("✅ " if ok else "❌ ") + text)
+        sent = self._say(chat_id, ("✅ " if ok else "❌ ") + text)
+        if not ok and sent and getattr(self.updater, "last_error", "") == "rolled_back":
+            # 第 32 轮：刚才那句就是「新版没装上，已经退回」⇒ 更新循环别再说一遍
+            try:
+                self.updater.mark_told(info["build_id"])
+            except Exception:  # noqa: BLE001
+                logger.debug("标记「没装上已告知」失败", exc_info=True)
 
     def _notify_waiting_loop(self) -> None:
         """后台每 10 秒扫一次。跑在自己的 daemon 线程里（扫描是阻塞的，别占事件循环）。
@@ -4426,17 +5460,95 @@ class Bridge:
         之后才按静默时长判。
         """
         limit = WATCHDOG_SILENT_SEC if threshold_sec is None else threshold_sec
+        # 🔴 第 34 轮：先看快判据（SDK 循环卡死 / 心跳回包停了）。有任务在跑就先不动手 ——
+        # 回复走 HTTP 接口能送达，腰斩它才是真丢；那一轮结束后下一拍再判。
+        reason = self.stuck_reason()
+        if reason and not self._work_in_flight():
+            self._watchdog_reason = reason
+            return True
         if self.connection_alive():
+            self._last_alive_at = time.monotonic()
             return False
+        down_for = self._down_for()
         # 🔴 有任务正在跑就宽限。连接断开时自杀会**腰斩那一轮**，结果全丢 ——
         # 用户看到的是「发了消息，状态卡停住，再也没有回复」，比多等一会儿更糟。
         # 而 SDK 的重连往往几秒就成了，没必要在这个窗口里动手。
-        if self._work_in_flight() and self.silent_for < limit * _INFLIGHT_GRACE:
+        if self._work_in_flight() and down_for < limit * _INFLIGHT_GRACE:
             return False
-        return self.silent_for > limit
+        # 还要求同时这么久没收到任何飞书事件：事件还在进来就说明连接其实是通的（探活认不出的时候）。
+        if down_for > limit and self.silent_for > limit:
+            self._watchdog_reason = f"长连接连续断了 {down_for:.0f}s 没连回来（阈值 {limit:.0f}s）"
+            return True
+        return False
+
+    def _down_for(self) -> float:
+        """长连接**连续**断了多久 = 离「最后一次看见它活着」多久。
+
+        🔴 第 35 轮（主人 11-10 同意）：兜底原来按「多久没收到消息」判 ⇒ 用户空闲 15 分钟以上时，
+        看门狗这一拍恰好碰上一次正常重连（断开 0.2 秒、刚连上 61 秒）就会被判死 ——
+        本机 agent.log 11 次「长连接已静默」里多数是这种误杀。
+        看门狗每拍（15 秒）看到连接活着就记一笔，所以一次正常重连只会算出十几秒。
+        - 只用 monotonic：睡眠期间不走 ⇒ 刚睡醒给 SDK 一个完整窗口去重连。
+        - 这个进程还**从没**看见过连接活着（刚起来就连不上）⇒ 退回原来的静默时长。
+        """
+        last_alive = getattr(self, "_last_alive_at", None)
+        if last_alive is None:
+            return self.silent_for
+        return time.monotonic() - max(last_alive, self._last_event_at)
+
+    def _watchdog_note_clock(self) -> None:
+        """每拍记一次两个时钟。墙钟比 monotonic 多走一截 ⇒ 刚睡醒 ⇒ 快判据重新计时。
+
+        🔴 不重新计时的后果：DarkWake（合盖时每隔十几分钟醒 45 秒做维护，本机 pmset 里一晚几十次）
+        会让 monotonic 一点点涨，而那几十秒里网络常常还没起来（本机日志里 DarkWake 期间
+        `NameResolutionError` 22 次）⇒ 醒一次就可能被判成「心跳停了」。
+        """
+        mono, wall = time.monotonic(), time.time()
+        last = getattr(self, "_watchdog_clock", None)
+        self._watchdog_clock = (mono, wall)
+        if not last:
+            return
+        jump = (wall - last[1]) - (mono - last[0])
+        if jump > WATCHDOG_SLEEP_JUMP_SEC:
+            self._watchdog_awake_since = mono
+            probe = getattr(self, "_loop_probe", None)
+            if probe is not None:
+                probe.reset()
+            self._loop_stall = None
+            logger.info("电脑刚睡醒（睡了约 %.0f 秒），卡死检测重新计时", jump)
+
+    def stuck_reason(self) -> str:
+        """快判据：有**现场证据**说长连接卡死了 ⇒ 返回一句原因；没证据 / 拿不到 ⇒ 空串。
+
+        空串的意思是「不知道」，不是「活着」—— 后面还有 `connection_alive()` 和 15 分钟静默兜底。
+        跑在看门狗线程里 ⇒ 任何异常都吞掉返回空串。
+        """
+        try:
+            from . import wsfast
+
+            now = time.monotonic()
+            awake_for = now - getattr(self, "_watchdog_awake_since", float("-inf"))
+            stall = getattr(self, "_loop_stall", None)
+            if stall is not None and min(stall, awake_for) > WATCHDOG_LOOP_STALL_SEC:
+                return f"飞书 SDK 的事件循环 {stall:.0f}s 没转（阈值 {WATCHDOG_LOOP_STALL_SEC}s，多半卡在无超时的重连里）"
+            client = getattr(self, "_ws_client", None)
+            if client is None or not self.connection_alive():
+                return ""
+            age = wsfast.pong_age(client, now)
+            limit = wsfast.pong_limit(client)
+            if age is not None and min(age, awake_for) > limit:
+                return f"当前连接 {age:.0f}s 没收到飞书心跳回包（阈值 {limit:.0f}s）"
+        except Exception:  # noqa: BLE001 —— 看门狗线程里绝不能抛
+            logger.debug("快判据探测失败", exc_info=True)
+        return ""
 
     def _work_in_flight(self) -> bool:
-        """有没有正在跑的轮次（会话锁被持着，或有待续跑的审批）。
+        """有没有正在跑的轮次（会话锁被持着；或有审批卡在等、而且重启会把它的续跑弄丢）。
+
+        🔴 第 30 轮：原来只要 `_awaiting` 非空就算有活 ⇒ 一张没人点的审批卡让这台**永远不更新**。
+        审批卡在等人点时 claude 那一轮已经结束了，重启不腰斩任何东西；点旧卡续跑靠的是钩子落盘的
+        `session_id`（`gate.pending_session_id`，第 24 轮）——重启后照样接得上。
+        所以只有「盘上**找不到**能接上的会话 id」的那种等审批才算有活（见 `_awaiting_resume_would_be_lost`）。
 
         这个方法跑在**看门狗线程**里，所以任何异常都不能往外抛 ——
         抛了会让看门狗线程死掉，而它是对 lark-oapi 静默卡死的唯一保险。
@@ -4448,10 +5560,36 @@ class Bridge:
                 lock = getattr(session, "lock", None)
                 if lock is not None and lock.locked():
                     return True
-            return bool(getattr(self, "_awaiting", None))
+            awaiting = getattr(self, "_awaiting", None) or {}
+            return any(self._awaiting_resume_would_be_lost(scope) for scope in list(awaiting))
         except Exception:  # noqa: BLE001 - 看门狗线程里绝不能抛
             logger.debug("探测在跑任务失败", exc_info=True)
             return False
+
+    def _awaiting_resume_would_be_lost(self, scope: str) -> bool:
+        """这个会话在等审批；现在重启，点旧卡还接得上那一轮吗？接不上 ⇒ True（当有活，别重启）。
+
+        接得上 = 盘上有这个会话的未决记录（`.asked` / `.pending`）且里面有钩子记下的 `session_id` ——
+        正是 `on_card_action` 重启后走的那条路（`gate.pending_session_id` → `_pin_resume`）。
+        探不出来一律按「会丢」处理（往「少重启」走永远安全）。
+        """
+        try:
+            directory = self.gate.dir_for(scope)
+            for name in os.listdir(directory):
+                stem, dot, suffix = name.rpartition(".")
+                if dot and suffix in ("asked", "pending") and self.gate.pending_session_id(scope, stem):
+                    return False
+        except Exception:  # noqa: BLE001
+            logger.debug("探测审批续跑记录失败", exc_info=True)
+        return True
+
+    def _updater_learn_app_id(self) -> None:
+        """把这台的飞书 app_id 交给自动更新（只用来上报对上人；app_secret 绝不给它）。"""
+        try:
+            if self.updater is not None and not getattr(self.updater, "app_id", ""):
+                self.updater.app_id = str(getattr(self.settings, "app_id", "") or "")
+        except Exception:  # noqa: BLE001 —— 上报是锦上添花
+            logger.debug("取 app_id 失败，这次上报不带", exc_info=True)
 
     def _greet_in_background(self) -> None:
         """扫码装完那条开场消息（实现和文案在 `pairing.py`）。
@@ -4476,6 +5614,57 @@ class Bridge:
             )
         except Exception:  # noqa: BLE001 —— 开场消息不值得让桥起不来
             logger.exception("开场消息没能起来，跳过")
+
+    def _new_streamer(self, chat_id: str):
+        """造这一轮的流式卡片对象。造不出来 ⇒ 一个「永远 broken」的壳，调用方不用判空。
+
+        🔴 失败不抛：流式是增益，缺权限（老用户都缺）/SDK 版本不对都只该让这一轮
+        安静回到「跑完发一条」。
+        """
+        try:
+            from .stream import StreamReply
+
+            return StreamReply(self._client_for_cards(), chat_id,
+                               enabled=self._streaming_on())
+        except Exception:  # noqa: BLE001
+            logger.info("流式回答没起来，这一轮用普通回复", exc_info=True)
+
+            class _Off:
+                broken = True
+                live = False
+                pushes = 0
+
+                async def start(self):
+                    return False
+
+                async def push(self, _text):
+                    return False
+
+                async def finish(self, _text, footer=""):
+                    return False
+
+                def idle_sec(self):          # ticker 每轮都调（第 24 轮：缺这个 ⇒ 90 秒后整轮崩）
+                    return None
+
+                async def abandon(self):
+                    return None
+
+                def shown_text(self):
+                    return ""
+
+            return _Off()
+
+    def _client_for_cards(self):
+        """发卡片用的 SDK 客户端。和 `Replier` 用同一个，不另建连接。"""
+        return getattr(self, "client", None) or getattr(self.replier, "_client", None)
+
+    def _streaming_on(self) -> bool:
+        """流式总开关。配置里 `[agent] streaming = false` 可以关掉。
+
+        默认开：没权限时它自己会安静退回，所以开着不会有坏处。
+        """
+        raw = getattr(self.settings, "streaming", None)
+        return True if raw is None else bool(raw)
 
     def _tell_about_migration(self) -> None:
         """这次升级把他从「只看」挪到了全控制 ⇒ 告诉他一次（`migrated_from` 由 carryover 写）。
@@ -4511,14 +5700,42 @@ class Bridge:
                         except Exception:  # noqa: BLE001
                             logger.debug("重读档位设置失败，下次重启生效", exc_info=True)
             text = migration_notice(migrated_from, self.policy.mode)
+            if migrated_from and not text:
+                # 迁移记录在、但这台现在不是放开状态（比如 IT 策略锁了只读）⇒ 没什么可说的。
+                # 🔴 第 19 轮（S4 缺口 3）：原来这里直接 return、**不擦**标记 ⇒ 哪天 IT 放开，
+                # 桥会说一句已经过时的「这次升级把权限放开了」。没什么可说就把记录擦掉。
+                self._erase_migration_marker(path)
+                return
             if not text:
                 return
             from .fleet.actions import do_button
 
+            # 🔴 第 19 轮（S4 缺口 1）：**至少一个主人确实收到了**才擦标记。
+            # 原来走 `_say_later_with_buttons`（异步投递，拿不到结果）然后无条件擦 ⇒
+            # S4 实测：发送失败时日志两条「消息没送达」，标记照样被擦，下次启动 0 条通知，
+            # 档位已是全授权 ⇒ **他被悄悄从只读升到了全控制**，这正是这段代码要防的事。
+            # 改成同步发、看返回值；一个都没送达 ⇒ 留着标记，下次启动再说。
+            # 还没绑主人 ⇒ 也留着，等配对绑定后再说。
+            # 同步发会占启动的一小会儿：只在迁移后的那一次启动发生，可以接受。
+            delivered = False
             for owner in sorted(self.settings.owner_open_ids):
                 chat = self._chat_for(f"dm:{owner}") or owner
-                self._say_later_with_buttons(chat, text, [do_button("mode", primary=True)])
-            # 说过就擦掉这一行（整行删，不动别的键）
+                try:
+                    if self._say_with_buttons(chat, text, [do_button("mode", primary=True)]):
+                        delivered = True
+                except Exception:  # noqa: BLE001 —— 这一个人没送达，看下一个
+                    logger.info("档位变更通知没送达 owner=%s", owner[:12], exc_info=True)
+            if not delivered:
+                logger.info("档位变更通知一个主人都没送达，留着记录下次再说")
+                return
+            self._erase_migration_marker(path)
+        except Exception:  # noqa: BLE001 —— 少说一句话不能让桥起不来
+            logger.exception("档位变更通知没发出去")
+
+    def _erase_migration_marker(self, path: str) -> None:
+        """把配置里 `migrated_from` 那一行删掉（整行删，不动别的键；原子替换）。"""
+        try:
+            from .carryover import MIGRATED_KEY
             with open(path, encoding="utf-8") as handle:
                 lines = handle.readlines()
             kept = [ln for ln in lines if not re.match(rf"^\s*{MIGRATED_KEY}\s*=", ln)]
@@ -4532,8 +5749,8 @@ class Bridge:
                     temp_name = tmp.name
                 os.chmod(temp_name, 0o600)
                 os.replace(temp_name, path)
-        except Exception:  # noqa: BLE001 —— 少说一句话不能让桥起不来
-            logger.exception("档位变更通知没发出去")
+        except Exception:  # noqa: BLE001
+            logger.exception("擦迁移记录失败（下次启动会再说一次）")
 
     def connection_alive(self) -> bool:
         """长连接是否还活着。
@@ -4576,15 +5793,31 @@ class Bridge:
         注意这里只负责**退出**，重启交给外面的 launchd/supervisor。进程自己拉自己
         起来是不可靠的 —— 要重启的恰恰是已经不正常的那个进程。
         """
+        from .wsfast import LoopProbe
+
+        self._loop_probe = LoopProbe()
         while True:
             time.sleep(WATCHDOG_TICK_SEC)
-            if self.should_self_exit():
-                logger.error(
-                    "长连接已静默 %.0fs（阈值 %ds），SDK 可能卡在无超时的重连里，主动退出等待重启",
-                    self.silent_for,
-                    WATCHDOG_SILENT_SEC,
-                )
-                os._exit(75)  # EX_TEMPFAIL：告诉 supervisor 这是可重试的故障
+            self._watchdog_tick()
+
+    def _watchdog_tick(self) -> None:
+        """看门狗的一拍（拆出来给测试用）：更新时钟和探针 ⇒ 判 ⇒ 该退就退。"""
+        try:
+            self._watchdog_note_clock()
+            probe = getattr(self, "_loop_probe", None)
+            self._loop_stall = probe.tick() if probe is not None else None
+        except Exception:  # noqa: BLE001 —— 看门狗线程里绝不能抛
+            logger.debug("看门狗探针失败", exc_info=True)
+            self._loop_stall = None
+        self._watchdog_reason = ""
+        if self.should_self_exit():
+            # 🔴 「长连接已静默」这几个字别改：`bridge/status.py` 的 ERROR_CLASSES 靠它数「看门狗重启」
+            logger.error(
+                "长连接已静默 %.0fs，判定卡死：%s。主动退出等待重启",
+                self.silent_for,
+                getattr(self, "_watchdog_reason", "") or "原因未知",
+            )
+            os._exit(75)  # EX_TEMPFAIL：告诉 supervisor 这是可重试的故障
 
 
 def _load_or_create_secret(home: str) -> bytes:
@@ -4632,6 +5865,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # SDK 的 `[Lark]` handler 在 import lark_oapi 时就建好了；两边的 handler 都要过滤（见 redact.LogScrubFilter）
+    from .redact import install_log_scrubber
+    install_log_scrubber()
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.environ.get("FEISHU_BRIDGE_CONFIG") or os.path.join(here, "config.toml")
     if not os.path.exists(config_path):

@@ -48,32 +48,59 @@ import re
 # 改了一边另一边不变，两个入口问出不一样的话而测试全绿（2026-11-04 review）。
 from .botmenu import QUESTION_TEXT as _QUESTION_TEXT
 
+# 🔴 第 28 轮：**顺序 = 卡上的顺序 = 用得多的在前**。数据来自本机 agent.log（11-04 ~ 11-08）
+# 悬浮栏「收到菜单点击 key=…」：哪里有改动 5、有哪些项目 2、找 TODO 2；
+# 后三条只在这张卡上有，日志不记卡上点的是哪个按钮（只记 act=menu）⇒ 没有数据，放后面。
 _QUICK_LABELS = (
-    ("q:projects", "📂 有哪些项目"),
     ("q:changes", "✏️ 哪里有改动"),
-    ("q:recent", "🕐 最近改了啥"),
+    ("q:projects", "📂 有哪些项目"),
     ("q:todo", "📌 找 TODO"),
+    ("q:recent", "🕐 最近改了啥"),
     ("q:tests", "🧪 测试怎么跑"),
     ("q:ports", "⚙️ 进程端口"),
 )
 QUICK_QUESTIONS = tuple((_QUESTION_TEXT[key], label) for key, label in _QUICK_LABELS)
 
-# 控制按钮。cmd 必须是已有的斜杠命令，不新增入口。
+# 控制按钮。cmd 必须是已有的斜杠命令（`known_commands()` 里有的），不新增入口。
 #
 # 为什么把「权限」「模型」放进来：对照豆包工作输入框下那一排
 # （本地电脑 / 项目 / **按需确认** / 技能 / 插件 / **自动 高**）——
 # 他们把"要不要每步问我"和"用多强的模型"当成一等公民摆在最外层。
 # 我们原来这两项只能改 config.toml 再重启，手机上根本做不到。
+#
+# 🔴 第 28 轮：顺序按悬浮栏实际点击数排（agent.log 11-04 ~ 11-08，147 次）：
+# 会话 60、权限 30、模型 18、最近问过 11、停下 5、换项目 5（换项目 11-04 之后挪出了悬浮栏）。
+# 「会话」「最近问过」「运行诊断」原来**不在这张卡上** —— 叫「全部按钮」却缺了点得最多的那个。
+# 标签和 `fleet.actions.DEFAULT_LABELS` 一字不差（帮助、别的卡叫他点的就是这几个字）。
+#
+# ⚠️ `resolve_click` 的 cmd 白名单就是这张表 ⇒ 加进来的三条同时进了白名单。
+# 三条都只是「看」（发一张卡），不改任何设置、不动电脑上的东西；
+# 而且早就在 `fleet.actions.DO_COMMANDS` 的按钮白名单里（同一套判据）。
 CONTROLS = (
+    ("/sessions", "🖥 看看会话"),
+    ("/history", "↑ 最近问过"),
+    ("/mode", "🔑 权限"),
+    ("/model", "🧠 模型"),
     # 图标和 actions.DEFAULT_LABELS["dirs"]、帮助、回话里叫他点的那个统一成 📂（原来这里是 🔀，
     # 而帮助和 runner 教模型说的都是「📂 换项目」⇒ 用户照着找找不到一模一样的那个）。
     ("/dirs", "📂 换项目"),
-    ("/mode", "🔑 权限"),
-    ("/model", "🧠 模型"),
-    ("/status", "ℹ️ 现在状态"),
     ("/stop", "⏹ 停下"),
     ("/new", "🆕 新话题"),
+    ("/status", "ℹ️ 现在状态"),
+    ("/诊断", "🩺 运行诊断"),
 )
+
+# 卡上**直接露出来**的那几个；其余收进底下的折叠面板（点开才看见，不走回调）。
+# 判据：悬浮栏上真有人点过的才露出来（数据见上面两段注释）。
+# 「换项目」点得不多也露着：别的卡、帮助都叫他「点📂 换项目」，而它不在悬浮栏里 ——
+# 再收进面板就从 3 下变 4 下（tests/test_r17_taps.py 的那套算法）。
+_PINNED_CONTROLS = ("/sessions", "/history", "/mode", "/model", "/dirs", "/stop")
+_PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
+
+# 折叠面板标题右边的小箭头。和 `fleet.cards.PANEL_ICON` 同一个（主会话 2026-11-08 真发过、
+# 飞书接受的写法）；不 import 是因为那个文件同一轮有别人在改，菜单卡不能跟着它一起坏。
+# tests/test_r28_menu_card.py 盯着两份一致。
+_PANEL_ICON = {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"}
 
 # 触发菜单的说法。除了 /menu，用户在手机上会直接打这几个字。
 TRIGGERS = frozenset({"/menu", "/m", "菜单", "menu", "帮助菜单", "?", "？"})
@@ -106,7 +133,7 @@ HELP = """**我在你的电脑上干活，结果发回这里。**
 **不想打字就点按钮**
 输入框上面那一排常驻菜单随时能点；想要全部按钮，发「菜单」两个字。
 · 「📂 换项目」— 换到别的项目，列出来点一下就行
-· 「🔑 权限」— 要不要每步问你（只读 / 可改文件 / 全授权）
+· 「🔑 权限」（在「⚡ 常用」里）— 现在是「全授权」，项目里的事不问就做；想让它每步先问你，切到「只读」
 · 「🧠 模型」— 用哪个模型（均衡 / 最聪明 / 最快）
 · 「ℹ️ 现在状态」— 看现在在哪、什么权限
 · 「⏹ 停下」— 停下正在跑的那一轮
@@ -122,11 +149,12 @@ HELP = """**我在你的电脑上干活，结果发回这里。**
 · 它手里那一轮**停不了** —— 只能到电脑上按 Esc（点「⏹ 停下」也会照实告诉你）
 
 **它做不到的**
-· 看不到你指定目录之外的东西（想换就点「📂 换项目」）
-· 不会读 `.env`、私钥这类凭据（读了也不会发出来）
-· 不会推代码、不会删东西、不会提权
+· 只在你指定的项目里动手；要动项目以外的东西会先问你（想换项目点「📂 换项目」）
+· 不会读私钥、密码这类凭据，点同意也不行
+· 不会推代码、不会删掉你的整个家目录、不会提权
 
 电脑睡着时收不到消息，醒了也不会补发 —— 发了没回先看看电脑是不是睡了。
+电脑不在身边时，点输入框上面「⚡ 常用」里的「🌐 网页版」，在网页里问（不经过电脑，查不了电脑上的文件）。
 
 按钮出不来的时候，也可以直接发文字：/stop 停下、/sessions 看会话、/cd 加项目名 换项目。
 """
@@ -156,6 +184,7 @@ _APP_LITERALS = frozenset({
     "/cancel",
     "/诊断", "/diag", "/diagnose",
     "/update", "/upgrade",   # 第 14 轮：自动更新（「更新」两个字也认，见 app.UPDATE_WORDS）
+    "/history", "/历史", "/最近",   # 「↑ 最近问过」（bridge/history.py）
 })
 
 # 一个 token 像不像"命令"：`/` 后面跟字母或汉字，中间不能再有 `/`。
@@ -269,7 +298,10 @@ def _row(buttons: list[dict]) -> dict:
 
 
 def build_menu_card(workspace_label: str = "", policy=None) -> str:
-    """菜单卡片 JSON。
+    """菜单卡片 JSON（「全部按钮」）。
+
+    从上到下：当前状态 → 常用控制（点得多的在前）→ 常用问题 → 折叠面板「更多」。
+    折叠面板是客户端本地展开的，不走回调；面板里的按钮和外面的一样走 `resolve_click`。
 
     顶上一行是**当前状态**：在哪个目录、哪一档权限、哪个模型。
     这是照着豆包工作那排抄的 —— 他们把这三样直接写在输入框下面，
@@ -292,20 +324,56 @@ def build_menu_card(workspace_label: str = "", policy=None) -> str:
     if status_bits:
         elements.append({"tag": "markdown", "content": "　".join(status_bits)})
 
+    # 🔴 第 28 轮：常用的放最上面（数据见 CONTROLS 的注释），没数据的收进折叠面板。
+    # 点得最多的「看看会话」（悬浮栏 60 / 147）用主色，一眼找到。
+    def rows(buttons: list[dict]) -> list[dict]:
+        return [_row(buttons[i : i + 2]) for i in range(0, len(buttons), 2)]
+
+    pinned_says = {_QUESTION_TEXT[key] for key in _PINNED_QUESTIONS}
+    controls = [
+        _button(label, {"act": "menu", "cmd": cmd}, primary=(cmd == _PINNED_CONTROLS[0]))
+        for cmd, label in CONTROLS
+        if cmd in _PINNED_CONTROLS
+    ]
+    elements.extend(rows(controls))
+
     elements.append({"tag": "markdown", "content": "**点一下就问：**"})
     questions = [
         _button(label, {"act": "menu", "say": say})
         for say, label in QUICK_QUESTIONS
+        if say in pinned_says
     ]
-    for i in range(0, len(questions), 2):
-        elements.append(_row(questions[i : i + 2]))
+    elements.extend(rows(questions))
 
-    elements.append({"tag": "hr"})
-    controls = [
-        _button(label, {"act": "menu", "cmd": cmd}) for cmd, label in CONTROLS
+    more_questions = [
+        _button(label, {"act": "menu", "say": say})
+        for say, label in QUICK_QUESTIONS
+        if say not in pinned_says
     ]
-    for i in range(0, len(controls), 2):
-        elements.append(_row(controls[i : i + 2]))
+    more_controls = [
+        _button(label, {"act": "menu", "cmd": cmd})
+        for cmd, label in CONTROLS
+        if cmd not in _PINNED_CONTROLS
+    ]
+    if more_questions or more_controls:
+        # 标题里把面板里有什么写出来 —— 收起来的东西不说名字，就等于没有。
+        names = [label.split(" ", 1)[-1] for cmd, label in CONTROLS if cmd not in _PINNED_CONTROLS]
+        if more_questions:
+            names.append("更多问题")
+        elements.append(
+            {
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {"tag": "markdown", "content": "**更多：**" + " · ".join(names)},
+                    "width": "fill",
+                    "icon": _PANEL_ICON,
+                    "icon_position": "right",
+                    "icon_expanded_angle": -180,
+                },
+                "elements": rows(more_controls) + rows(more_questions),  # 和标题的先后一致
+            }
+        )
 
     elements.append(
         {
@@ -343,14 +411,23 @@ def build_confirm_loosen_card(target: str, policy) -> str:
 
     label = MODE_LABELS.get(target, target)
     if target == "trusted":
+        # 🔴 第 17 轮补上「项目外还会问你」—— 那是放开之后**唯一还会弹卡**的情况
+        # （实测：`echo x > ~/Desktop/p.txt` 在全授权下仍然弹卡）。
+        # 原来这段只写红线，用户读完以为再也不弹卡，真弹了一张时不知道为什么。
         what = (
-            "**不再问你**就能改文件、跑命令、装依赖。\n"
-            "仍然挡着少数不可逆的：删家目录、`git push`、读 `.env` 和私钥。"
+            "项目里的事**不再问你**：改文件、跑命令、装依赖都直接做。\n"
+            "要动项目以外的东西还会先问你一下；"
+            "删家目录、推代码、读私钥这几样永远不做。"
         )
     else:
         # 🔴 写清"仍要逐次确认"。原来写"能直接编辑文件"，而钩子只在全授权下跳过确认 ——
         # 用户点了两下放开，结果每次改文件还是弹卡片（2026-11-04 review）。
-        what = "能改工作目录里的文件，**每次改之前先问你一下**（点同意就改）。仍不能提交、不能删、不能跑任意命令。"
+        # 🔴 第 17 轮：末句原来是「仍不能提交、不能删、不能跑任意命令」—— 和只读档
+        # 那句「不能改文件」同一个毛病（点同意它就做了）。只留**点同意也不许**的那几样。
+        what = (
+            "能改项目里的文件，**每次动手之前先问你一下**（点同意才做）。\n"
+            "删家目录、推代码、读私钥这几样永远不做。"
+        )
     elements = [
         {
             "tag": "markdown",
@@ -425,9 +502,14 @@ def build_mode_card(policy) -> str:
                 # 而中间白白等了一次安装。所以这里只留他**真能执行**的那一条：找人。
                 # 🔴 2026-11-05 用户拍板：不说「不会改你的文件」—— 实测只读档下坚持一句
                 # 会弹审批卡，点同意文件真的被改了。按真实行为说（同 policy.describe）。
-                "content": "这台电脑只开了「只读」：默认只看、只查，要改东西会先弹卡片问你。"
-                "想让它不用问就能改代码，找给你装的那位同事放开一下 —— "
-                "这一档是装的时候定下的，手机上点不开。",
+                #
+                # 🔴 第 17 轮：原来结尾写「这一档是装的时候定下的」。第 16 轮把安装默认
+                # 翻成了全控制之后那句话是假的 —— 装出来的就是全控制，走到这一格只剩两种：
+                # 管理员放了策略文件，或者有人主动把这台机器锁死在只读。
+                # 所以改成「被锁在只读」，并且照旧只给他**真能执行**的那条下一步：找人。
+                "content": "这台电脑被锁在「只读」：默认只看、只查，要改东西会先弹卡片问你。"
+                "想让它不用问就能改代码，找管理员或给你装的那位同事放开一下 —— "
+                "手机上点不开。",
                 "text_size": "notation",
             }
         )

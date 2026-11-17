@@ -48,6 +48,7 @@ DO_COMMANDS = {
     "help": "/help",
     # 诊断卡。纯显示、且内容走 status.HEALTH_FIELDS 白名单 ⇒ 点错了最坏只是多发一张卡。
     "diag": "/诊断",
+    "history": "/history",  # 「↑ 最近问过」卡（只显示，不改任何设置）
 }
 
 # 这几个只是「看」，不看是哪个聊天也能做；其余的要对准是哪个聊天（退出 / 停 / 新话题 / 继续）。
@@ -67,6 +68,7 @@ DEFAULT_LABELS = {
     "menu": "📋 菜单",
     "help": "❓ 帮助",
     "diag": "🩺 运行诊断",
+    "history": "↑ 最近问过",
 }
 
 # 点了之后的 toast。不许露内部命令（同 app._toast_for 的红字）。
@@ -83,6 +85,7 @@ TOASTS = {
     "menu": "收到，打开菜单",
     "help": "收到，打开帮助",
     "diag": "收到，看看运行状态",
+    "history": "收到，调出最近问过的话",
 }
 
 MAX_BUTTONS_CARD_BYTES = 8 * 1024
@@ -190,6 +193,36 @@ def fleet_button(op: str, tool: str, sid: str, label: str, primary: bool = False
     from .cards import fleet_value
 
     return _button(label, fleet_value(op, tool, sid), primary)
+
+
+# 第 33 轮「↩︎ 接着上次」：闲太久开了新会话，点它换回上一个。
+# 回调值只有 `{"act": "cont", "n": <序号>}`：要换回哪个会话记在服务端（`Bridge._continue_offers`），
+# 卡片值伪造不出「换到任意会话」。序号对不上 / 多带键 ⇒ 拒（`resolve_continue_click`）。
+CONTINUE_ACT = "cont"
+CONTINUE_HEAD_CHARS = 12
+
+
+def continue_label(head: str) -> str:
+    """「↩︎ 接着上次（<上次那句话前 12 字>）」。调用方先脱敏；没有那句话 ⇒ 不带括号。"""
+    one = " ".join(str(head or "").split())
+    if not one:
+        return "↩︎ 接着上次"
+    short = one if len(one) <= CONTINUE_HEAD_CHARS else one[:CONTINUE_HEAD_CHARS] + "…"
+    return f"↩︎ 接着上次（{short}）"
+
+
+def continue_button(nonce: str, head: str = "") -> dict:
+    return _button(continue_label(head), {"act": CONTINUE_ACT, "n": str(nonce)})
+
+
+def resolve_continue_click(value: Any) -> str:
+    """回调 value → 序号；形状不对（多键、不是字符串、太长）⇒ 空串。对不对得上由调用方查服务端记录。"""
+    if not isinstance(value, dict) or value.get("act") != CONTINUE_ACT or set(value) != {"act", "n"}:
+        return ""
+    nonce = value.get("n")
+    if not isinstance(nonce, str) or not nonce or len(nonce) > 32:
+        return ""
+    return nonce
 
 
 def readonly_button(label: str = "🔒 收回到只读") -> dict:

@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -104,14 +105,72 @@ def _update(path: str, app_id: str, **fields) -> None:
     _save(path, apps)
 
 
+def scopes_fingerprint() -> str:
+    """我们**现在**想要的那套权限清单 + 悬浮菜单形状的指纹。任何一个变了它就变。
+
+    （函数名保留旧的：安装器 / 测试 / `menu_heal.json` 的 `scopes` 键都按这个名字认。）
+
+    🔴 为什么要有（第 17 轮，角色 F 调研流式时撞出来）：
+    装机时申请权限只发生一次，而 `done: true` 之后自愈线程直接返回、不再碰权限
+    ⇒ **以后新增的 scope 永远到不了老用户手上**。现场实测：本机生产应用 13 项 scope、
+    流式要的 `cardkit` 一项都没有，而 `menu_heal.json` 已经是 `done: true`。
+    两边都看不出来：用户那边是「新功能没反应」，我们这边是「我发版了啊」。
+
+    判据放在**我们要什么**（`register.WANT_SCOPES`）上，不是「服务端现在有什么」——
+    后者要发请求，而这个函数在判「要不要重跑」时被调用，不能依赖网络。
+    """
+    try:
+        try:
+            from .register import WANT_CALLBACKS, WANT_SCOPES   # 包方式
+        except ImportError:
+            # 🔴 脚本方式：安装器跑 `python bridge/botmenu.py`，没有父包。
+            # 这个文件上面 `botmenu` 的 import 已经是这个形状（`menu_heal.py:57-59`），
+            # 漏了这一处会让指纹恒为空串 ⇒ 判据静默失效（`test_r12_menu_heal` 当场抓到）。
+            from register import WANT_CALLBACKS, WANT_SCOPES  # type: ignore[no-redef]
+    except Exception:  # noqa: BLE001 —— 认不出就返回空串 ⇒ 退回老行为（done 仍然算 done）
+        return ""
+    material = "\n".join(sorted(WANT_SCOPES) + sorted(WANT_CALLBACKS))
+    # 🔴 2026-11-10（悬浮栏加「🌐 网页版」）：菜单的形状也要进指纹。原来只看权限清单 ⇒
+    # 改了 `botmenu.MENU_TREE`，老机器 `done: true` + 指纹不变 ⇒ 自动更新跳过、自愈也不写 ⇒
+    # **新菜单永远到不了老用户**（和第 17 轮新 scope 到不了是同一个坑）。
+    # 代价：菜单每改一次，每个应用会多发一个版本（企业开了审核 = 管理员多批一次）——
+    # 这正是让新菜单生效必须付的那一次，不会反复：写成后指纹对上就停。
+    try:
+        menus = _botmenu().build_bot_menus()
+    except Exception:  # noqa: BLE001 —— 读不出菜单 ⇒ 只按权限清单算（老行为）
+        menus = None
+    if menus is not None:
+        material += "\nmenu:" + json.dumps(menus, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
 def is_done(path: str, app_id: str) -> bool:
-    return bool(app_id) and _record(path, app_id).get("done") is True
+    """这个 app 的菜单 / 权限 / 订阅都装好了吗。
+
+    🔴 「装好了」要连**装的是哪一套清单**一起看（见 `scopes_fingerprint`）：
+    - 记录里没有 `scopes` 字段 ⇒ 是这一轮之前写的（现场所有老机器都是这样）⇒ 当成没装好，
+      自愈会再跑一次把新权限补上
+    - 指纹和现在的清单不一样 ⇒ 我们新增过 scope ⇒ 同上
+    - 一样 ⇒ 照旧「成功一次永不再写」（这个设计是对的，别退回「每次启动都申请」）
+    """
+    if not app_id:
+        return False
+    record = _record(path, app_id)
+    if record.get("done") is not True:
+        return False
+    want = scopes_fingerprint()
+    if not want:
+        return True          # 认不出清单 ⇒ 不要因为判不出就反复申请
+    return record.get("scopes") == want
 
 
 def mark_done(path: str, app_id: str, version: str, *, at: float | None = None) -> None:
-    """菜单写成 + 订阅成 + 版本提交成 ⇒ 落标记。安装器（`botmenu.py` 脚本入口）和自愈线程共用。"""
+    """菜单写成 + 订阅成 + 版本提交成 ⇒ 落标记。安装器（`botmenu.py` 脚本入口）和自愈线程共用。
+
+    连**这一次装的是哪套权限清单**一起记（`scopes`）—— 以后清单变了才知道要重跑。
+    """
     _update(path, app_id, done=True, version=version, at=at if at is not None else time.time(),
-            last_error="")
+            scopes=scopes_fingerprint(), last_error="")
 
 
 class MenuHeal:
@@ -200,7 +259,8 @@ class MenuHeal:
             self._done = True
             return True
         version = time.strftime("1.%Y%m%d.%H%M%S", time.localtime(self._clock()))
-        pub = bm.publish(self.app_id, token, version, "补上常驻菜单（装机时没配上）", http=call)
+        # 措辞不再写「装机时没配上」：菜单改了形状（指纹变了）也走这里，那时装机是好的。
+        pub = bm.publish(self.app_id, token, version, "补上或更新常驻菜单", http=call)
         if pub.get("code"):
             return self._failed_with(pub, "发布版本", table=bm.PUBLISH_ERRORS)
 

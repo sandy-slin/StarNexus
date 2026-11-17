@@ -81,6 +81,10 @@ _BRIDGE_CONTEXT = (
 )
 
 
+# 一轮里前后几段文字（中间隔着工具调用）之间的分隔。流式累加和最终文本必须用同一个。
+_BLOCK_SEP = "\n\n"
+
+
 @dataclass
 class TurnResult:
     ok: bool
@@ -131,6 +135,11 @@ class ClaudeRunner:
             prompt,
             "--output-format",
             "stream-json",
+            # 🔴 第 18 轮：要逐字增量才能做流式回答（用户催过多次）。
+            # 这是 `--output-format stream-json` 的配套参数（`claude --help` 原话
+            # 「only works with --print and --output-format=stream-json」，两个都满足）。
+            # 不开它只有整块 `assistant` 事件 ⇒ 卡片上只能等一轮跑完一次性出现。
+            "--include-partial-messages",
             "--verbose",  # stream-json 需要它才给逐事件输出
             "--model",
             policy.model,
@@ -162,8 +171,14 @@ class ClaudeRunner:
         approval_dir: str | None = None,
         cancel: "asyncio.Event | None" = None,
         policy: Policy | None = None,
+        on_text=None,
+        on_session=None,
     ) -> TurnResult:
         """跑一轮。
+
+        `on_session(session_id)`（第 32 轮）：读到开头那条 `system/init` 就回调一次，
+        让上层**跑到一半**就知道 claude 会话 id（进程被杀时靠它续跑）。
+        和 `on_text` 一样必须同步、只记不发 —— 它跑在读子进程的循环里。
 
         `cancel` 给 `/stop` 用：置位后杀掉子进程并如实回报「被你停下了」。
         没有它的话，一句打错的请求会占住会话到 `turn_timeout_sec`（默认 15 分钟），
@@ -188,18 +203,27 @@ class ClaudeRunner:
         # 读一个大文件、贴一段长 diff 都会让 `readline()` 抛
         # `ValueError: Separator is found, but chunk is longer than limit`，
         # 整轮任务直接失败。2026-11-04 实测复现（逐个读 10 个 py 文件就触发）。
-        proc = await asyncio.create_subprocess_exec(
-            limit=_STREAM_LIMIT,
-            *argv,
-            cwd=workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                limit=_STREAM_LIMIT,
+                *argv,
+                cwd=workspace,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except FileNotFoundError:
+            # 🔴 第 25 轮（P-newbie 复现）：后台服务的 PATH 是装机那一刻写死的；claude 后来换了位置
+            # （换安装方式、升级）⇒ 这里抛异常 ⇒ 上层兜成「出错了，点新话题再试」，点了也没用。
+            return TurnResult(ok=False, text="",
+                              error="后台找不到 Claude Code，重新双击一次安装包就能修好（设置都会保留）。")
 
         # ↓↓↓ 这里到 gather 之间不要加任何 await —— 见文件头第 1 条。
         progress = Progress(last_event_at=time.monotonic())
         collected: list[str] = []
+        # 流式那条路自己累加（`collected` 走完整 `assistant` 事件，一个字不动）。
+        # 两者可能有极小差异（delta 丢包）⇒ 终态卡一律用 `result.text` 重写，不信累加值。
+        streamed: list[str] = []
         final: dict | None = None
         stderr_tail: list[str] = []
 
@@ -216,7 +240,34 @@ class ClaudeRunner:
                 except json.JSONDecodeError:
                     continue
                 kind = event.get("type")
-                if kind == "assistant":
+                if (kind == "system" and event.get("subtype") == "init"
+                        and on_session is not None and event.get("session_id")):
+                    # 🔴 同步回调、不 await（文件头第 1 条）。回调抛异常不能把这一轮读断。
+                    try:
+                        on_session(str(event["session_id"]))
+                    except Exception:  # noqa: BLE001
+                        logger.exception("on_session 回调出错（只影响重启后续跑）")
+                if kind == "stream_event":
+                    # 逐字增量。🔴 只认 `text_delta`：`input_json_delta`（工具参数）
+                    # 也是 `content_block_delta`，不按 `delta.type` 过滤就会把工具参数的
+                    # JSON 推到用户卡片上（第 17 轮角色 F 实测的事件形状）。
+                    inner = event.get("event") or {}
+                    if (inner.get("type") == "content_block_start"
+                            and (inner.get("content_block") or {}).get("type") == "text"
+                            and streamed):
+                        # 第 19 轮 S1-A5：前后两段文字中间隔着工具调用，原来直接粘在一起
+                        # （「…并总结。看到了：…」）。和下面 `collected` 用同一个分隔符。
+                        streamed.append(_BLOCK_SEP)
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta") or {}
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            streamed.append(delta["text"])
+                            if on_text is not None:
+                                # 🔴 **必须同步、只记不发**：这里一个 await 都不能有
+                                # （见本文件头第 1 条：spawn 到 gather 之间插 await 会让
+                                # 队列永久堵死）。真正发飞书由 app.py 那个独立协程做。
+                                on_text("".join(streamed))
+                elif kind == "assistant":
                     for block in event.get("message", {}).get("content", []):
                         if block.get("type") == "text" and block.get("text"):
                             collected.append(block["text"])
@@ -288,7 +339,7 @@ class ClaudeRunner:
             waiters[0].cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await waiters[0]
-            partial = "".join(collected).strip()
+            partial = _BLOCK_SEP.join(collected).strip()
             return TurnResult(
                 ok=False,
                 text=partial,
@@ -302,7 +353,7 @@ class ClaudeRunner:
             cancel_task.cancel()
 
         duration = time.monotonic() - started
-        text = "".join(collected).strip()
+        text = _BLOCK_SEP.join(collected).strip()
         denials = (final or {}).get("permission_denials") or []
         session_id = (final or {}).get("session_id") or resume
         cost = float((final or {}).get("total_cost_usd") or 0.0)

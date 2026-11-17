@@ -34,21 +34,24 @@ import re
 MASK = "[已脱敏]"
 
 # 一眼能认的密钥形状。顺序无关，逐条替换。
+# 🔴 第 19 轮：边界不用 `\b` —— Python 的 `\w` 含中文字，「密钥是sk-…」里「是」和 `s`
+# 之间**没有**词边界 ⇒ 紧贴中文写的密钥一条都不匹配，原样进飞书（W3 实测）。
+# 改成「前面不是 ASCII 字母数字/_/-」，中文、标点、空格、行首都算边界。
 _KNOWN_SHAPES = (
     # OpenAI / Anthropic 风格
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{16,}"),
     # GitHub
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{20,}"),
     # AWS
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"(?<![A-Za-z0-9_-])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
     # Slack / Google / 飞书
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),
-    re.compile(r"\b(?:cli|cig)_[a-f0-9]{16}\b"),
+    re.compile(r"(?<![A-Za-z0-9_-])xox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])(?:cli|cig)_[a-f0-9]{16}(?![A-Za-z0-9])"),
     # JWT（三段 base64url）
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
 )
 
 # URL 里的 `:密码@`。只抹密码那一段，保留协议/用户名/主机 —— 用户还要看懂这是哪个库。
@@ -58,7 +61,8 @@ _KNOWN_SHAPES = (
 # 这条路上**没有别的闸门**：进会话聊天用的是目标会话在电脑上那套权限，
 # pathguard 和工作目录白名单都不在这条路上，脱敏是唯一的出口。
 # `[^\s/:@]*` 而不是 `+`：`redis://:hunter2@host` 这种空用户名的形式也要盖到（实测漏过）
-_URL_CREDENTIAL = re.compile(r"\b([a-z][a-z0-9+.\-]*://[^\s/:@]*:)([^\s/@]{3,})(@)")
+# 🔴 第 24 轮：开头不用 `\b`（中文算 `\w` ⇒「连接串是postgres://…」不匹配，R-stream 实测原样上卡）
+_URL_CREDENTIAL = re.compile(r"(?<![A-Za-z0-9_-])([a-z][a-z0-9+.\-]*://[^\s/:@]*:)([^\s/@]{3,})(@)")
 
 # 私钥块：整段抹掉，不留行数（行数本身也是信息）
 _PRIVATE_KEY_BLOCK = re.compile(
@@ -75,7 +79,9 @@ _SECRET_KEY_WORDS = (
     r"private[_-]?key|auth|credential|bearer|session[_-]?id|cookie|"
     # 🔴 Cursor store.db 的 blobEncryptionKey（44 位 base64）原来一个词都对不上 ⇒ 原样外发。
     # 本机 3 份 Claude 记录里出现过它，其中 2 份带着真值（2026-11-04 安全审查）。
-    r"encryption[_-]?key|blob[_-]?key|signing[_-]?key|master[_-]?key"
+    r"encryption[_-]?key|blob[_-]?key|signing[_-]?key|master[_-]?key|"
+    # 第 25 轮（P-guard 实测 hits=0）：中文键名、passphrase
+    r"passphrase|密码|口令|密钥|秘钥|令牌"
 )
 # 值可能带 `Bearer ` 前缀（`AUTH_TOKEN=Bearer abc…`）—— 实测漏过，
 # 因为原来的字符类在空格处就停了。这里显式允许一个方案前缀。
@@ -84,6 +90,22 @@ _ASSIGNMENT = re.compile(
     rf"(\"?)((?:Bearer\s+|Basic\s+|token\s+)?[^\s\"',;}}]{{8,}})(\"?)",
     re.IGNORECASE,
 )
+# 第 25 轮（P-guard 实测 hits=0）：
+#   `密码：Tr0ub4dor&3xyz` / `数据库密码是 …`（中文冒号、「是」）——上面那条只认 `=` `:`
+#   `password Tr0ub4dor&3xyz`（.netrc 一行一对、用空格隔开）
+#   `curl -u admin:MyP@ssw0rd123` / `mysql -uroot -pS3cret`（命令行里的口令）
+# 值仍要求 ≥8 个非空白字符、且至少含一个数字或符号（纯英文单词不打码：「密码是 什么」不误伤）。
+_CJK_OR_SPACE_ASSIGNMENT = re.compile(
+    r"((?:密码|口令|密钥|秘钥|令牌|passphrase)\s*(?:[:：=]|是|为)\s*"
+    r"|(?:^|\s)(?:password|passwd|passphrase)\s+)"
+    r"(?=[^\s，。；]*[0-9!@#$%^&*_+=/\\-])([^\s，。；\"']{8,})",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CLI_PASSWORD = re.compile(
+    r"((?<![A-Za-z0-9_-])(?:curl|wget|http)\b[^\n]*?\s(?:-u|--user)\s+[^:\s]+:)([^\s]{4,})"
+    r"|((?<![A-Za-z0-9_-])(?:mysql|mysqldump|mariadb)\b[^\n]*?\s-p)([^\s]{4,})",
+)
+
 # JSON 里 `"key": "value"` 的形式（键名在引号里）
 _JSON_FIELD = re.compile(
     rf"(\"[A-Za-z0-9_-]*(?:{_SECRET_KEY_WORDS})[A-Za-z0-9_-]*\"\s*:\s*\")"
@@ -152,6 +174,23 @@ def redact(text: str) -> tuple[str, int]:
 
     result = _JSON_FIELD.sub(mask_json, result)
 
+    def mask_cjk(match: re.Match) -> str:
+        nonlocal hits
+        if MASK in match.group(2):
+            return match.group(0)
+        hits += 1
+        return f"{match.group(1)}{MASK}"
+
+    result = _CJK_OR_SPACE_ASSIGNMENT.sub(mask_cjk, result)
+
+    def mask_cli(match: re.Match) -> str:
+        nonlocal hits
+        hits += 1
+        head = match.group(1) if match.group(1) is not None else match.group(3)
+        return f"{head}{MASK}"
+
+    result = _CLI_PASSWORD.sub(mask_cli, result)
+
     return result, hits
 
 
@@ -165,3 +204,40 @@ def redact_with_notice(text: str) -> str:
     if hits:
         result += f"\n\n🔒 有 {hits} 处看着像凭据的内容没有发出来（飞书是外部系统）"
     return result
+
+
+# ── 本机日志脱敏 ────────────────────────────────────────────────────
+# 🔴 2026-11-10 实测：lark-oapi 每次连上/断开都把整条 ws 地址打进 INFO，
+# 里面的 `access_key=` / `ticket=` 是长连接凭证。本机 agent.log 从 11-03 起每天几十行原文
+# （SDK 自己的 `[Lark]` handler 和我们的 root handler 各打一份，两份都是原文）。
+# 只在本机，不外发（status.py 只回传分类计数），但日志会被人拷去发给 IT / 贴进群。
+_WS_QUERY_SECRET_RE = re.compile(r"(?i)\b(access_key|ticket)=[^&\s\]]+")
+
+
+def scrub_log_text(text: str) -> str:
+    """把日志文本里 ws 地址的 access_key / ticket 值换成 `***`。"""
+    return _WS_QUERY_SECRET_RE.sub(r"\1=***", text)
+
+
+class LogScrubFilter:
+    """logging 过滤器：格式化前就把凭证抹掉。挂在 handler 上（logger 上的 filter 管不到传播来的记录）。"""
+
+    def filter(self, record) -> bool:  # noqa: D401
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 —— 日志过滤绝不能让业务崩
+            return True
+        clean = scrub_log_text(msg)
+        if clean != msg:
+            record.msg, record.args = clean, None
+        return True
+
+
+def install_log_scrubber(loggers=("", "Lark")) -> None:
+    """给 root 和 SDK 的 `Lark` logger 已有的每个 handler 装上过滤器。可重复调用。"""
+    import logging
+
+    for name in loggers:
+        for handler in logging.getLogger(name).handlers:
+            if not any(isinstance(f, LogScrubFilter) for f in handler.filters):
+                handler.addFilter(LogScrubFilter())

@@ -106,6 +106,28 @@ class ReviewContext:
     mode: str = "readonly"
 
 
+# 一条 denial 里"能拿来判"的字段。形状以**实测**为准（2026-11-07，真 claude 2.1.319）：
+#   {"tool_name": "Bash", "tool_use_id": "toolu_…",
+#    "tool_input": {"command": "git push origin main", "description": "…"}}
+#   {"tool_name": "Read", "tool_use_id": "toolu_…",
+#    "tool_input": {"file_path": "/tmp/…/outside.txt"}}
+# CLI 自己的 schema 也是这三个键（`tool_name` / `tool_use_id` / `tool_input`）。
+# 🔴 `description` 是**模型写的**，不拿它当判据 —— 那等于让被审查的一方填自己的罪名。
+_DENIAL_FIELDS = ("command", "file_path", "notebook_path", "path", "url")
+
+
+def _denial_text(item: dict) -> str:
+    """这一条 denial 里要判的那段文本。空串 = 读不出来（调用方按"判不出来"处理）。"""
+    payload = item.get("tool_input")
+    if not isinstance(payload, dict):
+        return ""
+    for key in _DENIAL_FIELDS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 class Reviewer:
     """独立审查层。判定在 agent 跑之前做一遍（看请求），跑完再做一遍（看发生了什么）。"""
 
@@ -156,18 +178,100 @@ class Reviewer:
     def review_outcome(self, denials: list[dict], ctx: ReviewContext) -> Decision:
         """跑完之后看发生了什么 —— 这是 dots 那条"能掐停"的落点。
 
-        判据不是"有没有被拒"（偶尔撞到白名单边界是正常的），而是**反复试探**：
-        同一轮里被拒多次，说明 agent 在系统性地找绕过的路，这种要掐停让人来看。
+        判据是**反复撞红线**，不是"被拒了几次"。
+
+        ## 为什么换掉"数所有拒绝"（第 17 轮）
+
+        原来是 `len(denials) >= 3`。`permission_denials` 这一个列表里混着三种
+        完全不同的事，数在一起就会把正常用法锁掉：
+
+        2026-11-07 实测（真 claude 2.1.319、haiku、`--permission-mode manual`、
+        `--setting-sources ""`，/tmp 下一次性目录，已清理）。一句
+
+            读 <目录外的文件>，然后跑 dig +short example.com，再跑 pbpaste
+
+        拿回 **3 条** denial（一条目录外的 `Read`、两条白名单里没有的命令）⇒
+        老判据当场掐停。而这三条**一条红线都没撞**，它正是"远程看一眼电脑"的样子。
+        原样抄在 `tests/test_r17_pause.py::MEASURED_NORMAL_LOOKING`。
+
+        ## 哪几类算、哪几类不算
+
+        **算（红线类）** —— 判据是 `cmdclass.never_approvable` / `_touches_credentials`
+        命中，外加用户自己的 `custom_rules`。共同点是**连点同意都不许做**
+        （`git push`、`sudo`、删根/家目录、`kubectl delete`、读凭据…）：
+        这些在产品里已经宣告过"任何模式下都不做"，所以它**不是边界**，
+        是已经被告知过的禁区。在同一轮里还换着写法撞第二下，才是"在找绕过的路"。
+
+        **不算（边界类）** —— 工具不在白名单（`dig`、`osascript`、`pbpaste`…）、
+        读写路径伸出工作目录。这两类的拒**不说明意图**，只说明清单的宽严：
+        - 白名单是正面清单，`cmdclass` 认不出的一律要问 ⇒ 它天然拒掉一大片无害命令；
+        - 目录外的读在只读 / 可改档照旧按作用域拒，而"看看桌面、看看别的项目"
+          正是这个产品的主要用途。
+        把这两类算进来，等于把"清单不够全"当成"用户在搞破坏"。
+
+        **判不出来的** —— 记录里没有能读的命令或路径字段（拿不到 `tool_input`）。
+        不知道是哪一类，就保守按**老判据**（3 次）走：宁可锁住让人来看。
+        `cmdclass` 万一 import 不进来（它和这里是两个人在改），也退到这条路上 ——
+        退化成原来的行为，不会变松。
+
+        ## 阈值
+
+        红线类 **2 次**（原来 3 次，针对的是"被拒"这种弱信号；红线是强信号，收一格）。
+        同一条命令被重放算一次 —— 一次意图被拒两遍不是试探，`resume` 本来就会重放
+        同一条命令。真正的防线是那次 deny 本身，掐停只是"叫人来看"。
         """
-        if len(denials) >= 3:
-            names = sorted({d.get("tool_name", "?") for d in denials})
+        red: list[str] = []          # 撞到的红线种类（人话，去重后放进话术）
+        seen: set[str] = set()       # 已经数过的红线文本，重放不重复计数
+        blind = 0                    # 判不出来的
+        for item in denials:
+            text = _denial_text(item)
+            if not text:
+                blind += 1
+                continue
+            why = self._red_line(item.get("tool_name", ""), text)
+            if why and text not in seen:
+                seen.add(text)
+                red.append(why)
+
+        if len(seen) >= 2:
+            kinds = list(dict.fromkeys(red))[:3]
             return Decision(
                 Verdict.PAUSE,
-                f"这一轮有 {len(denials)} 次操作被挡（{', '.join(names)}）。"
-                "连续试探被拦的工具不正常，已暂停这个会话等你确认。",
+                f"这一轮里有 {len(seen)} 次操作撞到了红线（{'、'.join(kinds)}），"
+                "这些是任何时候都不做的事。我先停下了，"
+                "确认没问题的话点「继续」。",
+                rule="red_line_probing",
+            )
+        # 判不出来的那部分照老判据走（见上面"判不出来的"那一段）
+        if blind >= 3:
+            return Decision(
+                Verdict.PAUSE,
+                f"这一轮有 {blind} 次操作被挡下来，但看不出它们想做什么。"
+                "我先停下了，确认没问题的话点「继续」。",
                 rule="repeated_denials",
             )
         return Decision(Verdict.ALLOW, "")
+
+    def _red_line(self, tool_name: str, text: str) -> str:
+        """这一条拒是不是撞了红线。返回人话的种类，空串 = 只是边界。
+
+        命令走 `never_approvable` 全套；**路径只查凭据那一项** ——
+        那张清单里有 `eval`/`exec` 这类词，拿去匹配文件路径会误判
+        （`~/codes/exec/notes.md` 不是红线）。
+        """
+        for rule in self.custom_rules:
+            try:
+                if re.search(rule, text, re.I):
+                    return "你自己加的禁止项"
+            except re.error:
+                continue  # 用户写错正则不该让一轮崩掉（同 review_request）
+        try:
+            from .cmdclass import _touches_credentials, never_approvable
+        except Exception:  # noqa: BLE001 —— import 不进来就退到老判据，不会变松
+            return ""
+        if tool_name == "Bash":
+            return never_approvable(text)
+        return _touches_credentials(text)
 
 
 # ---------- 审批令牌 ----------

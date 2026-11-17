@@ -101,22 +101,77 @@ FIRST_EXAMPLES = (
 )
 _EXAMPLE_LINES = "\n".join(f"· {line}" for line in FIRST_EXAMPLES)
 
-# 只读那一档怎么说。两条开场路共用（同上，不许各写一份）。
-_READONLY_NOTE = (
-    "现在是**只读**：能看代码、查 git、搜文件。要它改东西会先弹一张卡片问你，"
-    "点「同意，去做」才动手。"
-)
+# 「现在是哪一档」怎么说。两条开场路共用（同上，不许各写一份）。
+#
+# 🔴 第 17 轮：这句原来是写死的只读那一版（`_READONLY_NOTE`），而第 16 轮已经把
+# 安装默认翻成了全控制 ⇒ 每个新用户收到的**第一句话**都在撒谎，而且撒在危险的方向上：
+# 他以为「它动手前会问我」，于是放心把它指到一个仓库上，它不问就改。
+#
+# 现在按**实际档位**生成。现场数据（真跑 `approval.HOOK_SOURCE`，2026-11-07）：
+#   全授权 + 工作目录内：改文件 / 删文件 / 跑命令 / git commit  全是 allow，一张卡都不弹
+#   全授权 + 目录外读：  `ls ~/Desktop`、`cat ~/.zsh_history`   allow
+#   全授权 + 目录外写：  `echo x > ~/Desktop/p.txt`             defer（弹卡）
+#   任何档：             `git push`、`sudo`、`rm -rf ~`、读私钥  deny（点同意也不许）
+#
+# 🔴 措辞上的两条纪律：
+# - 不写「不能改文件」那一类绝对承诺（2026-11-05 实测证伪：只读档点同意就改了）。
+#   只有**点同意也不许**的那几样才敢写「永远不做」。
+# - 全控制那句必须紧跟着说清挡什么 + 怎么切回只读（领导原话：「要安全的话让他
+#   单独设定只读权限」），否则用户只收到「它什么都能干」，不知道边界也不知道出路。
+_NOTES = {
+    "readonly": (
+        "现在是**只读**：能看代码、查 git、搜文件。要它改东西会先弹一张卡片问你，"
+        "点「同意，去做」才动手。想让它直接动手，点「🔑 权限」放开。"
+    ),
+    "write": (
+        "现在是**可改文件**：能改项目里的文件，每次动手前先弹一张卡片问你，"
+        "点「同意，去做」才改。删家目录、推代码、读私钥这几样永远不做。"
+    ),
+    "trusted": (
+        "现在是**全授权**：看文件、跑命令、改项目里的东西都不用再问你。"
+        "删家目录、推代码、读私钥这几样永远不做；要动项目以外的东西还会先问你。"
+        "想更安全，点「🔑 权限」切到「只读」，它就每步都先问你。"
+    ),
+}
 
-BOUND_MESSAGE = (
-    "✅ 绑好了，这台电脑现在只听你的。\n"
-    "\n"
-    "**试试这么问**（直接说就行，不用记命令）：\n"
-    f"{_EXAMPLE_LINES}\n"
-    "\n"
-    f"{_READONLY_NOTE}\n"
-    "\n"
-    "不想打字就发「菜单」，一排按钮点一下就问。完整说明点「❓ 帮助」。"
-)
+
+def permission_note(mode: str) -> str:
+    """开场消息里「现在是哪一档」那句。认不出的档位按最松那档说。
+
+    🔴 兜底方向**刻意和别处的 fail-closed 相反**：说「会先问你」而实际不问，
+    用户按这句话放心 —— 那是安全语义上的谎；说「不问就做」而实际会问，
+    最坏只是多几张卡片。
+    """
+    return _NOTES.get(str(mode or ""), _NOTES["trusted"])
+
+
+def bound_message(mode: str) -> str:
+    """配对码那条路绑定成功后的第一条消息。
+
+    ⚠️ 两条写法上的约束，都来自
+    `tests/test_copy_quality.py::test_binding_reply_onboards_the_user` ——
+    它在 pairing.py 的**源码**上从 `✅` 开始、到第一个右圆括号为止抓这条消息：
+    1. 那句档位说明先放进局部变量，不要内联成函数调用（调用的右括号会把它截断在
+       「菜单」那行之前 ⇒「有没有给他指路」那条判据假红）；
+    2. 这段 docstring 和下面的正文里都不要出现那个正则的字面量，否则它先被抓到。
+    """
+    note = permission_note(mode)
+    return (
+        "✅ 绑好了，这台电脑现在只听你的。\n"
+        "\n"
+        "**试试这么问**（直接说就行，不用记命令）：\n"
+        f"{_EXAMPLE_LINES}\n"
+        "\n"
+        f"{note}\n"
+        "\n"
+        "不想打字就发「菜单」，一排按钮点一下就问。完整说明点「❓ 帮助」。"
+    )
+
+
+# 老名字留着：`app.py`（主会话的文件）和几处测试还按常量引用。
+# 🔴 它是**全控制**那一版 —— 和安装器默认一致；真实档位由
+# `bound_message(policy.mode)` 给（切过档、或 IT 锁只读的机器会不一样）。
+BOUND_MESSAGE = bound_message("trusted")
 
 
 # 扫码装完之后的那条开场消息。
@@ -129,18 +184,25 @@ BOUND_MESSAGE = (
 # 也就是说：**唯一的介绍被绑在了降级路径上**，按推荐方式装完的人打开飞书
 # 什么都看不到，不知道能干什么、怎么开始。
 #
-# 文案和 BOUND_MESSAGE 共用例句和只读那句（上面的红字）。开头一句不一样是有意的：
+# 文案和 BOUND_MESSAGE 共用例句和「现在是哪一档」那句（上面的红字）。开头一句不一样是有意的：
 # 配对那条是"刚绑好"，扫码这条是"装好了"，用户在两条路上看到的是各自真实发生的事。
-GREETING = (
-    "👋 装好了，我在你的电脑上干活，结果发回这里。\n"
-    "\n"
-    "**试试这么问**（直接说就行，不用记命令）：\n"
-    f"{_EXAMPLE_LINES}\n"
-    "\n"
-    f"{_READONLY_NOTE}\n"
-    "\n"
-    "下面的按钮点一下就能用，不想打字就点「菜单」。"
-)
+def greeting_message(mode: str) -> str:
+    """扫码装完那条开场消息。"""
+    note = permission_note(mode)
+    return (
+        "👋 装好了，我在你的电脑上干活，结果发回这里。\n"
+        "\n"
+        "**试试这么问**（直接说就行，不用记命令）：\n"
+        f"{_EXAMPLE_LINES}\n"
+        "\n"
+        f"{note}\n"
+        "\n"
+        "下面的按钮点一下就能用，不想打字就点「菜单」。"
+    )
+
+
+# 同 BOUND_MESSAGE：老名字留着，默认那一版是全控制。
+GREETING = greeting_message("trusted")
 
 # 开场消息的落盘标记。**单独一个文件**，不并进 prefs.json / chat_binds.json /
 # relay_consent.json：那三个各有自己的 schema 和"读失败一律当没设过"的约定，
@@ -391,21 +453,30 @@ class GreetingState:
         return ""
 
 
-def greeting_buttons() -> list:
+def greeting_buttons(mode: str = "") -> list:
     """开场消息下面那排按钮。
 
     开场三条例句的作用是"让他第一次就看到能用"，而手机上打字最费劲 ——
     所以第一屏就给按钮，点一下就有东西发生，不用先读完一段说明再想怎么开始。
     只放**点了不会让电脑上发生任何事**的（同 `fleet/actions.py` 那份白名单的判据）：
     菜单是主入口、换项目回答"它在看哪"、帮助是全文。
-    """
-    from .fleet.actions import do_button
 
-    return [
+    🔴 第 17 轮多一个「🔒 切到只读」（只在不是只读档时给）。理由是第 16 轮留下的缺口：
+    那个一键按钮原来**只挂在「切到全授权」之后那条回复上**，而默认就是全控制的人
+    从来不走那一步 ⇒ 他永远看不到它，切只读得自己翻「🔑 权限」卡。
+    方向是收紧，点错了最坏只是多问几次（放开仍然要走二次确认卡），所以
+    放进开场不违反上面那条「点了不让电脑上发生任何事」的精神。
+    """
+    from .fleet.actions import do_button, readonly_button
+
+    buttons = [
         do_button("menu", primary=True),
         do_button("dirs"),
         do_button("help"),
     ]
+    if str(mode or "") != "readonly":
+        buttons.append(readonly_button("🔒 切到只读"))
+    return buttons
 
 
 def greet_once(
@@ -414,6 +485,7 @@ def greet_once(
     owner_open_ids,
     connection_alive,
     send,
+    mode: str = "",
     wait_sec: float = GREET_WAIT_SEC,
     tick_sec: float = GREET_TICK_SEC,
     sleep=time.sleep,
@@ -429,6 +501,11 @@ def greet_once(
     下次重启再试"配合次数上限会把 3 次机会在几秒内烧光（看门狗重启很快）。
     所以这里轮询连接状态最多等 `wait_sec`，连上了才发。
     探活抛异常按"还没连上"处理 —— 这是启动路径，不能让它把线程带走。
+
+    `mode` = 这台机器现在真正生效的档位，决定开场怎么说权限、给不给「切到只读」按钮。
+    ⚠️ 不传时按安装器默认（全控制）说 —— 调用方（`app.Bridge._greet_in_background`）
+    **应该传 `self.policy.mode`**，否则 IT 锁只读的机器开场会说成全控制。
+    那个文件不归本角色改，已写进报告交给主会话。
     """
     reason = state.should_greet(owner_open_ids)
     if reason:
@@ -461,14 +538,15 @@ def greet_once(
 
     state.note_attempt()
     try:
-        buttons = greeting_buttons()
+        buttons = greeting_buttons(mode)
     except Exception:  # noqa: BLE001 —— 按钮是锦上添花，话本身要发出去
         logger.exception("开场按钮构造失败，只发文字")
         buttons = []
+    text = greeting_message(mode)
     sent = False
     for owner in _owners_of(owner_open_ids):
         try:
-            sent = bool(send(owner, GREETING, buttons)) or sent
+            sent = bool(send(owner, text, buttons)) or sent
         except Exception:  # noqa: BLE001 —— 飞书接口超时 / 网络抖动
             logger.exception("开场消息发送抛异常")
     if not sent:
@@ -526,8 +604,12 @@ class PairingGate:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         owner_already_set: bool = False,
         state_path: str = "",
+        mode: str = "",
     ) -> None:
         self.config_path = config_path
+        # 绑定成功那条消息里「现在是哪一档」要说对（见 `permission_note` 的红字）。
+        # 空串 ⇒ 按安装器默认（全控制）说。
+        self.mode = str(mode or "")
         self._code = _normalize(code)
         self.issued_at = float(issued_at or 0)
         self.ttl_sec = int(ttl_sec)
@@ -559,6 +641,10 @@ class PairingGate:
             except (TypeError, ValueError):
                 return default
 
+        # 配对只在**刚装完还没主人**时走得到，这时聊天里还没切过档，
+        # 所以配置里的起步档就是绑定那一刻真正生效的档（IT 策略文件只会更紧 ⇒
+        # 那种机器照旧说只读，由 `Settings.load` 那条路管，这里取不到也不会说松）。
+        agent = raw.get("agent", {}) if isinstance(raw, dict) else {}
         return cls(
             config_path,
             code=str(feishu.get("pairing_code") or ""),
@@ -566,6 +652,7 @@ class PairingGate:
             ttl_sec=_int("pairing_ttl_min", DEFAULT_TTL_MIN) * 60,
             max_attempts=_int("pairing_max_attempts", DEFAULT_MAX_ATTEMPTS),
             owner_already_set=bool(feishu.get("owner_open_ids") or []),
+            mode=str(agent.get("mode") or "") if isinstance(agent, dict) else "",
         )
 
     @classmethod
@@ -734,7 +821,7 @@ class PairingGate:
         return PairingResult(
             Outcome.BOUND,
             owner_open_id=open_id,
-            reply=BOUND_MESSAGE,
+            reply=bound_message(self.mode),
             attempts_used=used,
         )
 

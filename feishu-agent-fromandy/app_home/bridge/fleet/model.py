@@ -34,6 +34,7 @@ TOOLS = ("claude", "codex", "cursor")
 SURFACES = ("cli", "app", "bridge")
 STATUSES = ("running", "idle", "waiting", "stopped", "unknown")
 OWNERS = ("none", "terminal", "app", "bridge", "unknown")
+LAST_TURNS = ("done", "failed")  # `Session.last_turn` 只认这两个，别的一律当读不到
 
 # 默认原因：adapter 没说清楚的时候兜底用，总比卡片上一片空白强
 DEFAULT_WHY_NOT_SEND = "这个会话现在不能从手机上发消息。"
@@ -154,6 +155,13 @@ class Session:
     extra: dict = field(default_factory=dict)
     # 「等你」时它在问什么 / 等你确认哪一步（只有 adapter 读得出来时才有；读不出来就是 None，卡上不显示）
     pending: Optional[PendingAsk] = None
+    # 第 32 轮：**最后一轮**是怎么结束的（只有 adapter 从记录里真读到结束信号时才填）：
+    #   "done"   = 好好跑完了（Claude 最后一条是收尾的回复 / Codex 最后是 task_complete）
+    #   "failed" = 读到了失败信号（Claude 的 API 报错记录 / 桥自己发的 Codex 那一轮 turn.failed）
+    #   ""       = 读不到 / 还在跑 / 被人打断 —— 卡上就不标，**不猜**
+    # `last_turn_at`：那一轮结束的时间（记录里的时间戳；读不到就是 0，这时 last_turn 也清空）。
+    last_turn: str = ""
+    last_turn_at: float = 0
 
     def __post_init__(self) -> None:
         if self.tool not in TOOLS:
@@ -191,6 +199,15 @@ class Session:
             object.__setattr__(self, "extra", {})
         if not isinstance(self.pending, PendingAsk):
             object.__setattr__(self, "pending", None)
+        try:
+            turn_at = float(self.last_turn_at or 0)
+        except (TypeError, ValueError):
+            turn_at = 0.0
+        turn_at = turn_at if turn_at > 0 and turn_at == turn_at else 0  # NaN 也不要
+        # 没有时间的「跑完了」没法和「上次给你发卡」比先后 ⇒ 当成读不到
+        last_turn = self.last_turn if self.last_turn in LAST_TURNS and turn_at else ""
+        object.__setattr__(self, "last_turn", last_turn)
+        object.__setattr__(self, "last_turn_at", turn_at if last_turn else 0)
 
     @property
     def key(self) -> tuple:

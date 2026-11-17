@@ -22,7 +22,10 @@ logger = logging.getLogger("feishu-bridge.fleet")
 
 TOOL_LABELS = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor"}
 DEFAULT_TIMEOUT_SEC = 1.2  # 本机实测三家各自 50~270ms；留余量但总览要 < 1.5 秒
-RECENT_PER_TOOL = 6
+# 每家读多少个历史会话（在跑 / 等你的另算，全读）。第 28 轮从 6 提到 30：总览「还有 N 个，点开看全部」
+# 要真能列出来，读 6 个时 Codex / Cursor 那组点开也只有 6 行。本机实测三家读 30 个各 70~200ms，
+# 在 DEFAULT_TIMEOUT_SEC 之内；总览卡本身每组仍只列 MAX_ROWS_PER_TOOL 行，卡不会变大。
+RECENT_PER_TOOL = 30
 # 🔴 2026-11-06：**「等你」排第一**，排在「在跑」前面。
 # 原来是 running 在前、waiting 在后，而总览每组只列 8 行 ⇒ 实测 10 个在跑 + 2 个等你时，
 # 列出来的 8 行全是 🟢，两个在等主人的会话被压进「还有 11 个更早的没列出来」里 ——

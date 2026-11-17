@@ -24,7 +24,7 @@
 - 1 父 + 5 子过、6 子报 `210011`
 - 3 父 × 3 子 = 12 节点 ⇒ `99992402 the max len is 10`
 
-所以我们的形状是 **3 个主菜单 + 7 个子菜单 = 10**，一个不多。
+所以我们的形状是 **5 个主菜单 + 5 个子菜单 = 10**（见 `MENU_TREE`），一个不多。
 加菜单项前先跑 `validate_tree()`，它按这个真实上限算。
 
 ## 另外三个实测出来的必填/类型坑
@@ -34,6 +34,12 @@
 2. **`menu_content_type` 是数字 `[0,1,2,3,4]`，不是字符串。**
    传 `"event"` 得到 `menu_content_type is optional, options: [0,1,2,3,4]`。
    实测 `2` = 推事件（带 `event_key`），父节点用 `0`（只展开、不推事件）。
+   `1` = 跳转链接（2026-11-10 读官方文档 + SDK 1.7.5 `BotMenuNode`，**没实打过**）：
+   官方原文「菜单响应动作类型.0:未知，1：跳转链接，2：事件通知，3展开子菜单，4：发消息」；
+   链接放在 `redirect_link: {"pc_url", "mobile_url"}`，文档写「在客户端内打开链接。当
+   menu_content_type = 1 时必填」。没有 ios_url / android_url 之分，SDK 的
+   `BotMenuRedirectLink` 也只有这两个字段。跳转由飞书客户端完成、**不推事件** ⇒ 电脑关着也能点。
+   出处：open.feishu.cn 文档 `/uAjLw4CM/ukTMukTMukTM/application-v7/application-v7/application-ability/patch`
 3. **`i18n_name` 必填。** 只给 `default_name` 会被 `210011` 拒掉，
    而这个错**不说是哪个字段**（error 里只有 log_id），很难查。
    只给 `zh_cn` 就能过，但两个都给更稳。
@@ -61,9 +67,9 @@
 | 豆包 | 我们 | 点了 |
 |---|---|---|
 | 项目 › | 🖥 会话 | 电脑上开着的 Claude / Codex / Cursor 会话（原「📁 项目」，换项目在全部按钮里） |
-| 按需确认 › | 🔑 权限 | 权限选择卡 |
-| 自动 高 › | 🧠 模型 | 模型选择卡 |
-| 更多技能 › | ⚡ 常用 ›（4 子） | 几句高频问题 + 全部按钮 |
+| （没有）| ↑ 最近 | 最近问过的几句 |
+| （没有）| 🧠 模型 | 换模型 |
+| 按需确认 › / 自动 高 › / 更多技能 › | ⚡ 常用 ›（5 子） | 权限、🌐 网页版（跳转链接，不经过电脑）、两句高频问题、全部按钮 |
 | （没有）| ⏹ 停下 | 停掉正在跑的那一轮 |
 
 刻意不做：云电脑（只有一台机器）、插件/企业知识（技能就是本机 skills）。
@@ -76,28 +82,49 @@ from __future__ import annotations
 # event_key 上限 30 字符。值直接用"等价的用户输入"，这样分派走现成的命令/消息流程，
 # 不新开一条处理路径 —— 新路径就是新的绕过闸门的机会。
 # 🔴 一共只能有 10 个节点（父 + 子拍平后算）。改之前先读文件头那段实测。
-#    现在是 5 主 + 4 子 = 9，还剩 1 格。`validate_tree()` 按实测上限算。
+#    现在是 5 主 + 5 子 = 10，满了。`validate_tree()` 按实测上限算。
 # 悬浮样式下主菜单可以直接推事件（不必挂子菜单），所以照豆包那排做成
 # **一排平铺的 chip**，点一下就出对应的卡片 —— 不用先展开再选。
 # 只有「常用」挂子菜单（问句太多，一排放不下）。
-# 节点数：5 主 + 4 子 = 9 ≤ 10。
+# 节点数：5 主 + 5 子 = 10 ≤ 10（满）。
+# 2026-11-08：用户要「最近问过放进悬浮栏，方便快速找到」。悬浮栏实测最多 5 主，已经满了 ⇒
+# 让出一格：「🧠 模型」挪进「⚡ 常用」（日志 118 次菜单点击里它 18 次，切一次管很久；
+# 「⏹ 停下」虽然只点过 5 次，但要停的时候必须一下就点到，不挪）。节点数仍是 5 主 + 5 子 = 10。
+# 2026-11-10：加「🌐 网页版」（跳转链接，电脑关着也能用）。主人选的让位：「🔑 权限」挪进「⚡ 常用」。
+# 「⚡ 常用」实测每父最多 5 子 ⇒ 权限进来就得挤出一条：挤「找 TODO」（agent.log 11-04~11-10
+# 菜单点击：/mode 33、/model 25、/menu 9、q:changes 5、q:todo 2、q:projects 2）。
+# 「找 TODO」还在「全部按钮」那张卡上露着（menu._PINNED_QUESTIONS），没删功能，只是多点一下。
+# 节点数：5 主 + 5 子 = 10 ≤ 10（满）。
+# 2026-11-10 主人改定：「🧠 模型」单独放回第一排；「🔑 权限」「🌐 网页版」都进「⚡ 常用」。
 MENU_TREE = (
     # 原来是「📁 项目」(/dirs)。换项目仍能打 `/cd`、或在「全部按钮」卡片里点「换项目」。
     ("🖥 会话", "/sessions", ()),
-    ("🔑 权限", "/mode", ()),
+    ("↑ 最近", "/history", ()),
     ("🧠 模型", "/model", ()),
     (
         "⚡ 常用",
         "",
         (
-            ("有哪些项目", "q:projects"),
+            ("🔑 权限", "/mode"),
+            # 跳转链接（menu_content_type=1），key 只是本文件里的名字，不会作为事件发出去。
+            ("🌐 网页版", "link:web"),
             ("哪里有改动", "q:changes"),
-            ("找 TODO", "q:todo"),
+            ("有哪些项目", "q:projects"),
             ("全部按钮", "/menu"),
         ),
     ),
     ("⏹ 停下", "/stop", ()),
 )
+
+# 跳转链接型菜单项：key → 链接。飞书客户端自己打开，**不推事件、不经过电脑** ⇒ 电脑关机/合盖/断网也能点。
+# 🔴 这些 key 绝不进 `ALLOWED_KEYS`：它们永远不该从事件里来；要是来了，说明有人在伪造。
+LINK_URLS = {
+    "link:web": "https://chat.auto-link.com.cn/",
+}
+
+
+def is_link(key: str) -> bool:
+    return key in LINK_URLS
 
 # 常用问题的完整措辞 —— 菜单上显示短标签，发给 agent 的是这句。
 #
@@ -115,11 +142,14 @@ QUESTION_TEXT = {
 # 飞书实测出来的硬上限（文档没写）。见文件头。
 MAX_NODES = 10
 MAX_TOP = 5  # 悬浮样式（strategy=3）实测 5 主过、6 主拒
-MAX_CHILDREN = 10
+# 文件头实测「1 父 + 5 子过、6 子报 210011」；API 文档也写「悬浮菜单……每级菜单最多支持五个节点」。
+# 原来这里写 10（照抄后台文档的「每个主菜单 10 个子菜单」），校验器放过了 6 子 ⇒ 改成实测的 5。
+MAX_CHILDREN = 5
 
-# `menu_content_type` 的数字含义（实测）
-CONTENT_TYPE_NONE = 0  # 只展开子菜单，不推事件
-CONTENT_TYPE_EVENT = 2  # 推 application.bot.menu_v6，带 event_key
+# `menu_content_type` 的数字含义
+CONTENT_TYPE_NONE = 0  # 只展开子菜单，不推事件（实测）
+CONTENT_TYPE_LINK = 1  # 跳转链接，带 redirect_link（官方文档 + SDK，没实打过，见文件头）
+CONTENT_TYPE_EVENT = 2  # 推 application.bot.menu_v6，带 event_key（实测）
 
 # `bot_menu_display_strategy`：**菜单显示在哪**。实测取值 [0,1,2,3]，
 # 其中 0 直接被拒（210011），1 和 2 都接受。
@@ -148,10 +178,11 @@ DISPLAY_FLOAT = 3
 def _all_event_keys() -> set[str]:
     keys = set()
     for _, key, children in MENU_TREE:
-        if key:
+        if key and not is_link(key):
             keys.add(key)
         for _, child_key in children:
-            keys.add(child_key)
+            if not is_link(child_key):
+                keys.add(child_key)
     # 常用问题的 key 全部允许 —— 卡片菜单上有菜单里放不下的那几条
     keys.update(QUESTION_TEXT)
     return keys
@@ -189,6 +220,16 @@ def _node(name: str, sort: int, **extra) -> dict:
     return node
 
 
+def _action(key: str) -> dict:
+    """叶子节点点了做什么：跳转链接（不推事件）或推事件。"""
+    if is_link(key):
+        url = LINK_URLS[key]
+        # 文档：type=1 时 redirect_link 必填。手机和电脑给同一个链接。
+        return {"menu_content_type": CONTENT_TYPE_LINK,
+                "redirect_link": {"pc_url": url, "mobile_url": url}}
+    return {"menu_content_type": CONTENT_TYPE_EVENT, "event_key": key}
+
+
 def build_bot_menus() -> list[dict]:
     """生成 `PATCH .../ability` 里 `bot.bot_menus` 要的结构。
 
@@ -204,16 +245,8 @@ def build_bot_menus() -> list[dict]:
                 _node(name, index, menu_id=parent_id, menu_content_type=CONTENT_TYPE_NONE)
             )
         else:
-            # 平铺 chip：点了直接推事件
-            nodes.append(
-                _node(
-                    name,
-                    index,
-                    menu_id=parent_id,
-                    menu_content_type=CONTENT_TYPE_EVENT,
-                    event_key=key,
-                )
-            )
+            # 平铺 chip：点了直接推事件 / 直接打开链接
+            nodes.append(_node(name, index, menu_id=parent_id, **_action(key)))
         for child_index, (child_name, child_key) in enumerate(children):
             nodes.append(
                 _node(
@@ -221,11 +254,17 @@ def build_bot_menus() -> list[dict]:
                     child_index,
                     menu_id=f"{parent_id}c{child_index}",
                     parent_menu_id=parent_id,
-                    menu_content_type=CONTENT_TYPE_EVENT,
-                    event_key=child_key,
+                    **_action(child_key),
                 )
             )
     return nodes
+
+
+def _link_problem(label: str, key: str) -> str:
+    url = LINK_URLS.get(key, "")
+    if not url.startswith("https://"):
+        return f"「{label}」的链接 {url!r} 不是 https"
+    return ""
 
 
 def validate_tree() -> list[str]:
@@ -250,7 +289,10 @@ def validate_tree() -> list[str]:
             problems.append(f"「{name}」既有事件又有子菜单（有子菜单时父节点不推事件）")
         if not key and not children:
             problems.append(f"「{name}」没事件也没子菜单（点了什么都不会发生）")
-        if key and not resolve_event_key(key):
+        if key and is_link(key):
+            if _link_problem(name, key):
+                problems.append(_link_problem(name, key))
+        elif key and not resolve_event_key(key):
             problems.append(f"「{name}」的 key {key!r} 解不出要发什么")
         if key and len(key) > 30:
             problems.append(f"event_key 超 30 字符：{key}")
@@ -261,7 +303,10 @@ def validate_tree() -> list[str]:
                 problems.append(f"event_key 超 30 字符：{child_key}")
             if len(child_name) > 60:
                 problems.append(f"「{child_name}」名字太长")
-            if not resolve_event_key(child_key):
+            if is_link(child_key):
+                if _link_problem(child_name, child_key):
+                    problems.append(_link_problem(child_name, child_key))
+            elif not resolve_event_key(child_key):
                 problems.append(f"「{child_name}」的 key {child_key!r} 解不出要发什么")
     return problems
 
@@ -416,7 +461,7 @@ def publish(app_id: str, token: str, version: str, changelog: str, *, http=None)
         {
             "version": version,
             "changelog": changelog,
-            "remark": "CarHer 电脑助手自动配置",
+            "remark": "Her remote自动配置",
             "mobile_default_ability": "bot",
             "pc_default_ability": "bot",
         },
@@ -492,7 +537,7 @@ def version_status(app_id: str, token: str, version_id: str, *, http=None) -> in
 
 # 审批在哪：管理员在飞书「审批」应用里（或管理后台「工作台 → 应用审核」）收到这条申请。
 # 依据 `docs/productize-plan.md`：管理员能把审核方式设成「在飞书审批中审核」。没在本机实测过审批那一侧。
-_REVIEW_WHERE = "管理员会在飞书「审批」里（或管理后台「应用审核」）收到「CarHer 电脑助手」的发布申请"
+_REVIEW_WHERE = "管理员会在飞书「审批」里（或管理后台「应用审核」）收到「Her remote」的发布申请"
 
 
 def setup(app_id: str, app_secret: str, version: str, *, http=None) -> list[str]:

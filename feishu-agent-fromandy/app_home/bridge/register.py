@@ -43,6 +43,23 @@ _BASE_SCOPES = (
     # 装机时自动补权限、配常驻菜单、发布版本都靠它。
     # 没有它，新同事装完只有聊天里的卡片菜单，没有常驻菜单（2026-11-04 review）。
     "application:application:patch",
+    # ── 第 18 轮：两件用户催过多次的事，都要新权限 ──
+    #
+    # 🔴 能加这两项的前提是第 17 轮修好的「权限清单漂移」：
+    # `menu_heal.scopes_fingerprint()` 把清单指纹和 `done` 记在一起，清单一变老用户的
+    # 「已装好」标记就失效 ⇒ 下次重启自愈会重跑、把新权限补上。
+    # 在那之前往这里加东西对老用户**完全无效**（装机只申请一次，done 之后再也不碰权限）。
+    #
+    # 1. 表情回复：用户发完消息立刻给个「收到」的表情（他原话「比如 get 符号」）。
+    #    🔴 按**服务端的原话**要，不按文档那句中文要 —— 文档「权限要求」写的是
+    #    「获取与发送单聊、群组消息」二者任一即可，而我们已经有那一组，真打一发仍然被拒：
+    #        code=99991672  One of the following scopes is required:
+    #        [im:message, im:message.reactions:write_only]
+    #    两个里挑**窄**的那个：`im:message` 是单聊群聊全量读写，比我们要的宽得多。
+    "im:message.reactions:write_only",
+    # 2. 流式输出（第 17 轮角色 F 的方案）：建卡片实体 + 反复推全量文本。
+    #    F 实测现有 13 项 scope 里 cardkit 一项都没有。
+    "cardkit:card:write",
 )
 # 这台机器需要的全部权限面：单聊 3 项 + 建群清单里推荐开的那一项（去重、保序）。
 WANT_SCOPES = list(dict.fromkeys([*_BASE_SCOPES, *(need[2] for need in _GROUP_NEEDS)]))
@@ -202,7 +219,7 @@ def main(argv: list[str]) -> int:
         print(f"CHECK_OK=addons_bytes={len(encoded)} scopes={len(WANT_SCOPES)}")
         return 0
 
-    name = argv[1] if len(argv) > 1 else "我的电脑助手"
+    name = argv[1] if len(argv) > 1 else "Her remote"
     try:
         created = register(name)
     except RuntimeError as exc:

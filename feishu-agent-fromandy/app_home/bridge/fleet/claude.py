@@ -291,7 +291,8 @@ def _first_user_text(records: list) -> str:
 def _scan_head(path: str) -> dict:
     """头 64KB：cwd、入口（cli / sdk-cli / claude-desktop-3p）、标题候选、第一句话。"""
     records = _read_head(path)
-    info: dict = {"cwd": "", "entrypoint": "", "custom_title": "", "ai_title": "", "first": ""}
+    info: dict = {"cwd": "", "entrypoint": "", "custom_title": "", "ai_title": "", "first": "",
+                  "last_turn": "", "last_turn_at": 0.0}
     for rec in records:
         if not info["cwd"] and isinstance(rec.get("cwd"), str):
             info["cwd"] = rec["cwd"]
@@ -311,10 +312,66 @@ def _take_titles(rec: dict, info: dict) -> None:
 
 
 def _tail_titles(path: str, info: dict) -> None:
-    """改名会在后面追加新的 custom-title / ai-title；尾部的比头部的新。"""
+    """改名会在后面追加新的 custom-title / ai-title；尾部的比头部的新。
+
+    第 32 轮：同一份尾巴顺手看「最后一轮怎么结束的」（`_last_turn`），别为它再读一遍文件。
+    """
     records, _ = _read_tail(path, TITLE_TAIL_BYTES)
     for rec in records:
         _take_titles(rec, info)
+    info["last_turn"], info["last_turn_at"] = _last_turn(records)
+
+
+def _turn_mark(rec: dict) -> Optional[tuple]:
+    """一条记录对「最后一轮怎么结束的」说了什么 → (状态, 时间)；跟这件事无关 ⇒ None。
+
+    本机 211 个 jsonl 实测（2026-11-09）：
+    - 好好跑完 = 最后一条主线 assistant 是 `stop_reason: end_turn`、里面没有 tool_use（181 个）
+    - 出错 = `isApiErrorMessage: true` 的那条 assistant（model=`<synthetic>`，`error` 字段是
+      server_error / invalid_request / authentication_failed …，正文是「Request timed out」
+      「Prompt is too long」「Please run /login」这类）；只有它是**最后一条**才算（3 个）——
+      后面人又说了话的 31 个都是「出错后重试过」，那一轮不算失败
+    - 别的（最后是人说的话 = 正在跑 / 被打断；是 tool_result / tool_use = 一轮跑到一半；
+      stop_reason 是空的或 max_tokens）⇒ 说不准，返回 ("", 0)，卡上不标
+    """
+    kind = rec.get("type")
+    if kind not in ("user", "assistant") or rec.get("isSidechain"):
+        return None
+    message = rec.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    at = _iso_to_epoch(rec.get("timestamp"))
+    if kind == "user":
+        if rec.get("isMeta"):
+            return None
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            return ("", 0.0)  # 一轮还在中间
+        # 噪音（系统塞的提醒之类）不算人说了话；真说了话 ⇒ 后面要么在跑、要么被打断，都不是「跑完了」
+        return ("", 0.0) if _clean_user_text(_content_text(content)) else None
+    if rec.get("isApiErrorMessage"):
+        return ("failed", at)
+    blocks = content if isinstance(content, list) else ()
+    if any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks):
+        return ("", 0.0)
+    if message.get("stop_reason") == "end_turn":
+        return ("done", at)
+    return ("", 0.0)
+
+
+def _last_turn(records: list) -> tuple:
+    """jsonl 记录（旧 → 新）→ 最后一轮怎么结束的：("done"|"failed"|"", 时间)。读不出来一律 ("", 0)。"""
+    last = ("", 0.0)
+    for rec in records:
+        try:
+            mark = _turn_mark(rec)
+        except Exception:  # noqa: BLE001 —— 形状怪的记录跳过，别让总览出不来
+            continue
+        if mark is not None:
+            last = mark
+    return last
 
 
 def _app_index(app_root: str) -> dict:
@@ -683,6 +740,9 @@ class ClaudeAdapter(Adapter):
             extra["version"] = str(version)
         # 「等你」⇒ 它在问什么 / 等你确认哪一步（详情卡上显示）。只有等你时才读，别的状态不花这次 IO
         pending = self._pending_for(path) if status == "waiting" else None
+        # 第 32 轮：开着但闲着的（终端里跑完一轮停在那儿）⇒ 看最后一轮是跑完了还是报错了。
+        # 在跑 / 等你的不读：那两个状态排在前面，读了也不显示。
+        last_turn, last_turn_at = self._last_turn_for(path) if status == "idle" else ("", 0.0)
         can_relay, why_relay = self._relay_capability(items, owner, status)
         if can_relay:
             # 卡片上要显示「正在和谁说话」，而 relay 的地址就是这个 name
@@ -695,7 +755,20 @@ class ClaudeAdapter(Adapter):
             can_send=False, why_not_send=self._why_not_send_held(items),
             can_stop=not why_stop, why_not_stop=why_stop,
             can_relay=can_relay, why_not_relay=why_relay, extra=extra, pending=pending,
+            last_turn=last_turn, last_turn_at=last_turn_at,
         )
+
+    @staticmethod
+    def _last_turn_for(path: str) -> tuple:
+        """jsonl 尾巴 → 最后一轮怎么结束的；读不到 / 出任何错 ⇒ ("", 0)（卡上不标，同 `_pending_for`）。"""
+        if not path:
+            return "", 0.0
+        try:
+            records, _ = _read_tail(path, TITLE_TAIL_BYTES)
+            return _last_turn(records)
+        except Exception:  # noqa: BLE001
+            logger.debug("读最后一轮失败 path=%s", path, exc_info=True)
+            return "", 0.0
 
     @staticmethod
     def _pending_for(path: str) -> Optional[PendingAsk]:
@@ -827,6 +900,7 @@ class ClaudeAdapter(Adapter):
             tool=TOOL, surface="app" if is_app else "cli", id=sid, title=short_title(title), cwd=cwd,
             status="idle", owner="none", updated_at=mtime,
             can_send=not why, why_not_send=why, can_stop=False, why_not_stop=WHY_STOP_IDLE, extra=extra,
+            last_turn=info.get("last_turn", ""), last_turn_at=info.get("last_turn_at", 0),
         )
 
     # ---------- read ----------

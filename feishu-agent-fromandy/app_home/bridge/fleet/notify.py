@@ -22,6 +22,14 @@
 6. 开关在 config.toml：`[notify]` 下 `waiting = false` 就一张都不推
 
 卡片上**不放会话的消息内容**（隐私 + 卡片大小），只有名字、项目和一个「看看它」按钮。
+
+## 稍后提醒（第 33 轮）
+
+推送卡上多一个「1 小时后再提醒」（op=snooze，记在 `fleet/settled.py`）：
+- 静音期间不推这个会话；
+- 静音期间它问了**新的**（`pending_sig` 变了）⇒ 照样推；
+- 一小时到了还在等同一个问题 ⇒ 再推一次（不然「再提醒」就成了「再也不提醒」）。
+另外：同一段等待里它问的东西变了（两次都读得出、指纹不同）⇒ 算新的一次等待，照规则重新计时推。
 """
 
 from __future__ import annotations
@@ -35,8 +43,9 @@ import time
 from collections import deque
 from typing import Any, Callable, Optional
 
-from .cards import _card, _escape, _md, _row, project_of, session_label
+from .cards import _button, _card, _escape, _md, _row, fleet_value, project_of, session_label
 from .actions import fleet_button
+from .settled import pending_sig
 
 logger = logging.getLogger("feishu-bridge.fleet")
 
@@ -96,8 +105,10 @@ class WaitingNotifier:
                  idle: Callable[[], Optional[float]] = human_idle_seconds,
                  min_wait: float = MIN_WAIT_SEC, per_session: float = PER_SESSION_SEC,
                  burst: int = BURST_LIMIT, burst_window: float = BURST_WINDOW_SEC,
-                 present_idle: float = PRESENT_IDLE_SEC) -> None:
+                 present_idle: float = PRESENT_IDLE_SEC, snoozes: Any = None) -> None:
         self.enabled = bool(enabled)
+        # 「稍后提醒」的记录（`settled.SettledStore`）。不给 ⇒ 每一拍用 `settled.active()`
+        self._snoozes = snoozes
         self._now = now or time.monotonic
         self._idle = idle
         self.min_wait = float(min_wait)
@@ -109,6 +120,20 @@ class WaitingNotifier:
         self._done: set = set()  # 这一次 waiting 已经推到了的 key
         self._last_try: dict = {}  # key → 上一次尝试推的时刻（限流用，跨 waiting 段）
         self._recent: deque = deque()  # 最近的尝试时刻（全局限流）
+        self._sig: dict = {}  # key → 这一段等待里最近读到的「在问什么」指纹
+        self._muted: set = set()  # 上一拍还在静音的 key（静音结束那一拍要再推一次）
+
+    def _snooze_store(self) -> Any:
+        if self._snoozes is not None:
+            return self._snoozes
+        from .settled import active
+
+        return active()
+
+    def _new_question(self, key: tuple) -> None:
+        """同一个 key 当成一段新的等待：重新计时、可以再推。"""
+        self._since.pop(key, None)
+        self._done.discard(key)
 
     def _human_present(self) -> bool:
         try:
@@ -143,6 +168,29 @@ class WaitingNotifier:
                 # 这一次等待结束了（回去干活 / 闲着 / 进程没了）⇒ 下一次 waiting 是新的一次
                 self._since.pop(key, None)
                 self._done.discard(key)
+                self._sig.pop(key, None)
+        self._muted &= set(waiting)
+        for key, sess in waiting.items():
+            sig = pending_sig(sess)
+            old = self._sig.get(key, "")
+            if sig and old and sig != old:
+                # 它问了新的（两次都读得出、指纹变了）⇒ 新的一次等待
+                self._new_question(key)
+            if sig:
+                self._sig[key] = sig
+        # 稍后提醒：静音中的这一拍不推；静音刚结束（到点 / 问了新的）⇒ 当新的一次等待
+        muted: set = set()
+        try:
+            store = self._snooze_store()
+            for key, sess in waiting.items():
+                if store.snoozed(sess):
+                    muted.add(key)
+        except Exception:  # noqa: BLE001 —— 读不出静音记录 ⇒ 当没静音（漏推比多推一次更糟）
+            logger.debug("读「稍后提醒」记录失败", exc_info=True)
+        for key in self._muted - muted:
+            self._new_question(key)
+            self._last_try.pop(key, None)
+        self._muted = muted
         for key in waiting:
             self._since.setdefault(key, now)
         for key, at in list(self._last_try.items()):
@@ -154,6 +202,7 @@ class WaitingNotifier:
         candidates = [
             sess for key, sess in waiting.items()
             if key not in self._done
+            and key not in muted
             and now - self._since[key] >= self.min_wait
             and key not in self._last_try
         ]
@@ -187,11 +236,31 @@ def build_waiting_card(sess: Any, redact: Optional[Callable[[str], str]] = None)
         project = ""
     tool = getattr(sess, "tool", TOOL)
     sid = str(getattr(sess, "id", "") or "")
+    snooze = fleet_value("snooze", tool, sid)
+    snooze["q"] = pending_sig(sess)  # 静音的是**这一个问题**：它问了新的照样推
     elements = [
         _md(f"📁 {_escape(project) or '不知道哪个项目'}"),
-        _row([fleet_button("open", tool, sid, "👀 看看它", primary=True)]),
+        _row([fleet_button("open", tool, sid, "👀 看看它", primary=True),
+              _button(SNOOZE_LABEL, snooze)]),
     ]
     return _card(f"🟡 {label}在等你", "yellow", elements)
+
+
+SNOOZE_LABEL = "⏰ 1 小时后再提醒"
+
+
+def build_snoozed_card(sess: Any, redact: Optional[Callable[[str], str]] = None) -> dict:
+    """点完「1 小时后再提醒」原地换成的卡（dict，直接放进回调响应）。"""
+    clean = redact or (lambda s: s)
+    label = session_label(sess, clean)
+    tool = getattr(sess, "tool", TOOL)
+    sid = str(getattr(sess, "id", "") or "")
+    import json
+
+    return json.loads(_card(f"⏰ {label}", "grey", [
+        _md("好，1 小时内不再为这件事提醒你。它问了新的问题照样推。"),
+        _row([fleet_button("open", tool, sid, "👀 看看它")]),
+    ]))
 
 
 def waiting_fallback_text(sess: Any, redact: Optional[Callable[[str], str]] = None) -> str:

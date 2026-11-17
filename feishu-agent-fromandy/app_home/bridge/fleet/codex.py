@@ -247,6 +247,31 @@ def _turn_state(records) -> str:
     return "running" if last == "task_started" else "idle"
 
 
+def _turn_end(records) -> tuple:
+    """rollout 记录 → (最后一轮怎么结束的, 结束时间, 最后一次 task_started 的时间)。
+
+    本机 214 个 rollout 实测（codex-cli 0.153.4，2026-11-09）：轮次事件只有 task_started /
+    task_complete / turn_aborted 三种，**rollout 里一条报错事件都没有**（`turn.failed` 只出现在
+    `codex exec --json` 的 stdout 里，见 `parse_exec_output`）。所以这里只判得出「跑完了」：
+    - 最后是 task_complete 且带时间 ⇒ ("done", 时间)
+    - turn_aborted（被打断）/ task_started（在跑）/ 没有时间 ⇒ ("", 0)，不猜
+    """
+    last, at, started = "", 0.0, 0.0
+    for rec in records:
+        if rec.get("type") != "event_msg":
+            continue
+        kind = (rec.get("payload") or {}).get("type")
+        if kind not in ("task_started", "task_complete", "turn_aborted"):
+            continue
+        stamp = _epoch(rec.get("timestamp"))
+        last, at = kind, stamp
+        if kind == "task_started":
+            started = max(started, stamp)
+    if last == "task_complete" and at:
+        return "done", at, started
+    return "", 0.0, started
+
+
 def _message_of(rec: dict) -> Optional[Message]:
     if rec.get("type") != "response_item":
         return None
@@ -292,6 +317,10 @@ class CodexAdapter(Adapter):
         self.lsof_timeout = lsof_timeout
         self._send_guard = threading.Lock()
         self._sending: set = set()
+        # 第 32 轮：桥自己发的那一轮读到 `turn.failed` / 顶层 error 的时间（线程 id → epoch 秒）。
+        # rollout 里没有失败事件（见 `_turn_end`），这是唯一读得到的失败信号 ⇒ 只记在内存；
+        # 那之后 rollout 里又开了新的一轮（task_started 更晚）就作废。
+        self._failed_at: dict = {}
 
     # ---------- 路径 ----------
 
@@ -410,6 +439,31 @@ class CodexAdapter(Adapter):
         except OSError as exc:
             self.last_error = friendly_error(exc, "读 Codex 对话记录失败")
             return ""
+
+    def _last_turn(self, thread_id: str, row: Optional[dict]) -> tuple:
+        """这个线程最后一轮怎么结束的 → ("done"|"failed"|"", 时间)。读不到 ⇒ ("", 0)，绝不抛。
+
+        🔴 只看 threads 行里的 `rollout_path`，不 glob：历史会话一次扫 30 个，每个 glob 一遍
+        `sessions/*/*/*` 会拖慢总览（`scan.DEFAULT_TIMEOUT_SEC` 才 1.2 秒）。没有这个字段的就不标。
+        """
+        tid = str(thread_id or "").lower()
+        rollout = str((row or {}).get("rollout_path") or "")
+        started = 0.0
+        state, at = "", 0.0
+        try:
+            if rollout.endswith(".jsonl") and os.path.isfile(rollout) and self._inside_home(rollout):
+                lines, _ = _tail_lines(rollout, BUSY_TAIL_BYTES)
+                state, at, started = _turn_end(_records(lines))
+        except Exception:  # noqa: BLE001 —— 锦上添花，读不到就不标
+            logger.debug("读 Codex 最后一轮失败 tid=%s", tid, exc_info=True)
+            state, at = "", 0.0
+        failed = self._failed_at.get(tid, 0.0)
+        if failed and failed >= started and failed >= at:
+            return "failed", failed
+        return state, at
+
+    def _note_turn_failed(self, tid: str) -> None:
+        self._failed_at[str(tid or "").lower()] = time.time()
 
     # ---------- 谁占着 ----------
 
@@ -579,6 +633,8 @@ class CodexAdapter(Adapter):
             extra["model"] = str(row["model"])
         if archived:
             extra["archived"] = True
+        # 第 32 轮：闲着的才看最后一轮（在跑 / 等你 / 挂起的读了也不显示）
+        last_turn, last_turn_at = self._last_turn(tid, row) if status == "idle" else ("", 0.0)
         return Session(
             tool=self.tool,
             surface=_surface(source),
@@ -601,6 +657,8 @@ class CodexAdapter(Adapter):
             why_not_send=why_send,
             why_not_stop=why_stop,
             extra=extra,
+            last_turn=last_turn,
+            last_turn_at=last_turn_at,
         )
 
     # ---------- 公开方法 ----------
@@ -786,6 +844,10 @@ class CodexAdapter(Adapter):
                 self.jobs.forget(pid)
 
         reply, failure = parse_exec_output(res.stdout)
+        if failure and not reply and "active writer" not in failure:
+            # 第 32 轮：读到真失败（turn.failed / 顶层 error）⇒ 总览上这个会话标「⚠️ 出错了」。
+            # 「被 App / 终端占着」不算它出错，是我们没发进去。
+            self._note_turn_failed(tid)
         if res.error:
             # SubprocessRunner 的 error 自己就以「没能启动 …」开头 ⇒ 别再套一层
             return ActionResult(False, res.error if res.error.startswith("没能启动") else "没能启动 Codex：" + res.error, tid)

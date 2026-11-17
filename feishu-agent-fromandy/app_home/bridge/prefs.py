@@ -173,3 +173,37 @@ def clear_readonly_override(path: str) -> bool:
         return False
     logger.info("迁移：清掉了落盘的旧只读档位（它会顶掉新的默认全控制）")
     return True
+
+
+def installed_mode(config_path: str, prefs_path: str) -> str:
+    """装完之后这台**真正生效**的档位 —— 安装器尾屏照这个说。
+
+    🔴 第 19 轮（S4 缺口 2）：尾屏原来用 sed 只读 config.toml 的 `mode =` 一行 ⇒
+    手机上切过只读（prefs.json）、或者 IT 策略锁了只读的机器，尾屏说【全授权】、桥实际只读。
+    这里照桥启动的同一套顺序算：config 起步档 → IT 策略收上限 → prefs 覆盖（再过一遍上限）。
+
+    顺带把「迁移那一次清掉 prefs 里的旧只读」前移到这里（原来只在桥启动时做）：
+    不先清，这里会在「老默认只读 → 新默认全授权」那种机器上读到旧只读、说错。
+    桥里那次保留当兜底（清过了它就是 no-op）。
+    """
+    import tomllib
+
+    from .policy import MODE_RANK, effective_ceiling
+
+    with open(config_path, "rb") as handle:
+        agent = tomllib.load(handle).get("agent") or {}
+    start = str(agent.get("mode") or "readonly")
+    ceiling = effective_ceiling(str(agent.get("max_mode") or start))
+    if start not in MODE_RANK or ceiling not in MODE_RANK:
+        return "readonly"          # 配置写坏了 ⇒ 桥起不来或按最紧算，绝不说成放开
+    mode = clamp_mode(start, ceiling)
+    if str(agent.get("migrated_from") or "") == "readonly":
+        clear_readonly_override(prefs_path)
+    try:
+        with open(prefs_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("mode"), str) and data["mode"]:
+        mode = clamp_mode(data["mode"], ceiling)
+    return mode
