@@ -151,7 +151,7 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(bridge._refresh_status_card("oc_g"), "sent_pinned")
         text = fs.sent[0][1]
         self.assertIn("remote_control", text)
-        self.assertIn("全授权", text)
+        self.assertIn("全部授权", text)
         self.assertIn("工具默认", text)
         self.assertEqual(bridge._refresh_status_card("not_a_group"), "not_group")
 
