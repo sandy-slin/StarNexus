@@ -1,4 +1,4 @@
-"""1.2.0 从 GitHub 自升级（tools/selfupgrade.py），UP-01 ~ UP-12。"""
+"""1.2.0 从 GitHub 自升级（tools/selfupgrade.py），UP-01 ~ UP-22。"""
 
 import importlib.util
 import json
@@ -203,6 +203,53 @@ class NoOfficialReportTest(unittest.TestCase):
 
         text = app_mod._github_upgrade_status()
         self.assertIn("GitHub", text)
+
+
+class NotifyTest(unittest.TestCase):
+    """UP-20 ~ UP-22：通知读 [feishu] 段，逐个目标发，机器人不在群里时改用 lark-cli 以用户身份发群。"""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        with open(os.path.join(self.home, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('[feishu]\napp_id = "cli_x"\napp_secret = "s"\nowner_open_ids = ["ou_owner"]\n')
+        self.calls, self.posts = [], []
+
+    def make(self, replies, cli_rc=0):
+        def run(argv, **kw):
+            self.calls.append(argv)
+            return SimpleNamespace(returncode=cli_rc, stdout="", stderr="")
+        up = selfupgrade.Upgrader(self.home, "git@example:x.git", run=run, sleep=lambda s: None,
+                                  now=lambda: 0.0, notify=lambda t: None)
+
+        def http_json(url, body, token=""):
+            self.posts.append((url, body))
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t"}
+            return replies.pop(0)
+        up.http_json = http_json
+        return up
+
+    def test_up20_reads_feishu_section(self):
+        cfg = self.make([]).feishu_cfg()
+        self.assertEqual((cfg["app_id"], cfg["owners"]), ("cli_x", ["ou_owner"]))
+
+    def test_up21_bot_out_of_group_falls_back_to_user(self):
+        up = self.make([{"code": 0}, {"code": 230002, "msg": "Bot/User can NOT be out of the chat."}])
+        up._notify_feishu("hello")
+        sent = [b["receive_id"] for u, b in self.posts if "messages" in u]
+        self.assertEqual(sent, ["ou_owner", selfupgrade.DEV_CHAT])
+        cli = [c for c in self.calls if "+messages-send" in c]
+        self.assertEqual(len(cli), 1)
+        self.assertIn(selfupgrade.DEV_CHAT, cli[0])
+        self.assertEqual(cli[0][cli[0].index("--as") + 1], "user")
+
+    def test_up22_owner_failure_does_not_block_group(self):
+        up = self.make([{"code": 99991663, "msg": "x"}, {"code": 0}])
+        up._notify_feishu("hello")
+        sent = [b["receive_id"] for u, b in self.posts if "messages" in u]
+        self.assertEqual(sent, ["ou_owner", selfupgrade.DEV_CHAT])
+        self.assertFalse([c for c in self.calls if "+messages-send" in c])
 
 
 if __name__ == "__main__":

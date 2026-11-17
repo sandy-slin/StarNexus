@@ -11,7 +11,7 @@
    ⇒ 记为已装；否则换回备份、重启，记坏版本，通知。
 
 状态文件 `~/.carher-feishu-agent/upgrade/state.json`：{installed, installed_sha, bad: {tag: 原因}, history: [...]}。
-通知：私聊主人 + Remote control dev 群（都用 Her remote · Pro 机器人发）。
+通知：私聊主人 + Remote control dev 群（用 Her remote · Pro 机器人发；机器人不在群里时用 lark-cli 以用户身份发群）。
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
 import urllib.request
 from typing import Callable, Optional
 
@@ -189,29 +190,69 @@ class Upgrader:
 
     # ---------- 通知 ----------
 
-    def _notify_feishu(self, text: str) -> None:
+    def http_json(self, url: str, body: dict, token: str = "") -> dict:
+        """POST JSON，返回飞书的 JSON 回包；HTTP 错误也读出回包（只含 code/msg，不含密钥）。"""
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(), headers=headers)
         try:
-            with open(os.path.join(self.home, "config.toml"), "rb") as fh:
-                cfg = tomllib.load(fh)
-            app_id, secret = cfg.get("app_id", ""), cfg.get("app_secret", "")
-            owners = list(cfg.get("owner_open_ids") or [])
-            req = urllib.request.Request(
-                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                data=json.dumps({"app_id": app_id, "app_secret": secret}).encode(),
-                headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=20) as resp:
-                token = json.load(resp).get("tenant_access_token", "")
-            targets = [("open_id", o) for o in owners] + [("chat_id", DEV_CHAT)]
-            for kind, rid in targets:
-                body = {"receive_id": rid, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)}
-                req = urllib.request.Request(
-                    f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={kind}",
-                    data=json.dumps(body, ensure_ascii=False).encode(),
-                    headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {token}"})
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    resp.read()
-        except Exception as exc:  # noqa: BLE001 —— 通知失败不影响升级结论
-            log(f"飞书通知发送失败：{type(exc).__name__}")
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            try:
+                return json.loads(exc.read() or b"{}")
+            except ValueError:
+                return {"code": exc.code, "msg": "HTTP error"}
+
+    def feishu_cfg(self) -> dict:
+        """config.toml 里应用凭据和主人在 [feishu] 段下（兼容旧的顶层写法）。"""
+        with open(os.path.join(self.home, "config.toml"), "rb") as fh:
+            cfg = tomllib.load(fh)
+        sec = cfg.get("feishu") if isinstance(cfg.get("feishu"), dict) else cfg
+        return {"app_id": sec.get("app_id", ""), "app_secret": sec.get("app_secret", ""),
+                "owners": list(sec.get("owner_open_ids") or [])}
+
+    def _notify_feishu(self, text: str) -> None:
+        """私聊主人 + Remote control dev 群，逐个目标发，一个失败不影响其他。
+        机器人不在 dev 群里（230002）时，改用 lark-cli 以用户身份发到群。"""
+        try:
+            cfg = self.feishu_cfg()
+        except (OSError, ValueError) as exc:
+            log(f"飞书通知：读配置失败 {type(exc).__name__}")
+            cfg = {"app_id": "", "app_secret": "", "owners": []}
+        token = ""
+        if cfg["app_id"] and cfg["app_secret"]:
+            got = self.http_json("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                                 {"app_id": cfg["app_id"], "app_secret": cfg["app_secret"]})
+            token = got.get("tenant_access_token", "")
+            if not token:
+                log(f"飞书通知：取机器人令牌失败 code={got.get('code')} msg={got.get('msg')}")
+        content = json.dumps({"text": text}, ensure_ascii=False)
+        targets = [("open_id", o) for o in cfg["owners"]] + [("chat_id", DEV_CHAT)]
+        for kind, rid in targets:
+            ok = False
+            if token:
+                got = self.http_json(f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={kind}",
+                                     {"receive_id": rid, "msg_type": "text", "content": content}, token)
+                ok = got.get("code") == 0
+                if not ok:
+                    log(f"飞书通知：机器人发 {kind} 失败 code={got.get('code')} msg={got.get('msg')}")
+            if not ok and kind == "chat_id":
+                ok = self._notify_as_user(rid, text)
+            log(f"飞书通知：{'私聊主人' if kind == 'open_id' else 'dev 群'} {'已发' if ok else '未发出'}")
+
+    def _notify_as_user(self, chat_id: str, text: str) -> bool:
+        lark = shutil.which("lark-cli") or os.path.expanduser("~/.local/bin/lark-cli")
+        try:
+            res = self.sh([lark, "im", "+messages-send", "--chat-id", chat_id, "--as", "user", "--text", text],
+                          timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"飞书通知：lark-cli 不可用 {type(exc).__name__}")
+            return False
+        if res.returncode != 0:
+            log(f"飞书通知：lark-cli 以用户身份发群失败 rc={res.returncode}")
+        return res.returncode == 0
 
     # ---------- 主流程 ----------
 
