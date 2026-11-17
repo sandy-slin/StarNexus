@@ -367,7 +367,7 @@ def build_menu_card(workspace_label: str = "", policy=None) -> str:
                 "tag": "collapsible_panel",
                 "expanded": False,
                 "header": {
-                    "title": {"tag": "markdown", "content": "**更多：**" + " · ".join(names)},
+                    "title": {"tag": "markdown", "content": "**更多**：" + " · ".join(names)},
                     "width": "fill",
                     "icon": _PANEL_ICON,
                     "icon_position": "right",
