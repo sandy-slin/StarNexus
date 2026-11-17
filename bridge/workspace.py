@@ -111,6 +111,10 @@ COMMANDS = frozenset({"/cd", "/dirs", "/ls", "/pwd", "/where"})
 DIRS_BUTTON = "「📂 换项目」"
 
 
+def looks_like_path(raw: str) -> bool:
+    return _looks_like_path(raw)
+
+
 def _looks_like_path(raw: str) -> bool:
     """这串东西是"路径"还是"项目名"。
 

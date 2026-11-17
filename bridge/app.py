@@ -3785,7 +3785,8 @@ class Bridge:
 
         control = self.fleet
         sess = control.cached(tool, sid)
-        title = getattr(sess, "title", "") if sess is not None else ""
+        title = getattr(self, "_new_session_name", {}).get(sid, "") or (
+            getattr(sess, "title", "") if sess is not None else "")
         project = getattr(sess, "cwd", "") if sess is not None else ""
         if not project:
             project = getattr(self, "_new_session_cwd", {}).get(sid, "")
@@ -4473,6 +4474,9 @@ class Bridge:
         if not rest:
             await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool, model, effort)
             return True
+        name = ""
+        if len(rest) >= 2 and workspace_mod.looks_like_path(rest[-1]):
+            name, rest = " ".join(rest[:-1]), rest[-1:]
         found = workspace_mod.resolve_request(self.policy, self._new_current_dir(scope), " ".join(rest))
         if not found.ok or not found.workspace:
             if found.outcome == workspace_mod.Outcome.MISSING:
@@ -4483,7 +4487,7 @@ class Bridge:
                     self._say(chat_id, created.reply or found.reply.replace("/cd ", f"/newsession {tool} "))
             if not found.ok or not found.workspace:
                 return True
-        self._arm_new_session(scope, chat_id, tool, found.workspace, model, effort)
+        self._arm_new_session(scope, chat_id, tool, found.workspace, model, effort, name=name)
         return True
 
     async def _new_project(self, scope: str, chat_id: str, args: list) -> None:
@@ -4545,7 +4549,7 @@ class Bridge:
         return self._new_models
 
     def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str, model: str = "",
-                         effort: str = "") -> None:
+                         effort: str = "", name: str = "") -> None:
         from .fleet.catalog import EFFORT_LABELS
         from .fleet.newsession import model_hint, permission_line
         from .fleet.scan import TOOL_LABELS
@@ -4555,7 +4559,7 @@ class Bridge:
         if carried and carried[0] == tool:
             model = model or carried[1]
             effort = effort or (carried[2] if len(carried) > 2 else "")
-        self._newsession_state().arm(scope, tool, cwd, model, effort)
+        self._newsession_state().arm(scope, tool, cwd, model, effort, name=name)
         logger.info("新建会话 选好 tool=%s model=%s effort=%s scope=%s", tool, model or "-", effort or "-", scope[:16])
         short = _redact_text(workspace_mod.short_name(cwd, policy))
         mode = MODE_LABELS.get(policy.mode, policy.mode)
@@ -4569,7 +4573,8 @@ class Bridge:
                           f"「/ns {tool} 项目名 模型 [强度]」，可选 {model_hint(tool)}\n")
         self._say_with_buttons(
             chat_id,
-            f"好，在「{short}」新开一个 **{TOOL_LABELS.get(tool, tool)}** 会话。\n"
+            f"好，在「{short}」新开一个 **{TOOL_LABELS.get(tool, tool)}** 会话"
+            + (f"「{_redact_text(name)}」" if name else "") + "。\n"
             f"{permission_line(tool, mode)}\n"
             + model_line
             + "**下一句话就是它的第一句**，直接打字发过来（10 分钟内有效）。开好之后就进对话模式，接着说都发给它。",
@@ -4699,6 +4704,10 @@ class Bridge:
         if not hasattr(self, "_new_session_cwd"):
             self._new_session_cwd = {}
         self._new_session_cwd[result.session_id] = cwd
+        if armed.get("name"):
+            if not hasattr(self, "_new_session_name"):
+                self._new_session_name = {}
+            self._new_session_name[result.session_id] = armed["name"]
         group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id)
         target_scope = group_bound.scope if group_bound is not None else scope
         target_chat_id = group_bound.chat_id if group_bound is not None else chat_id

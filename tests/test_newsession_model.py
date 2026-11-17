@@ -1,4 +1,5 @@
 import asyncio
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -184,3 +185,26 @@ class GroupNameTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NameAndPathTest(unittest.TestCase):
+    def test_name_then_full_path(self):
+        import tempfile
+
+        bridge = make_bridge()
+        bridge.fleet = object()
+        root = tempfile.mkdtemp()
+        bridge.settings.policy = Policy("trusted", (root,), root, "", 60, "trusted")
+        bridge._new_current_dir = lambda scope: root
+        armed = []
+        bridge._arm_new_session = lambda scope, chat_id, tool, cwd, model="", effort="", name="": armed.append(
+            (tool, cwd, name))
+        handled = asyncio.run(bridge._handle_newsession_command("dm:x", "oc", f"/ns claude ai-native {root}"))
+        self.assertTrue(handled)
+        self.assertEqual(armed, [("claude", os.path.realpath(root), "ai-native")])
+        self.assertFalse(any("完整路径" in t for t in bridge.sent))
+
+    def test_state_keeps_name(self):
+        state = NewSessionState()
+        state.arm("dm:x", "claude", "/tmp", name="ai-native")
+        self.assertEqual(state.peek("dm:x")[0]["name"], "ai-native")
