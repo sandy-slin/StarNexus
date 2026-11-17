@@ -350,6 +350,46 @@ def case_term_stop(dm: str) -> tuple:
         _tmux("kill-session", "-t", session)
 
 
+def case_progress(dm: str) -> tuple:
+    """FC-14：一轮持续约 5 分钟的工具调用 ⇒ 群里只多一张进展卡并原地更新，回完之前不刷屏。"""
+    name = "lr-prog-" + time.strftime("%H%M%S")
+    chat, why = _new_session(dm, "codex", name, "回归测试，只回复 LR-READY")
+    if not chat or not wait_bot(chat, "LR-READY", timeout=300):
+        return False, why or "首句没回"
+    time.sleep(8)
+    seen = {m.get("message_id") for m in messages(chat, 30)}
+    if not send(chat, "回归测试：依次运行 5 条 shell 命令，每条单独执行：sleep 55 && date。"
+                      "全部跑完后只回复 LR-PROG-DONE。"):
+        return False, "发任务失败"
+    snapshots: dict = {}
+    end = time.time() + 480
+    done = False
+    while time.time() < end:
+        for m in messages(chat, 30):
+            mid = m.get("message_id")
+            if mid in seen or (m.get("sender") or {}).get("sender_type") != "app":
+                continue
+            text = str(m.get("content") or "")
+            snapshots.setdefault(mid, set()).add(text)
+            if "LR-PROG-DONE" in text:
+                done = True
+        if done:
+            break
+        time.sleep(20)
+    if not done:
+        return False, "8 分钟内没回 LR-PROG-DONE"
+    before_reply = [mid for mid, texts in snapshots.items() if not any("LR-PROG-DONE" in t for t in texts)]
+    cards = [mid for mid in before_reply if any("发给" in t or "它回了" in t for t in snapshots[mid])]
+    extra = [mid for mid in before_reply if mid not in cards]
+    if len(cards) != 1:
+        return False, f"进展卡数量 {len(cards)}，应为 1"
+    if len(snapshots[cards[0]]) < 2:
+        return False, "进展卡在运行中没有原地更新"
+    if len(extra) > 1:
+        return False, f"回完之前多发了 {len(extra)} 条消息"
+    return True, f"一张进展卡更新了 {len(snapshots[cards[0]])} 个版本，其他新消息 {len(extra)} 条"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -362,6 +402,7 @@ CASES = {
     "choices": case_choices,
     "codex_trusted": case_codex_trusted,
     "term_stop": case_term_stop,
+    "progress": case_progress,
 }
 
 
