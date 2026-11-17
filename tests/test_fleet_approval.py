@@ -133,3 +133,62 @@ class FleetApprovalTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FleetWorkspaceScopeTest(unittest.TestCase):
+    """FC-13（2026-11-17 实测回归）：会话的工作区 = 它的项目目录，不是全局清单（整个家目录）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bridge = make_bridge(self.tmp.name)
+        # 项目目录放家目录下：临时目录（/var/folders、/tmp）在钩子里算系统路径，测不出越界
+        self.home_tmp = tempfile.TemporaryDirectory(dir=os.path.expanduser("~"), prefix=".sn-unit-")
+        self.project = os.path.realpath(os.path.join(self.home_tmp.name, "proj"))
+        os.makedirs(self.project)
+        self.policy = SimpleNamespace(mode="trusted", workspaces=(os.path.expanduser("~"),))
+
+    def tearDown(self):
+        self.home_tmp.cleanup()
+        self.tmp.cleanup()
+
+    def workspaces(self, directory):
+        with open(os.path.join(directory, "workspaces.json"), encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_project_dir_becomes_workspace(self):
+        directory = self.bridge._fleet_approval_dir("codex", "t1", self.policy, self.project)
+        self.assertEqual(self.workspaces(directory), [self.project])
+
+    def test_missing_project_falls_back_to_policy(self):
+        directory = self.bridge._fleet_approval_dir("codex", "t1", self.policy, "")
+        self.assertEqual(self.workspaces(directory), list(self.policy.workspaces))
+        gone = os.path.join(self.tmp.name, "gone")
+        directory = self.bridge._fleet_approval_dir("codex", "t2", self.policy, gone)
+        self.assertEqual(self.workspaces(directory), list(self.policy.workspaces))
+
+    def test_hook_defers_write_outside_project(self):
+        import subprocess
+        import sys
+
+        from bridge import approval
+
+        directory = self.bridge._fleet_approval_dir("codex", "t1", self.policy, self.project)
+        hook = os.path.join(self.tmp.name, "hook.py")
+        with open(hook, "w", encoding="utf-8") as handle:
+            handle.write(approval.HOOK_SOURCE)
+        outside = os.path.join(self.home_tmp.name, "outside.txt")
+
+        def decide(command):
+            event = {"tool_name": "Bash", "tool_input": {"command": command},
+                     "cwd": self.project, "session_id": "s1"}
+            out = subprocess.run([sys.executable, hook], input=json.dumps(event), text=True,
+                                 capture_output=True, timeout=20,
+                                 env=dict(os.environ, CARHER_APPROVAL_DIR=directory,
+                                          CARHER_HOOK_FLAVOR="codex"))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            if not out.stdout.strip():
+                return ""
+            return json.loads(out.stdout)["hookSpecificOutput"]["permissionDecision"]
+
+        self.assertEqual(decide("echo hi > inside.txt"), "")
+        self.assertEqual(decide(f"echo hi > {outside}"), "deny")

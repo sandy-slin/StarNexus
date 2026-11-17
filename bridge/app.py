@@ -3224,10 +3224,12 @@ class Bridge:
         result = await asyncio.to_thread(self.fleet.stop, tool, sid)
         self._say(chat_id, ("⏹ " if result.ok else "") + result.text)
 
-    def _fleet_approval_dir(self, tool: str, sid: str, policy) -> str:
+    def _fleet_approval_dir(self, tool: str, sid: str, policy, cwd: str = "") -> str:
         """总控这一次发送的批准目录：按目标会话分，和飞书对话自己的那份分开。
 
         每次发之前清空：总控这条路弹不了确认卡，留着的 .ok 不该让下一次直接放行。
+        🔴 FC-13（2026-11-17 实测）：工作区 = 这个会话的项目目录，不是全局 workspaces
+        （那是整个家目录，等于工作区外的写也直接放行）。拿不到项目目录才退回全局清单。
         """
         gate = getattr(self, "gate", None)
         if gate is None:
@@ -3240,7 +3242,8 @@ class Bridge:
         else:
             gate.clear(scope)
         gate.set_trusted(scope, policy.mode == "trusted")
-        gate.write_workspaces(scope, policy.workspaces)
+        project = os.path.realpath(os.path.expanduser(cwd)) if cwd else ""
+        gate.write_workspaces(scope, (project,) if project and os.path.isdir(project) else policy.workspaces)
         return gate.dir_for(scope)
 
     async def _maybe_send_to_fleet(self, scope: str, chat_id: str, text: str) -> bool:
@@ -3372,7 +3375,8 @@ class Bridge:
                 keeper = getattr(self, "status_cards", None)
                 if keeper is not None and keeper.finished(chat_id):
                     self._in_background(self._mark_session_done, chat_id, False)
-            approval_dir = self._fleet_approval_dir(target.tool, target.id, policy)
+            approval_dir = self._fleet_approval_dir(target.tool, target.id, policy,
+                                                    str(getattr(known, "cwd", "") or ""))
             # 🔴 发之前 adapter 在锁里**再查一次**有没有人占着（五分钟里终端可能打开了它）。
             # `relay=True`：电脑上正开着的会话走「进会话聊天」那条路（消息进它的输入队列，
             # 不分叉、不打断）；没人占着的还是走 resume（同步拿回复，更快）。选路在 control.send。
@@ -4703,7 +4707,7 @@ class Bridge:
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
         result = None
         try:
-            approval_dir = (self._fleet_approval_dir(tool, "new-" + scope, policy)
+            approval_dir = (self._fleet_approval_dir(tool, "new-" + scope, policy, cwd)
                             if tool in ("claude", "codex") else "")
             base = self._effective_model(tool, "")
             start_model = armed.get("model", "") or base.model

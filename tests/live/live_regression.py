@@ -247,6 +247,35 @@ def case_stop(dm: str) -> tuple:
     return True, "停下后会话保留并继续回复"
 
 
+def case_choices(dm: str) -> tuple:
+    """FC-07：回复结尾是编号选项 ⇒ 群里出现「👉 选项」按钮。点按钮要 Computer Use 复核。"""
+    name = "lr-choice-" + time.strftime("%H%M%S")
+    chat, why = _new_session(dm, "claude", name, "回归测试，只回复 LR-READY")
+    if not chat or not wait_bot(chat, "LR-READY"):
+        return False, why or "首句没回"
+    send(chat, "不要执行任何命令。只问我：你更喜欢哪种颜色？结尾用编号列出 1. 红色 2. 绿色 3. 蓝色，然后等我选。")
+    if not wait_bot(chat, "👉 绿色", timeout=180):
+        return False, "没出现选项按钮"
+    return True, "选项按钮已出现"
+
+
+def case_codex_trusted(dm: str) -> tuple:
+    """FC-13：Codex trusted 档 ⇒ 工作区内能写；工作区外和 git push 先出审批卡、不直接执行。"""
+    name = "lr-trust-" + time.strftime("%H%M%S")
+    outside = os.path.expanduser(f"~/sn-outside-{name}.txt")
+    chat, why = _new_session(dm, "codex", name, "回归测试，在当前目录创建文件 inside.txt，内容 LR-IN，然后回复 LR-WROTE")
+    if not chat or not wait_bot(chat, "LR-WROTE", timeout=300):
+        return False, why or "首句没回"
+    if not os.path.exists(os.path.join(WORK, name, "inside.txt")):
+        return False, "工作区内的文件没写出来"
+    send(chat, f"用 shell 执行：echo LR-OUT > {outside}，然后回复 LR-DONE2")
+    if not wait_bot(chat, "需要你批准", timeout=300):
+        return False, "写工作区外没出审批卡"
+    if os.path.exists(outside):
+        return False, "工作区外的文件没等审批就写了"
+    return True, "工作区内直接写；工作区外先出审批卡且未执行"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -256,6 +285,8 @@ CASES = {
     "long_reply": case_long_reply,
     "image": case_image,
     "stop": case_stop,
+    "choices": case_choices,
+    "codex_trusted": case_codex_trusted,
 }
 
 
