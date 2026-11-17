@@ -175,7 +175,7 @@ HELP = """**我在你的电脑上干活，结果发回这里。**
 # 扫 app.py 源码盯着 —— 那条测试红了就是有人加了命令没登记，而不是等用户踩到。
 _APP_LITERALS = frozenset({
     "/help", "/h",
-    "/mode", "/权限", "/mode!",
+    "/mode", "/权限", "/p", "/mode!",
     "/model", "/模型",
     "/status",
     "/new",

@@ -2509,7 +2509,7 @@ class Bridge:
         if command in {"/help", "/h"}:
             self._say_with_buttons(chat_id, HELP, self._help_buttons())
             return True
-        if command in {"/mode", "/权限"}:
+        if command in {"/mode", "/权限", "/p"}:
             if self._session_of_group(chat_id) is not None:
                 self._handle_session_mode(chat_id, text)
                 return True
@@ -6224,9 +6224,9 @@ class Bridge:
 
         # 中文也认 —— 用户在手机上不会打英文
         alias = {
-            "只读": "readonly", "readonly": "readonly", "ro": "readonly",
-            "可改": "write", "可改文件": "write", "write": "write", "w": "write",
-            "全授权": "trusted", "trusted": "trusted", "全开": "trusted",
+            "只读": "readonly", "readonly": "readonly", "ro": "readonly", "r": "readonly",
+            "可改": "write", "可改文件": "write", "可写": "write", "write": "write", "w": "write",
+            "全授权": "trusted", "全部授权": "trusted", "trusted": "trusted", "全开": "trusted", "f": "trusted",
         }
         target = alias.get(arg)
         if target is None:
