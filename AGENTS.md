@@ -21,6 +21,7 @@
 | 选择操作手册和交付规则 | [`docs/operations.md`](docs/operations.md) | 先按任务类型读取对应细节；所有交付必须有 Git 提交 |
 | Computer Use、飞书真实验收 | [`docs/computer-use.md`](docs/computer-use.md) | 按目标确认、操作、结果三段验收；客户端画面未确认时不能宣布完成 |
 | 常驻菜单更新和发布 | [`docs/menu-update.md`](docs/menu-update.md) | 源码、能力、版本、客户端四层分别验收 |
+| 从 GitHub 自升级、官方更新屏蔽 | [`docs/selfupgrade.md`](docs/selfupgrade.md) | 只认 `x.y.z` 标签；测试不过或起不来就回滚；改了升级脚本要同步运行副本 |
 | 后台同步、回归和交付 | [`docs/runtime-delivery.md`](docs/runtime-delivery.md) | 同步运行目录、重启服务、跑回归、提交并推送 GitHub，记录 SHA |
 | 常驻菜单结构、节点限制、事件订阅和版本发布 | [`bridge/botmenu.py`](bridge/botmenu.py)、[`bridge/menu_heal.py`](bridge/menu_heal.py) | 先跑 `validate_tree()`；菜单形状变化必须发布新版本 |
 | 菜单版本号回归 | [`tests/test_menu_version.py`](tests/test_menu_version.py) | 覆盖整点前十分钟等前导零场景 |

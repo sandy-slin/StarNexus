@@ -65,6 +65,8 @@ save() {
 
 # ── 上报：只拼 5 个键，每个值先按白名单形状过一遍，不像就留空 ──
 report_crashloop() {
+  # StarNexus（有 .local-deploy 标记）不向官方服务器上报任何东西（1.2.0）
+  [ -f "$HOME_DIR/.local-deploy" ] && return 0
   local v id app qs
   v="$(sed -n 's/^BUILD_ID = "\(.*\)"$/\1/p' "$HOME_DIR/bridge/buildinfo.py" 2>/dev/null | head -1 \
        | tr -cd 'A-Za-z0-9._-' | cut -c1-60)"

@@ -310,6 +310,21 @@ def _held_line(texts) -> str:
     return f"点确认之后，会把你刚才说的这 {len(texts)} 句一起发过去，不用再打一遍：\n{lines}"
 
 
+def _github_upgrade_status() -> str:
+    """「更新」在 StarNexus 上的回话：报 GitHub 自升级的记录（tools/selfupgrade.py 写的 state.json）。"""
+    path = os.path.expanduser("~/.carher-feishu-agent/upgrade/state.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {}
+    installed = state.get("installed") or "未记录"
+    last = (state.get("history") or [{}])[-1]
+    tail = f"最近一次：{last.get('at', '')} {last.get('tag', '')} {last.get('outcome', '')}" if last else ""
+    return ("这台跑的是 StarNexus，只从 GitHub 的版本标签自动升级（每 6 小时查一次），不用官方安装包。\n"
+            f"当前版本：{installed}。{tail}".strip())
+
+
 def _split_ns_args(tool: str, rest: list, pick_model, pick_effort) -> tuple:
     """`/ns 工具` 后面的词 → (项目那几个词, 模型, 强度, 第一句)。
 
@@ -2686,8 +2701,11 @@ class Bridge:
         put("version", lambda: updater.current_build() if updater else None)
 
         def _latest():
+            # 1.2.0：StarNexus 只从 GitHub 标签升级（tools/selfupgrade.py），不再访问官方更新源
             from . import selfupdate
 
+            if selfupdate.is_local_deploy(os.path.dirname(os.path.abspath(__file__))):
+                return None
             info = selfupdate.latest()
             return info["build_id"] if info else None
 
@@ -7259,6 +7277,11 @@ class Bridge:
         """他在飞书里发「更新」⇒ 立刻查 + 装，结果如实回他。跑在自己的线程里。"""
         if self.updater is None:
             self._say(chat_id, "这台机器上的自动更新没起来，要人工重新跑一次安装包。")
+            return
+        from . import selfupdate
+
+        if selfupdate.is_local_deploy(self.updater.package_dir):
+            self._say(chat_id, _github_upgrade_status())
             return
         self._updater_learn_app_id()
         try:
