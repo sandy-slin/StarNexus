@@ -145,6 +145,31 @@ class StartPassesModelTest(unittest.TestCase):
         bridge._open_session_group.assert_awaited_once_with("oc", "dm:x", "x", "codex", "s-new")
 
 
+class FirstTurnNotRepushedTest(unittest.TestCase):
+    def test_first_turn_marked_relayed_for_group_push(self):
+        import time as _time
+        from bridge.fleet.grouppush import GroupPusher
+
+        bridge = make_bridge()
+        start = lambda tool, cwd, text, **kw: SimpleNamespace(ok=True, session_id="s-new", text="好的")
+        target = SimpleNamespace(label="Codex · repo", tool="codex", id="s-new")
+        bridge.fleet = SimpleNamespace(start=start, set_pending=lambda scope, tool, sid: target)
+        bridge._fleet_inflight = {}
+        bridge._paused = {}
+        bridge.reviewer = None
+        bridge.replier = SimpleNamespace(send=lambda chat_id, text: bridge.sent.append(text) or True)
+        bridge._grant_by_open_click = lambda *a: None
+        bridge._sync_talk_marker = lambda scope: None
+        bridge._send_buttons = lambda *a: None
+        bridge._talk_buttons = lambda *a: []
+        bridge._open_session_group = mock.AsyncMock(return_value=None)
+        bridge.group_pusher = GroupPusher()
+        bridge._newsession_state().arm("dm:x", "codex", "/tmp", "")
+        with mock.patch.object(app_mod, "_FleetWaitCard", FakeWaitCard):
+            asyncio.run(bridge._maybe_start_new_session("dm:x", "oc", "你好"))
+        self.assertTrue(bridge.group_pusher._relayed(("codex", "s-new"), _time.time()))
+
+
 class MissingWorkspaceTest(unittest.TestCase):
     def test_creates_one_missing_child_inside_allowed_root(self):
         import tempfile

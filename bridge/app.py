@@ -4706,6 +4706,7 @@ class Bridge:
         wait_stop = asyncio.Event()
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
         result = None
+        started_at = time.time()
         try:
             approval_dir = (self._fleet_approval_dir(tool, "new-" + scope, policy, cwd)
                             if tool in ("claude", "codex") else "")
@@ -4751,6 +4752,12 @@ class Bridge:
             name_session = getattr(control, "set_name", None)
             if name_session is not None:
                 name_session(tool, result.session_id, armed["name"])
+        pusher = getattr(self, "group_pusher", None)
+        if pusher is not None:
+            try:
+                pusher.note_relay(tool, result.session_id, started_at)
+            except Exception:  # noqa: BLE001
+                logger.debug("记新会话首轮失败", exc_info=True)
         group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id)
         target_scope = group_bound.scope if group_bound is not None else scope
         target_chat_id = group_bound.chat_id if group_bound is not None else chat_id
