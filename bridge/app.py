@@ -310,6 +310,66 @@ def _held_line(texts) -> str:
     return f"点确认之后，会把你刚才说的这 {len(texts)} 句一起发过去，不用再打一遍：\n{lines}"
 
 
+def _split_ns_args(tool: str, rest: list, pick_model, pick_effort) -> tuple:
+    """`/ns 工具` 后面的词 → (项目那几个词, 模型, 强度, 第一句)。
+
+    从左往右：遇到第一个认得出的模型 / 强度词，前面是项目（可带名字），后面连着的模型 / 强度词吃掉，
+    再往后就是第一句话。也认 `--`：`/ns codex 项目 -- 第一句`。都没有 ⇒ 老规矩，从右往左认模型 / 强度，
+    没有第一句（下一句话才是）。
+    """
+    words = list(rest)
+    if "--" in words:
+        cut = words.index("--")
+        head, first = words[:cut], " ".join(words[cut + 1:]).strip()
+        model = effort = ""
+        for _ in range(2):
+            if head and not effort and pick_effort(tool, head[-1]):
+                effort, head = pick_effort(tool, head[-1]), head[:-1]
+            elif head and not model and pick_model(tool, head[-1]):
+                model, head = pick_model(tool, head[-1]), head[:-1]
+        return head, model, effort, first
+    for i, word in enumerate(words):
+        if i == 0:
+            continue
+        if pick_model(tool, word) or pick_effort(tool, word):
+            head, model, effort, j = words[:i], "", "", i
+            while j < len(words) and j < i + 2:
+                if not model and pick_model(tool, words[j]):
+                    model = pick_model(tool, words[j])
+                elif not effort and pick_effort(tool, words[j]):
+                    effort = pick_effort(tool, words[j])
+                else:
+                    break
+                j += 1
+            return head, model, effort, " ".join(words[j:]).strip()
+    model = effort = ""
+    for _ in range(2):
+        if words and not effort and pick_effort(tool, words[-1]):
+            effort, words = pick_effort(tool, words[-1]), words[:-1]
+        elif words and not model and pick_model(tool, words[-1]):
+            model, words = pick_model(tool, words[-1]), words[:-1]
+    return words, model, effort, ""
+
+
+class _QuietReplier:
+    """一张卡开新会话时给等待卡用：什么都不发（进度在那张卡上）。"""
+
+    def send_status_card(self, *args, **kwargs):
+        return None
+
+    def patch_status_card(self, *args, **kwargs):
+        return False
+
+    def send(self, *args, **kwargs):
+        return False
+
+    def send_card_id(self, *args, **kwargs):
+        return None
+
+    def patch_card(self, *args, **kwargs):
+        return False
+
+
 class _FleetWaitCard:
     """话发进电脑上的会话之后、等它回的那段时间：一张**原地刷新**的等待卡。
 
@@ -505,7 +565,7 @@ def _toast_for(text: str) -> str:
         "/mode": "看看权限", "/model": "看看模型", "/dirs": "看看有哪些项目",
         "/status": "看看现在状态", "/stop": "正在停", "/new": "开个新话题",
         "/menu": "打开菜单", "/help": "打开帮助", "/history": "调出最近问过的话", "/sessions": "看看电脑上的会话",
-        "/诊断": "看看运行状态", "/newsession": "选一下用哪个",
+        "/诊断": "看看运行状态", "/newsession": "填一下就开",
     }
     if cmd in named:
         return f"收到，{named[cmd]}"
@@ -1982,6 +2042,8 @@ class Bridge:
             # 「➕ 新建会话」那两张卡：只带工具名 / 服务端序号，目录不在卡上
             if value.get("act") == "new":
                 return self._on_new_click(event, clicker, value)
+            if value.get("act") == "nsc":
+                return self._on_ns_card_click(event, clicker, value)
             if value.get("act") == "mdl":
                 return self._on_model_click(event, clicker, value)
             if value.get("act") == "sc":
@@ -3800,7 +3862,7 @@ class Bridge:
         return False
 
     async def _open_session_group(self, chat_id: str, scope: str, clicker: str, tool: str, sid: str,
-                                  jumped: bool = False) -> None:
+                                  jumped: bool = False, quiet_dm: bool = False) -> None:
         """单聊里点了某个会话的 [接着聊]：给它建（或复用）一个群，在群里先问一次权限。
 
         `jumped=True`：那一下点的按钮**已经带着他跳进了这个群**（详情卡 op=go，第 14 轮）。
@@ -3857,7 +3919,10 @@ class Bridge:
         group_scope = bound.scope
         if result.how != CREATED and not bound.on:
             self.chat_binds.turn_on(bound.chat_id)
-        if result.how == CREATED:
+        if quiet_dm:
+            # 1.1.0 一张卡：「进群」按钮放在那张卡上（`_ns_card_run` 原地换卡），私聊里不再多发一条
+            logger.info("群绑定 一张卡 tool=%s 会话=%s how=%s", tool, sid[:8], result.how)
+        elif result.how == CREATED:
             # 新建的群（含「他跳去的那个群已经被解散、这里重建了」）⇒ 他手上没有能进这个群的东西，必须给按钮
             enter = await self._group_enter_button(bound.chat_id)
             self._say_with_buttons(
@@ -4515,7 +4580,7 @@ class Bridge:
             self._say(chat_id, "会话总控这次没起来，重启一下服务再试。")
             return True
         if not args:
-            self._send_new_tool_card(chat_id)
+            await asyncio.to_thread(self._send_ns_card, scope, chat_id)
             return True
         if args[0].lower() in ("project", "项目") and len(args) >= 2 and args[1].lower() in ("new", "新建"):
             await self._new_project(scope, chat_id, args[2:])
@@ -4525,23 +4590,13 @@ class Bridge:
             self._say(chat_id, "认不出要用哪个，能用的是 claude / codex / opencode。")
             return True
         if len(args) == 1:
-            await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool)
+            await asyncio.to_thread(self._send_ns_card, scope, chat_id, tool)
             return True
         from .fleet.newsession import pick_effort, pick_model
 
-        rest = args[1:]
-        model, effort = "", ""
-        for _ in range(2):
-            if not rest:
-                break
-            if not effort and pick_effort(tool, rest[-1]):
-                effort = pick_effort(tool, rest[-1])
-                rest = rest[:-1]
-            elif not model and pick_model(tool, rest[-1]):
-                model = pick_model(tool, rest[-1])
-                rest = rest[:-1]
+        rest, model, effort, first = _split_ns_args(tool, args[1:], pick_model, pick_effort)
         if not rest:
-            await asyncio.to_thread(self._send_new_dir_card, scope, chat_id, tool, model, effort)
+            await asyncio.to_thread(self._send_ns_card, scope, chat_id, tool, "", model, effort)
             return True
         name = ""
         if len(rest) >= 2 and workspace_mod.looks_like_path(rest[-1]):
@@ -4556,6 +4611,12 @@ class Bridge:
                     self._say(chat_id, created.reply or found.reply.replace("/cd ", f"/newsession {tool} "))
             if not found.ok or not found.workspace:
                 return True
+        if first:
+            # 一句话开：`/ns 工具 项目 [模型] [强度] 第一句`（1.1.0）⇒ 不再等下一句，直接开
+            state.arm(scope, tool, found.workspace, model, effort,
+                      name=name or os.path.basename(found.workspace.rstrip(os.sep)))
+            await self._maybe_start_new_session(scope, chat_id, first)
+            return True
         self._arm_new_session(scope, chat_id, tool, found.workspace, model, effort, name=name)
         return True
 
@@ -4575,9 +4636,8 @@ class Bridge:
             self._arm_new_session(scope, chat_id, tool, made.workspace,
                                   name=os.path.basename(made.workspace.rstrip(os.sep)))
             return
-        self._say(chat_id, made.reply + "。接着选用哪个工具，选完说第一句就开工。")
-        self._remember_new_project(scope, made.workspace)
-        self._send_new_tool_card(chat_id)
+        self._say(chat_id, made.reply + "。在下面这张卡上选工具、说第一句就开工。")
+        await asyncio.to_thread(self._send_ns_card, scope, chat_id, "", made.workspace)
 
     def _remember_new_project(self, scope: str, path: str) -> None:
         if not hasattr(self, "_new_projects"):
@@ -4617,6 +4677,297 @@ class Bridge:
         if not hasattr(self, "_new_models"):
             self._new_models = {}
         return self._new_models
+
+    # ---------- 1.1.0 一张卡开新会话（bridge/fleet/nscard.py） ----------
+
+    def _ns_drafts(self):
+        store = getattr(self, "_ns_draft_store", None)
+        if store is None:
+            from .fleet.nscard import DraftStore
+
+            store = self._ns_draft_store = DraftStore()
+        return store
+
+    def _ns_last_path(self) -> str:
+        config_path = getattr(getattr(self, "settings", None), "config_path", "") or ""
+        return os.path.join(os.path.dirname(config_path), "ns_last_tool.json") if config_path else ""
+
+    def _ns_last_tool(self, scope: str) -> str:
+        """这个聊天上次开新会话用的工具（落盘，重启还在）；没有 ⇒ claude。"""
+        from .fleet.nscard import TOOLS
+
+        cache = self.__dict__.setdefault("_ns_last", None)
+        if cache is None:
+            cache = {}
+            path = self._ns_last_path()
+            try:
+                if path and os.path.exists(path):
+                    with open(path, encoding="utf-8") as fh:
+                        raw = json.load(fh)
+                    cache = {k: v for k, v in raw.items() if isinstance(v, str) and v in TOOLS} \
+                        if isinstance(raw, dict) else {}
+            except (OSError, ValueError):
+                cache = {}
+            self._ns_last = cache
+        return cache.get(scope) or cache.get("*") or "claude"
+
+    def _ns_remember_tool(self, scope: str, tool: str) -> None:
+        self._ns_last_tool(scope)
+        self._ns_last[scope] = tool
+        self._ns_last["*"] = tool
+        path = self._ns_last_path()
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._ns_last, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError:
+            logger.debug("记上次用的工具失败", exc_info=True)
+
+    def _ns_tools(self) -> tuple:
+        from .fleet.nscard import TOOLS
+
+        control = getattr(self, "fleet", None)
+        have = tuple(getattr(getattr(control, "fleet", None), "adapters", {}) or ())
+        return tuple(t for t in TOOLS if not have or t in have)
+
+    def _ns_models(self, tool: str) -> list:
+        mp = getattr(self, "model_prefs", None)
+        try:
+            return list(mp.catalog.names(tool)) if mp is not None else []
+        except Exception:  # noqa: BLE001
+            logger.debug("读模型目录失败", exc_info=True)
+            return []
+
+    def _ns_default_choice(self, tool: str):
+        """缺省时这家实际用的模型 / 强度：飞书设的默认 > 工具自己的配置。"""
+        from .fleet.catalog import Choice
+
+        base = self._effective_model(tool, "")
+        native = Choice()
+        mp = getattr(self, "model_prefs", None)
+        try:
+            native = mp.catalog.native(tool) if mp is not None else Choice()
+        except Exception:  # noqa: BLE001
+            native = Choice()
+        model = base.model or native.model
+        effort = base.effort or (native.effort if model == native.model else "")
+        return Choice(model, effort)
+
+    def _ns_efforts(self, tool: str, model: str) -> tuple:
+        from .fleet.model import can
+
+        if not can(tool, "effort"):
+            return ()
+        mp = getattr(self, "model_prefs", None)
+        try:
+            return tuple(mp.catalog.efforts(tool, model)) if mp is not None else ()
+        except Exception:  # noqa: BLE001
+            return ()
+
+    def _ns_card(self, draft, warn: str = "") -> dict:
+        from .fleet.nscard import build_card
+
+        default = self._ns_default_choice(draft.tool)
+        efforts = self._ns_efforts(draft.tool, draft.model or default.model)
+        if draft.effort and draft.effort not in efforts:
+            draft.effort = ""
+        return build_card(draft, self._ns_tools(), default_model=default.model, efforts=efforts,
+                          default_effort=default.effort if not draft.model or draft.model == default.model else "",
+                          escape=_redact_text, warn=warn)
+
+    def _send_ns_card(self, scope: str, chat_id: str, tool: str = "", project: str = "", model: str = "",
+                      effort: str = "") -> None:
+        """菜单「新建会话」/ `/ns`：发一张卡（工具 / 项目 / 模型 / 强度 / 第一句话）。"""
+        from .fleet.nscard import MAX_PROJECTS, dumps
+
+        policy = self.policy
+        tools = self._ns_tools()
+        tool = tool if tool in tools else (self._ns_last_tool(scope) if self._ns_last_tool(scope) in tools
+                                           else (tools[0] if tools else "claude"))
+        dirs = workspace_mod.recent_repos(policy, project or self._new_current_dir(scope), MAX_PROJECTS)
+        projects = [(d, _redact_text(workspace_mod.short_name(d, policy))) for d in dirs]
+        draft = self._ns_drafts().new(scope, tool, projects, self._ns_models(tool), proj=0)
+        if model in draft.models:
+            draft.model = model
+        draft.effort = effort
+        card = self._ns_card(draft)
+        sender = getattr(getattr(self, "replier", None), "send_card", None)
+        if sender is None or not sender(chat_id, dumps(card)):
+            self._say(chat_id, "新建会话的卡片发不出去。也可以直接发：/ns claude 项目名（或 codex / opencode）")
+        logger.info("新建会话卡 发出 tool=%s 项目数=%d", tool, len(projects))
+
+    def _on_ns_card_click(self, event, clicker: str, value: dict):
+        """新会话卡上的每一下。3 秒内返回：改选项 ⇒ 原地换卡；回车 / 开始 ⇒ 换成「正在开」，真开丢后台。"""
+        import re as _re
+
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet import nscard
+
+        def reply(kind: str, content: str, card=None, result: str = ""):
+            logger.info("新建会话卡 点击 op=%s 结果=%s", str(value.get("op") or "")[:8], result or content)
+            body = {"toast": {"type": kind, "content": content}}
+            if card is not None:
+                body["card"] = {"type": "raw", "data": card}
+            return P2CardActionTriggerResponse(body)
+
+        if clicker not in self.settings.owner_open_ids:
+            return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN], result="拒绝:不是主人")
+        action = getattr(event, "action", None)
+        click = nscard.resolve_click(value, getattr(action, "option", None), getattr(action, "input_value", None))
+        if click is None:
+            return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED], result="拒绝:形状不对")
+        chat_id, scope = self._click_scope(event, clicker)
+        if not chat_id or not scope:
+            if chat_id:
+                self._unknown_chat_notice(chat_id)
+            return reply("error", "服务刚重启过，先在这个聊天里发一句「新建会话」", result="拒绝:scope对不上")
+        draft, why = self._ns_drafts().get(scope, click["n"])
+        if draft is None:
+            return reply("error", why, result="拒绝:草稿对不上")
+        op, pick = click["op"], click["pick"]
+        if draft.started:
+            return reply("info", "已经在开了，稍等", result="重复")
+        if op == "cancel":
+            self._ns_drafts().finish(draft)
+            return reply("info", "好，不建了", nscard.build_cancelled_card(), "取消")
+        if op == "tool":
+            if pick not in self._ns_tools():
+                return reply("error", "这台电脑上没接上这个工具", result="拒绝:没装")
+            if pick != draft.tool:
+                draft.tool, draft.model, draft.effort = pick, "", ""
+                draft.models = self._ns_models(pick)[:nscard.MAX_MODELS]
+            return reply("info", "换好了", self._ns_card(draft), "换工具")
+        if op == "proj":
+            if pick == nscard.NEW_PROJECT:
+                draft.proj = None
+                return reply("info", "填一个新项目名", self._ns_card(draft), "新建项目")
+            idx = nscard.pick_index(pick, "p")
+            if idx is None or not 0 <= idx < len(draft.projects):
+                return reply("error", "这个项目认不出来，重新选一下", result="拒绝:项目下标")
+            draft.proj = idx
+            return reply("info", "换好了", self._ns_card(draft), "换项目")
+        if op == "model":
+            if pick == nscard.DEFAULT_OPT:
+                draft.model = ""
+            else:
+                idx = nscard.pick_index(pick, "m")
+                if idx is None or not 0 <= idx < len(draft.models):
+                    return reply("error", "这个模型认不出来，重新选一下", result="拒绝:模型下标")
+                draft.model = draft.models[idx]
+            return reply("info", "换好了", self._ns_card(draft), "换模型")
+        if op == "effort":
+            efforts = self._ns_efforts(draft.tool, draft.model or self._ns_default_choice(draft.tool).model)
+            if pick == nscard.DEFAULT_OPT:
+                draft.effort = ""
+            else:
+                idx = nscard.pick_index(pick, "e")
+                if idx is None or not 0 <= idx < len(efforts):
+                    return reply("error", "这个强度认不出来，重新选一下", result="拒绝:强度下标")
+                draft.effort = efforts[idx]
+            return reply("info", "换好了", self._ns_card(draft), "换强度")
+        if op == "pname":
+            name = click["text"].strip()
+            if not _re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff._-]{0,47}", name or ""):
+                return reply("error", "项目名只能用字母、数字、中文和 . _ -，不带斜杠",
+                             self._ns_card(draft, "项目名只能用字母、数字、中文和 . _ -，不带斜杠"), "拒绝:项目名")
+            draft.new_name = name
+            return reply("info", "记下了，接着说第一句", self._ns_card(draft), "项目名")
+        # send / go：开
+        text = click["text"] if op == "send" else ""
+        text = text or nscard.DEFAULT_PROMPT
+        if draft.tool not in self._ns_tools():
+            return reply("error", "这台电脑上没接上这个工具", self._ns_card(draft, "这台电脑上没接上这个工具，换一个。"),
+                         "拒绝:没装")
+        if draft.proj is None:
+            if not draft.new_name:
+                return reply("error", "先填新项目名", self._ns_card(draft, "先在上面填新项目名，回车确认。"), "没项目名")
+            project, project_label = "", draft.new_name
+        else:
+            project, project_label = draft.projects[draft.proj]
+            if not self.policy.resolve_workspace(project):
+                return reply("error", "这个项目现在不在手机能用的目录里了",
+                             self._ns_card(draft, "这个项目现在不在手机能用的目录里了，换一个。"), "拒绝:越界")
+        draft.started = True
+        self._ns_drafts().finish(draft)
+        self._ns_remember_tool(scope, draft.tool)
+        default = self._ns_default_choice(draft.tool)
+        model_text = draft.model or (f"缺省（{default.model}）" if default.model else "缺省")
+        if draft.effort:
+            model_text += f" / {nscard.effort_label(draft.effort)}"
+        message_id = getattr(getattr(event, "context", None), "open_message_id", "") or ""
+        loop = getattr(self, "_loop", None)
+        job = self._ns_card_run(scope, chat_id, message_id, draft.tool, project, draft.new_name,
+                                draft.model, draft.effort, text)
+        if loop is not None and hasattr(loop, "call_soon_threadsafe"):
+            asyncio.run_coroutine_threadsafe(job, loop)
+        else:
+            job.close()
+            return reply("error", "服务还没准备好，过几秒再点", result="拒绝:没循环")
+        return reply("info", "正在开", nscard.build_starting_card(draft.tool, project_label, model_text, text,
+                                                                  _redact_text), "开")
+
+    async def _ns_card_run(self, scope: str, chat_id: str, message_id: str, tool: str, project: str,
+                           new_name: str, model: str, effort: str, text: str) -> None:
+        """后台：（新建项目）→ 起会话 → 建群 → 第一轮回复进群 → 卡片换成「开好了 + 进群」。"""
+        if not project:
+            made = await asyncio.to_thread(workspace_mod.create_project, self.policy,
+                                           os.path.join("~/work", new_name))
+            if not made.ok or not made.workspace:
+                await self._ns_patch(message_id, self._ns_done_card(tool, "", False, made.reply or "新项目没建成"))
+                return
+            project = made.workspace
+        name = os.path.basename(project.rstrip(os.sep))
+        self._newsession_state().arm(scope, tool, project, model, effort, name=name)
+        holder: dict = {}
+        try:
+            await self._maybe_start_new_session(scope, chat_id, text, card_msg_id=message_id or "-",
+                                                out=holder)
+        except Exception:  # noqa: BLE001
+            logger.exception("新建会话卡 后台起会话失败")
+            holder.setdefault("error", "开的时候出错了，再试一次")
+        bound = holder.get("bound")
+        button = await self._group_enter_button(bound.chat_id) if bound is not None else None
+        card = self._ns_done_card(tool, getattr(bound, "name", ""), bool(holder.get("sid")),
+                                  holder.get("error", ""), button)
+        if not await self._ns_patch(message_id, card) and button is not None:
+            self._say_with_buttons(chat_id, f"新会话开好了，群「{getattr(bound, 'name', '')}」。", [button])
+        logger.info("新建会话卡 完成 tool=%s ok=%s 群=%s", tool, bool(holder.get("sid")), bool(bound))
+
+    def _ns_done_card(self, tool: str, group: str, ok: bool, error: str = "", button=None) -> dict:
+        from .fleet.actions import do_button
+        from .fleet.nscard import TOOL_NAMES, _card, _md
+
+        label = TOOL_NAMES.get(tool, tool)
+        if ok and group:
+            elements = [_md(f"✅ **{label}** 会话开好了，群「{_redact_text(group)}」。回复在群里，接着在群里说就行。")]
+        elif ok:
+            elements = [_md(f"✅ **{label}** 会话开好了。这次没建成群，就在这个聊天里接着说。")]
+        else:
+            elements = [_md(f"❌ 没开成：{_redact_text(error or '再试一次')}")]
+        buttons = [b for b in (button,) if b] + ([] if ok else [do_button("newsession", "➕ 再试一次")])
+        if buttons:
+            from .fleet.actions import button_rows
+
+            elements.extend(button_rows(buttons))
+        return _card("➕ 新建会话", "green" if ok else "red", elements)
+
+    async def _ns_patch(self, message_id: str, card: dict) -> bool:
+        from .fleet.nscard import dumps
+
+        patch = getattr(getattr(self, "replier", None), "patch_card", None)
+        if not message_id or patch is None:
+            return False
+        try:
+            return bool(await asyncio.to_thread(patch, message_id, dumps(card)))
+        except Exception:  # noqa: BLE001
+            logger.debug("新建会话卡 原地更新失败", exc_info=True)
+            return False
 
     def _arm_new_session(self, scope: str, chat_id: str, tool: str, cwd: str, model: str = "",
                          effort: str = "", name: str = "") -> None:
@@ -4693,8 +5044,13 @@ class Bridge:
         self._in_background(self._arm_new_session, scope, chat_id, tool, cwd)
         return toast("info", "好，说第一句吧", "已选好")
 
-    async def _maybe_start_new_session(self, scope: str, chat_id: str, text: str) -> bool:
-        """选好了工具和项目 ⇒ 这一句是新会话的第一句。开成了就进对话模式。没在新建 ⇒ False。"""
+    async def _maybe_start_new_session(self, scope: str, chat_id: str, text: str, card_msg_id: str = "",
+                                       out: dict | None = None) -> bool:
+        """选好了工具和项目 ⇒ 这一句是新会话的第一句。开成了就进对话模式。没在新建 ⇒ False。
+
+        `card_msg_id`：从「一张卡」那条路来的（1.1.0）⇒ 私聊里不再另发「正在开 / 建了群」这些消息，
+        进度和结果都落在那张卡上（`out` 带回 sid / 群 / 错误，由 `_ns_card_run` 原地换卡）。
+        """
         from .fleet.newsession import INFLIGHT_ID
         from .fleet.scan import TOOL_LABELS
 
@@ -4708,12 +5064,18 @@ class Bridge:
         control = getattr(self, "fleet", None)
         if control is None:
             state.disarm(scope)
+            if out is not None:
+                out["error"] = "会话总控这次没起来，重启一下服务再试"
             return False
         inflight = self._fleet_inflight
         if scope in inflight:
+            if out is not None:
+                out["error"] = "这个聊天上一条还在发，等它回来再开"
             self._say(chat_id, "上一条还在发，等它回来再说。")
             return True
         if scope in getattr(self, "_paused", {}):
+            if out is not None:
+                out["error"] = "这个聊天已暂停，先点「继续」"
             self._say_with_buttons(chat_id, f"⏸ 这个对话已暂停：{self._paused[scope]}\n确认没问题的话点「继续」。",
                                    [_do_button("resume", primary=True), _do_button("newcancel")])
             return True
@@ -4722,6 +5084,8 @@ class Bridge:
         if reviewer is not None:
             decision = reviewer.review_request(ReviewContext(text=text, source="human", mode=policy.mode))
             if decision.verdict is Verdict.DENY:
+                if out is not None:
+                    out["error"] = f"这句不能发：{decision.reason}"
                 self._say(chat_id, f"⛔️ {decision.reason}")
                 return True
         tool, cwd = armed["tool"], armed["cwd"]
@@ -4729,10 +5093,12 @@ class Bridge:
         label = TOOL_LABELS.get(tool, tool)
         inflight[scope] = (tool, INFLIGHT_ID)
         logger.info("新建会话 发出 tool=%s 字数=%d", tool, len(text))
-        self._say(chat_id, f"📨 正在新开 {label} 会话，等它回…")
+        quiet = bool(card_msg_id)
+        if not quiet:
+            self._say(chat_id, f"📨 正在新开 {label} 会话，等它回…")
         settings = getattr(self, "settings", None)
         wait_card = _FleetWaitCard(
-            self.replier, chat_id, f"新的 {label} 会话", can_stop=False,
+            _QuietReplier() if quiet else self.replier, chat_id, f"新的 {label} 会话", can_stop=False,
             first_delay=getattr(settings, "progress_first_notice_sec", 90),
             escalate_sec=getattr(settings, "progress_escalate_sec", 0),
             limit_sec=float(getattr(policy, "turn_timeout_sec", 600) or 600),
@@ -4762,7 +5128,12 @@ class Bridge:
             except Exception:  # noqa: BLE001
                 logger.debug("等待卡收尾失败", exc_info=True)
         logger.info("新建会话 结果 ok=%s tool=%s 会话=%s", result.ok, tool, str(result.session_id)[:8] or "-")
+        if out is not None:
+            out["sid"] = result.session_id or ""
         if not result.session_id:
+            if quiet and out is not None:
+                out["error"] = result.text or "没开成"
+                return True
             self._say_with_buttons(chat_id, f"❌ 没开成：{result.text}",
                                    [_do_button("newsession", "➕ 再试一次"), _do_button("sessions")])
             return True
@@ -4792,7 +5163,10 @@ class Bridge:
                 pusher.note_relay(tool, result.session_id, started_at)
             except Exception:  # noqa: BLE001
                 logger.debug("记新会话首轮失败", exc_info=True)
-        group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id)
+        group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id,
+                                                     **({"quiet_dm": True} if quiet else {}))
+        if out is not None:
+            out["bound"] = group_bound
         target_scope = group_bound.scope if group_bound is not None else scope
         target_chat_id = group_bound.chat_id if group_bound is not None else chat_id
         target = control.set_pending(target_scope, tool, result.session_id)
