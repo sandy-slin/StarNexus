@@ -276,6 +276,80 @@ def case_codex_trusted(dm: str) -> tuple:
     return True, "工作区内直接写；工作区外先出审批卡且未执行"
 
 
+def _tmux(*args: str) -> str:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=30).stdout
+
+
+def _claude_pid(cwd: str) -> int:
+    folder = os.path.expanduser("~/.claude/sessions")
+    for name in os.listdir(folder):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if rec.get("cwd") == cwd and rec.get("entrypoint") == "cli":
+            return int(rec.get("pid") or 0)
+    return 0
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def case_term_stop(dm: str) -> tuple:
+    """FC-12：终端里正在跑的 Claude 一轮，私聊 /stop ⇒ 说明只能在终端停、给替代按钮，终端会话不被关掉。"""
+    name = "lr-term-" + time.strftime("%H%M%S")
+    path = os.path.join(WORK, name)
+    os.makedirs(path, exist_ok=True)
+    session = "sn-" + name
+    _tmux("new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", path, "claude")
+    try:
+        time.sleep(10)
+        _tmux("send-keys", "-t", session,
+              "用 Bash 前台运行 python3 -c 'print(sum(1 for n in range(2, 40000000) "
+              "if all(n % d for d in range(2, int(n**0.5)+1))))'，命令超时设 600000 毫秒，不要改算法，算完回复 TERM-DONE。")
+        time.sleep(1)
+        _tmux("send-keys", "-t", session, "Enter")
+        pid = 0
+        end = time.time() + 60
+        while time.time() < end and not pid:
+            pid = _claude_pid(path)
+            time.sleep(3)
+        if not pid:
+            return False, "终端 Claude 没登记会话"
+        time.sleep(25)
+        seen = {m.get("message_id") for m in messages(dm)}
+        if not send(dm, "/stop"):
+            return False, "发 /stop 失败"
+        fresh: list = []
+        end = time.time() + 60
+        while time.time() < end:
+            fresh = [str(m.get("content") or "") for m in messages(dm)
+                     if m.get("message_id") not in seen and (m.get("sender") or {}).get("sender_type") == "app"]
+            if any("终端里的会话只能在终端里停" in t for t in fresh) and any("提醒我到电脑上停" in t for t in fresh):
+                break
+            time.sleep(4)
+        if not any("终端里的会话只能在终端里停" in t for t in fresh):
+            return False, "这次 /stop 的回复里没有终端会话的说明"
+        if not any("提醒我到电脑上停" in t for t in fresh):
+            return False, "这次 /stop 的回复里没有「提醒我到电脑上停」替代按钮"
+        time.sleep(20)
+        if not _alive(pid):
+            return False, "终端会话被关掉了"
+        return True, "说明只能在终端停并给替代按钮，终端会话还在"
+    finally:
+        _tmux("send-keys", "-t", session, "Escape")
+        time.sleep(2)
+        _tmux("kill-session", "-t", session)
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -287,6 +361,7 @@ CASES = {
     "stop": case_stop,
     "choices": case_choices,
     "codex_trusted": case_codex_trusted,
+    "term_stop": case_term_stop,
 }
 
 
