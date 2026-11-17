@@ -4708,6 +4708,9 @@ class Bridge:
             if not hasattr(self, "_new_session_name"):
                 self._new_session_name = {}
             self._new_session_name[result.session_id] = armed["name"]
+            name_session = getattr(control, "set_name", None)
+            if name_session is not None:
+                name_session(tool, result.session_id, armed["name"])
         group_bound = await self._open_session_group(chat_id, scope, clicker, tool, result.session_id)
         target_scope = group_bound.scope if group_bound is not None else scope
         target_chat_id = group_bound.chat_id if group_bound is not None else chat_id
@@ -5892,7 +5895,8 @@ class Bridge:
         cwd = getattr(sess, "cwd", "") if sess is not None else ""
         if not cwd:
             cwd = getattr(self, "_new_session_cwd", {}).get(bound.id, "")
-        title = getattr(sess, "title", "") if sess is not None else ""
+        title = getattr(self, "_new_session_name", {}).get(bound.id, "") or (
+            getattr(sess, "title", "") if sess is not None else "")
         choice = self._effective_model(bound.tool, bound.id)
         model = choice.text() if (choice.model or choice.effort) else ""
         if not model:

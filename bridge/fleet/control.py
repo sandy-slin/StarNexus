@@ -67,6 +67,7 @@ class FleetControl:
         self._lock = threading.Lock()
         self._known: dict = {}  # (tool, id) → Session（最近一次扫描）
         self._pending: dict = {}  # scope → Target
+        self._names: dict = {}  # (tool, id) → 主人用 /ns 起的名字
         self.last: Optional[Overview] = None
 
     # ---------- 扫描 ----------
@@ -196,9 +197,18 @@ class FleetControl:
 
     # ---------- 待发目标 ----------
 
+    def set_name(self, tool: str, sid: str, name: str) -> None:
+        if name:
+            with self._lock:
+                self._names[(tool, sid)] = name
+
+    def name_of(self, tool: str, sid: str) -> str:
+        with self._lock:
+            return self._names.get((tool, sid), "")
+
     def set_pending(self, scope: str, tool: str, sid: str) -> Target:
         sess = self.cached(tool, sid)
-        title = (sess.title if sess is not None else "") or ""
+        title = self.name_of(tool, sid) or (sess.title if sess is not None else "") or ""
         target = Target(tool, sid, title, self._now() + self.ttl)
         with self._lock:
             self._pending[scope] = target

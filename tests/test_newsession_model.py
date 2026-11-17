@@ -208,3 +208,23 @@ class NameAndPathTest(unittest.TestCase):
         state = NewSessionState()
         state.arm("dm:x", "claude", "/tmp", name="ai-native")
         self.assertEqual(state.peek("dm:x")[0]["name"], "ai-native")
+
+
+class SessionNameLabelTest(unittest.TestCase):
+    def test_ns_name_beats_first_message_title(self):
+        from bridge.fleet.control import FleetControl
+
+        control = FleetControl(object())
+        control._known[("claude", "b994d9f4-x")] = SimpleNamespace(title="你好，这是 ai-native 项目的新会话")
+        control.set_name("claude", "b994d9f4-x", "ai-native")
+        target = control.set_pending("dm:x", "claude", "b994d9f4-x")
+        self.assertEqual(target.label, "Claude「ai-native」")
+
+    def test_without_name_keeps_session_title(self):
+        from bridge.fleet.control import FleetControl
+
+        control = FleetControl(object())
+        control._known[("codex", "s1")] = SimpleNamespace(title="修登录")
+        self.assertEqual(control.set_pending("dm:x", "codex", "s1").label, "Codex「修登录」")
+        control.set_name("codex", "s1", "")
+        self.assertEqual(control.name_of("codex", "s1"), "")
