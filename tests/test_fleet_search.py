@@ -50,6 +50,38 @@ class SearchTest(unittest.TestCase):
         for v in values:
             self.assertIsNotNone(resolve_fleet_click(v, bridge.fleet.known_keys()))
 
+    def test_existing_group_button_jumps_in_one_click(self):
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        bridge.fleet = self.control()
+        bridge.fleet.overview = lambda: None
+        bridge._fleet_scanner = lambda: None
+        bridge.settings = SimpleNamespace(policy=SimpleNamespace(workspaces=("/u",), default_workspace="/u",
+                                                                 resolve_workspace=lambda c: c))
+        bound = SimpleNamespace(chat_id="oc_group_a1")
+        bridge.chat_binds = SimpleNamespace(
+            of_chat=lambda chat_id: None,
+            of_session=lambda tool, sid: bound if sid == "a1" else None,
+        )
+        bridge.group_client = SimpleNamespace(
+            open_link=lambda chat_id: f"https://applink.feishu.cn/client/chat/open?openChatId={chat_id}")
+        bridge._chat_ids = {}
+        out = []
+        bridge._say_with_buttons = lambda chat, text, buttons: out.append((text, buttons))
+        bridge._say = lambda chat, text: out.append((text, []))
+        asyncio.run(bridge._fleet_search("dm:ou_me", "oc_dm", "登录"))
+        _, buttons = out[0]
+        by_id = {}
+        for button in buttons:
+            callback = [b for b in button["behaviors"] if b["type"] == "callback"][0]["value"]
+            if callback.get("act") == "fleet":
+                by_id[callback["id"]] = button
+        jump = [b for b in by_id["a1"]["behaviors"] if b["type"] == "open_url"]
+        self.assertEqual(len(jump), 1)
+        self.assertIn("oc_group_a1", jump[0]["default_url"])
+        a1_callback = [b for b in by_id["a1"]["behaviors"] if b["type"] == "callback"][0]["value"]
+        self.assertIsNotNone(resolve_fleet_click(a1_callback, bridge.fleet.known_keys()))
+        self.assertFalse([b for b in by_id["c3"]["behaviors"] if b["type"] == "open_url"])
+
     def test_word_routes_to_command(self):
         self.assertTrue(app_mod._is_fleet_word("找会话 登录"))
         self.assertFalse(app_mod._is_fleet_word("找会话登录的问题"))

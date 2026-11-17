@@ -3157,11 +3157,14 @@ class Bridge:
             return
         lines = [f"找到 {len(hits)} 个会话，点一下进它的群（还没有群就建一个）："]
         buttons = []
+        row_button = self._overview_row_button(chat_id)
         for sess in hits:
             label = session_label(sess, _redact_text)
             proj = _redact_text(short_name(getattr(sess, "cwd", "") or "", self.policy)) if getattr(sess, "cwd", "") else ""
             lines.append(f"- {label}" + (f" · {proj}" if proj else ""))
-            buttons.append(fleet_button("send", sess.tool, sess.id, f"💬 {label}"[:28]))
+            text = f"💬 {label}"[:28]
+            button = row_button(sess, text, False) if row_button is not None else None
+            buttons.append(button or fleet_button("send", sess.tool, sess.id, text))
         buttons.append(do_button("sessions", "🖥 回到总览"))
         self._say_with_buttons(chat_id, "\n".join(lines), buttons)
 
