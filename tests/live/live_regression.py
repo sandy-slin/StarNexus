@@ -233,8 +233,12 @@ def case_stop(dm: str) -> tuple:
     send(chat, "用 shell 运行 sleep 120，结束后回复 LR-SLEPT")
     time.sleep(25)
     send(chat, "/stop")
-    if not wait_bot(chat, "停下", timeout=90):
-        return False, "没看到停下回执"
+    if not wait_bot(chat, "这一轮已停下", timeout=90):
+        return False, "没看到「这一轮已停下」回执"
+    if not wait_bot(chat, "⏹ 已停下", timeout=30):
+        return False, "等待卡没收尾成「⏹ 已停下」"
+    if any("没正常回完" in t for t in bot_texts(chat)):
+        return False, "停下后仍按「没正常回完」警告"
     if any("LR-SLEPT" in t for t in bot_texts(chat)):
         return False, "那一轮没被停住"
     send(chat, "停下后接着聊，只回复 LR-AFTER")
