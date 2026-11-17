@@ -450,12 +450,19 @@ class _FleetWaitCard:
         took = _fmt_elapsed(int(time.monotonic() - self._started))
         if result is not None and getattr(result, "ok", False):
             head = "✅ 它回了"
+        elif _stopped_by_owner(result):
+            head = "⏹ 已停下"
         elif result is not None and getattr(result, "delivered", False):
             head = "⚠️ 没等到它正常回复，看下面那条"
         else:
             head = "❌ 没发进去，看下面那条"
         self._last_text = ""  # 收尾那次一定要改，哪怕文字碰巧一样
         await self._show(f"{head} · {took}", with_stop=False)
+
+
+def _stopped_by_owner(result) -> bool:
+    """这一轮是主人点「停下」停的（不是超时、报错）⇒ 不按「没正常回完」的警告说。"""
+    return result is not None and str(getattr(result, "text", "") or "").startswith("这一轮已按你的要求停下")
 
 
 def _fmt_wait(seconds: float) -> str:
@@ -3434,6 +3441,14 @@ class Bridge:
             await self._send_reply_maybe_doc(chat_id, f"🖥 {target.label}", body, tail)
             self._send_buttons(chat_id, self._choice_buttons(scope, chat_id, target.tool, target.id,
                                                              result.text or "") + buttons)
+        elif _stopped_by_owner(result):
+            look = fleet_button("open", target.tool, target.id, "👀 看看它现在")
+            self._say_with_buttons(
+                chat_id,
+                f"⏹ {target.label} 这一轮已停下。会话还在，直接说下一句就能接着聊；"
+                "想看它停下前做到哪，点「看看它现在」。" + tail,
+                [look] + buttons,
+            )
         elif result.delivered:
             # 消息**已经进了会话**，只是没正常回完（超时 / 被停 / 等确认 / 报错）。
             # 不能说「没发进去」—— 用户会重发，在他真实的会话里重复执行一次。

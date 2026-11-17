@@ -182,6 +182,35 @@ class SendStageTest(unittest.TestCase):
         self.assertFalse(asyncio.run(card.open()))
 
 
+class WaitCardFinishTest(unittest.TestCase):
+    """FC-11：主人点「停下」⇒ 等待卡收尾写「已停下」，不按「没正常回完」的警告说。"""
+
+    def finish_with(self, result):
+        replier = FakeReplier()
+        card = app_mod._FleetWaitCard(replier, "oc", "Claude", can_stop=True, first_delay=0)
+
+        async def go():
+            await card.open()
+            await card.finish(result)
+
+        asyncio.run(go())
+        return replier.patched[-1]
+
+    def test_owner_stop_says_stopped(self):
+        from bridge.fleet.claude import STOPPED_BY_OWNER
+        from bridge.fleet.model import ActionResult
+
+        text = self.finish_with(ActionResult(False, STOPPED_BY_OWNER, "s1", delivered=True))
+        self.assertIn("⏹ 已停下", text)
+        self.assertNotIn("没等到", text)
+
+    def test_timeout_still_warns(self):
+        from bridge.fleet.model import ActionResult
+
+        text = self.finish_with(ActionResult(False, "太久没回完", "s1", delivered=True))
+        self.assertIn("没等到它正常回复", text)
+
+
 if __name__ == "__main__":
     unittest.main()
 
