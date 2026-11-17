@@ -6872,10 +6872,6 @@ class Bridge:
             self._status_cards_tick()
         except Exception:  # noqa: BLE001
             logger.exception("状态卡这一拍失败")
-        try:
-            self._escalate_tick(view)
-        except Exception:  # noqa: BLE001
-            logger.exception("加急这一拍失败")
         if not waiting_on:
             return
         try:
@@ -6972,18 +6968,9 @@ class Bridge:
                 ok = self._say(bound.chat_id, f"📌 {session_label(sess, _redact_text)} 进展：{line}")
                 logger.info("重要进展 推送 tool=%s 会话=%s 送达=%s", sess.tool, str(sess.id)[:8], ok)
 
-    def _escalator(self):
-        esc = getattr(self, "_needs_you_escalator", None)
-        if esc is None:
-            from .fleet.escalate import Escalator
-
-            esc = self._needs_you_escalator = Escalator()
-        return esc
-
     def _push_needs_you(self, push, text: str) -> bool:
-        """需要人介入的推送：@ 主人；「在等你」记下 message_id，10 分钟没处理加急一次（§5.8）。"""
+        """需要人介入的推送：@ 主人（bot 的主人）。不再加急（§5.8）。"""
         from .fleet.escalate import at_owner_line
-        from .fleet.grouppush import pending_key
 
         owners = getattr(getattr(self, "settings", None), "owner_open_ids", None) or ()
         at = at_owner_line(owners)
@@ -6998,34 +6985,7 @@ class Bridge:
                 mid = None
         if not mid:
             return bool(self._say(push.chat_id, text))
-        if push.kind == "waiting":
-            self._escalator().track((push.sess.tool, push.sess.id), push.chat_id, mid,
-                                    pending_key(push.sess) or "-")
         return True
-
-    def _escalate_tick(self, view) -> None:
-        """每拍：还在等、过了 10 分钟、没加急过的那件事 ⇒ 加急一次。"""
-        from .fleet.grouppush import pending_key
-
-        esc = getattr(self, "_needs_you_escalator", None)
-        if esc is None or not esc.pending():
-            return
-        waiting = {}
-        for sess in list(getattr(view, "sessions", None) or []):
-            if getattr(sess, "status", "") == "waiting":
-                waiting[(sess.tool, sess.id)] = pending_key(sess) or "-"
-        owners = getattr(getattr(self, "settings", None), "owner_open_ids", None) or ()
-        urge = getattr(getattr(self, "group_client", None), "urgent", None)
-        for item in esc.due(waiting):
-            ok, code = False, 0
-            if urge is not None:
-                try:
-                    ok, code, _msg = urge(item.message_id, owners)
-                except Exception:  # noqa: BLE001
-                    logger.exception("加急抛异常")
-            logger.info("需要人介入 加急 chat=%s 成功=%s code=%s", item.chat_id[:12], ok, code)
-            if not ok:
-                self._say(item.chat_id, "⏰ 这件事已经等了 10 分钟还没人处理，请尽快看一下。")
 
     def _send_card_or_text_ok(self, chat_id: str, card: str, fallback: str) -> bool:
         """同 `_send_card_or_text`，但告诉调用方到底送没送到（限流要知道）。"""

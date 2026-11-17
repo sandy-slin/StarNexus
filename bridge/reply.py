@@ -509,7 +509,7 @@ class Replier:
     def send_md_id(self, chat_id: str, text: str) -> str | None:
         """发一条 post 富文本（md，可以带 `<at user_id=...>`），返回 message_id；失败返回 None。
 
-        给「需要人介入」那条用：要拿 message_id 去加急。正文照样先脱敏。
+        给「需要人介入」那条用：带 @ 主人发出，返回 message_id。正文照样先脱敏。
         """
         from lark_oapi.api.im.v1 import (
             CreateMessageRequest,

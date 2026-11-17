@@ -47,11 +47,12 @@ class HealScopesTest(unittest.TestCase):
         self.assertEqual([x["scope_name"] for x in body["scope"]["add_scopes"]], ["im:message:readonly"])
 
     def test_scope_not_effective_logged(self):
-        have = [sc for sc in register.WANT_SCOPES if sc != "im:message.urgent:app_send"]
+        missing = register.WANT_SCOPES[-1]
+        have = [sc for sc in register.WANT_SCOPES if sc != missing]
         fake = FakeFeishu(have)
         with self.assertLogs("feishu-bridge", level="WARNING") as logs:
             self.assertTrue(self.heal(fake).attempt())
-        self.assertIn("还没生效 im:message.urgent:app_send", "\n".join(logs.output))
+        self.assertIn("还没生效 " + missing, "\n".join(logs.output))
 
     def test_nothing_missing_no_add(self):
         fake = FakeFeishu(list(register.WANT_SCOPES))
@@ -67,8 +68,8 @@ class HealScopesTest(unittest.TestCase):
         self.assertIn("im:message:readonly", register.WANT_SCOPES)
         self.assertNotIn("im:message", register.WANT_SCOPES)
 
-    def test_urgent_scope_wanted(self):
-        self.assertIn("im:message.urgent:app_send", register.WANT_SCOPES)
+    def test_urgent_scope_not_wanted(self):
+        self.assertFalse(any("urgent" in sc for sc in register.WANT_SCOPES))
 
 
 if __name__ == "__main__":

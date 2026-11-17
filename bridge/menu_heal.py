@@ -277,7 +277,7 @@ class MenuHeal:
             return self._failed_with(pub, "发布版本", table=bm.PUBLISH_ERRORS)
 
         shown = (pub.get("data") or {}).get("version") or version
-        # 🔴 2026-11-17 实测：`im:message.urgent:app_send` 申请接口回 success、版本也发了，权限列表里
+        # 🔴 2026-11-17 实测：有的权限申请接口回 success、版本也发了，权限列表里
         # 仍然没有（这类权限要在开发者后台手动开 / 等管理员批）。发版后回读一次，没生效的写日志 + 开通链接，
         # 别让「申请成功」掩盖「其实没开」。
         asked = list(getattr(self, "_pending_scopes", []) or [])
