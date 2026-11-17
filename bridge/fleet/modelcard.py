@@ -55,8 +55,12 @@ def value(op: str, to: str = "d", tool: str = "", **extra: Any) -> dict:
     return out
 
 
-def resolve_click(raw: Any) -> Optional[dict]:
-    """卡片回调 → 干净的点击；形状不对 ⇒ None。"""
+def resolve_click(raw: Any, option: Any = None) -> Optional[dict]:
+    """卡片回调 → 干净的点击；形状不对 ⇒ None。
+
+    1.3.0 起模型和强度是下拉：回调值里只有 op/to/tool，选中项在 `option`（模型是 `m序号`，强度是档名）。
+    旧卡上的按钮（值里直接带 `i` / `e`）照样认。
+    """
     if not isinstance(raw, dict) or raw.get("act") != ACT:
         return None
     op, to, tool = raw.get("op"), raw.get("to", "d"), raw.get("tool", "")
@@ -65,13 +69,16 @@ def resolve_click(raw: Any) -> Optional[dict]:
     if op != "home" and tool not in TOOLS:
         return None
     out = {"op": op, "to": to, "tool": tool}
+    pick = option if isinstance(option, str) else ""
     if op == "m":
         idx = raw.get("i")
-        if not isinstance(idx, int) or idx < 0 or idx > 64:
+        if idx is None and pick.startswith("m") and pick[1:].isdigit() and len(pick) <= 3:
+            idx = int(pick[1:])
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx > 64:
             return None
         out["i"] = idx
     if op == "e":
-        effort = raw.get("e")
+        effort = raw.get("e", pick)
         if not isinstance(effort, str) or not effort.isalpha() or len(effort) > 10:
             return None
         out["e"] = effort
@@ -96,25 +103,37 @@ def home_card(prefs: ModelPrefs, session: Optional[tuple] = None) -> str:
     return _card("🧠 模型", [{"tag": "markdown", "content": "\n".join(lines)}] + _rows(buttons))
 
 
+def _select(placeholder: str, options: list, initial: str, val: dict) -> dict:
+    node = {
+        "tag": "select_static", "width": "fill",
+        "placeholder": {"tag": "plain_text", "content": placeholder},
+        "options": [{"text": {"tag": "plain_text", "content": text}, "value": v} for text, v in options],
+        "behaviors": [{"type": "callback", "value": val}],
+    }
+    if initial and any(v == initial for _, v in options):
+        node["initial_option"] = initial
+    return node
+
+
 def list_card(prefs: ModelPrefs, to: str, tool: str, sid: str = "", label: str = "") -> str:
-    """选模型 + 选 effort。当前项打 ✅。"""
+    """选模型 + 选强度，两个下拉放一行（1.3.0）。下拉的值只有序号 / 档名，真名服务端现查。"""
     current = prefs.session(tool, sid) if to == "s" else prefs.default(tool)
     shown = prefs.effective(tool, sid) if to == "s" else current
     names = prefs.catalog.names(tool)
     head = (f"给 **{label or LABELS[tool]}** 这个会话选模型" if to == "s"
             else f"设 **{LABELS[tool]}** 的默认模型")
     elements = [{"tag": "markdown", "content": f"{head}\n现在：{shown.text()}"}]
-    model_buttons = []
-    for idx, name in enumerate(names):
-        on = name == shown.model
-        model_buttons.append(_button(("✅ " if on else "") + name, value("m", to, tool, i=idx), primary=on))
-    elements += _rows(model_buttons)
+    model_opts = [(name, f"m{idx}") for idx, name in enumerate(names)]
+    model_init = f"m{names.index(shown.model)}" if shown.model in names else ""
+    model_sel = _select("模型", model_opts, model_init, value("m", to, tool))
     efforts = prefs.catalog.efforts(tool, shown.model)
+    cells = [(model_sel, 3)]
     if efforts:
-        elements.append({"tag": "markdown", "content": "**推理强度**", "text_size": "notation"})
-        effort_buttons = [_button(("✅ " if e == shown.effort else "") + EFFORT_LABELS.get(e, e),
-                                  value("e", to, tool, e=e), primary=e == shown.effort) for e in efforts]
-        elements += _rows(effort_buttons, 3)
+        effort_opts = [(f"{EFFORT_LABELS.get(e, e)}（{e}）", e) for e in efforts]
+        cells.append((_select("推理强度", effort_opts, shown.effort, value("e", to, tool)), 2))
+    elements.append({"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+        {"tag": "column", "width": "weighted", "weight": w, "vertical_align": "center", "elements": [node]}
+        for node, w in cells]})
     elements += _rows([_button("↩︎ 回到模型总览", value("home", to))])
     return _card("🧠 选模型", elements)
 

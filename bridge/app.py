@@ -568,6 +568,12 @@ def _outcome_of(result) -> str:
     return "done"
 
 
+def _full_access(policy):
+    """飞书上开的会话（一张卡 / `/ns` / CEO 子任务）用的档位：全部授权，仍被本机上限压住。"""
+    with_mode = getattr(policy, "with_mode", None)
+    return with_mode("trusted") if with_mode is not None else policy
+
+
 def _toast_for(text: str) -> str:
     """点了按钮后的提示。**不许露内部命令**（原来会显示「收到，/mode! trusted」）。"""
     parts = text.split(maxsplit=1)
@@ -733,6 +739,14 @@ class Bridge:
             self.model_prefs = ModelPrefs(os.path.join(home, "model_prefs.json"), Catalog())
         except Exception:  # noqa: BLE001
             logger.exception("模型设置没起来，会话照旧用工具自己的默认模型")
+        # 每个会话自己的权限档位（1.3.0，fleet/sessperm.py）：飞书开的会话全部授权，群里切只改这个会话
+        self.session_perms = None
+        try:
+            from .fleet.sessperm import SessionPerms
+
+            self.session_perms = SessionPerms(os.path.join(home, "session_perms.json"))
+        except Exception:  # noqa: BLE001
+            logger.exception("会话权限记录没起来，会话照旧跟随全局档位")
         # 🔴 令牌密钥**必须落盘**。
         # 原来用 os.urandom(32) 每次启动随机生成，注释里写"重启后旧卡片失效是对的，
         # 因为 claude 会话也续不上了"—— 这个推理是错的：会话 id 存在
@@ -2061,6 +2075,8 @@ class Bridge:
                 return self._on_ns_card_click(event, clicker, value)
             if value.get("act") == "mdl":
                 return self._on_model_click(event, clicker, value)
+            if value.get("act") == "sp":
+                return self._on_session_perm_click(event, clicker, value)
             if value.get("act") == "sc":
                 return self._on_status_card_click(event, clicker, value)
             if value.get("act") == "ch":
@@ -2494,6 +2510,9 @@ class Bridge:
             self._say_with_buttons(chat_id, HELP, self._help_buttons())
             return True
         if command in {"/mode", "/权限"}:
+            if self._session_of_group(chat_id) is not None:
+                self._handle_session_mode(chat_id, text)
+                return True
             self._handle_mode(chat_id, text)
             return True
         if command == "/mode!":
@@ -3414,7 +3433,7 @@ class Bridge:
             self._say_with_buttons(chat_id, f"⏸ 这个对话已暂停：{self._paused[scope]}\n确认没问题的话点「继续」。",
                                    [do_button("resume", primary=True), do_button("quit")])
             return True
-        policy = self.policy
+        policy = self._session_policy(target.tool, target.id)
         reviewer = getattr(self, "reviewer", None)
         if reviewer is not None:
             decision = reviewer.review_request(ReviewContext(text=text, source="human", mode=policy.mode))
@@ -3990,6 +4009,8 @@ class Bridge:
             )
         else:
             self._ask_relay_consent(bound.chat_id, group_scope, tool, sid)
+        if result.how == CREATED:
+            self._offer_session_perm(bound.chat_id, tool, sid, bound.name or label)
         try:
             await asyncio.to_thread(self._refresh_status_card, bound.chat_id)
         except Exception:  # noqa: BLE001 —— 状态卡失败不能连累进群
@@ -4523,7 +4544,7 @@ class Bridge:
             ClaudeBrain(env=brain_env, settings=brain_settings),
             control,
             self._say,
-            policy=lambda: self.policy,
+            policy=lambda: _full_access(self.policy),
             projects=projects,
             approval_dir=approval_dir,
             timeout=lambda: float(getattr(self.policy, "turn_timeout_sec", 600) or 600),
@@ -5107,6 +5128,8 @@ class Bridge:
                 self._say(chat_id, f"⛔️ {decision.reason}")
                 return True
         tool, cwd = armed["tool"], armed["cwd"]
+        # 1.3.0：飞书上开的会话一律「全部授权」（仍被本机上限压住）
+        policy = _full_access(policy)
         state.disarm(scope)
         label = TOOL_LABELS.get(tool, tool)
         inflight[scope] = (tool, INFLIGHT_ID)
@@ -5158,6 +5181,9 @@ class Bridge:
         # 🔴 新会话是主人自己从手机开的，权限说明在选项目时已经给过 ⇒ 记成确认（和建群那条同一套记法），
         # 之后会话改名 / 换项目 / 在电脑上打开，照旧会再问。
         clicker = scope[3:] if scope.startswith("dm:") else ""
+        perms = getattr(self, "session_perms", None)
+        if perms is not None:
+            perms.mark_feishu(tool, result.session_id)
         mp = getattr(self, "model_prefs", None)
         if mp is not None and (armed.get("model") or armed.get("effort")):
             mp.set_session(tool, result.session_id, model=armed.get("model") or None,
@@ -5800,9 +5826,11 @@ class Bridge:
             sess = self.fleet.cached(tool, sid)
         except Exception:  # noqa: BLE001
             sess = None
+        from .fleet.sessperm import LABELS as _perm_labels
+
         if tool == "codex":
-            mode = MODE_LABELS.get(getattr(self.policy, "mode", "trusted"), "全授权")
-            return f"· 按当前权限档位 **{mode}** 处理，手机和终端一致\n"
+            mode = _perm_labels.get(self._session_policy(tool, sid).mode, "全部授权")
+            return f"· 这个会话的权限：**{mode}**\n"
         if sess is not None and self._runs_in_background(sess):
             return "· 电脑上这个会话现在关着，会在后台接着跑，权限按当前档位处理\n"
         mode = MODE_LABELS.get(getattr(self.policy, "mode", "trusted"), "全授权")
@@ -6304,7 +6332,7 @@ class Bridge:
 
         if clicker not in self.settings.owner_open_ids:
             return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
-        click = resolve_click(value)
+        click = resolve_click(value, getattr(getattr(event, "action", None), "option", None))
         mp = getattr(self, "model_prefs", None)
         if click is None or mp is None:
             return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
@@ -6388,7 +6416,9 @@ class Bridge:
                 native = None
             if native is not None and native.model:
                 model = f"工具默认（{native.text()}）"
-        mode = MODE_LABELS.get(getattr(getattr(self, "policy", None), "mode", ""), "")
+        from .fleet.sessperm import LABELS as _perm_labels
+
+        mode = _perm_labels.get(self._session_policy(bound.tool, bound.id).mode, "")
         progress = ""
         pending = getattr(sess, "pending", None) if sess is not None else None
         if pending is not None:
@@ -6521,6 +6551,121 @@ class Bridge:
             self._in_background(fn, chat_id)
         except Exception:  # noqa: BLE001
             logger.debug("状态卡刷新排队失败", exc_info=True)
+
+    # ---------- 每个会话自己的权限（1.3.0，fleet/sessperm.py） ----------
+
+    def _session_policy(self, tool: str, sid: str):
+        """这个会话这一轮用的 Policy：会话自己选过档位就用它（仍被本机上限压住），没选过跟随全局。"""
+        policy = self.policy
+        perms = getattr(self, "session_perms", None)
+        if perms is None or not sid:
+            return policy
+        try:
+            mode = perms.mode(tool, sid)
+        except Exception:  # noqa: BLE001
+            mode = ""
+        return policy.with_mode(mode) if mode and hasattr(policy, "with_mode") else policy
+
+    def _session_of_group(self, chat_id: str):
+        """这个聊天是会话群 ⇒ 绑定（Bound）；不是 ⇒ None。"""
+        binds = getattr(self, "chat_binds", None)
+        if binds is None or not chat_id:
+            return None
+        try:
+            return binds.of_chat(chat_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _session_perm_card(self, chat_id: str, note: str = ""):
+        from .fleet import sessperm
+
+        bound = self._session_of_group(chat_id)
+        if bound is None:
+            return None
+        perms = getattr(self, "session_perms", None)
+        own = perms.mode(bound.tool, bound.id) if perms is not None else ""
+        current = self._session_policy(bound.tool, bound.id).mode
+        label = bound.name or bound.tool
+        return sessperm.card(current, _redact_text(label), follows_global=not own, note=note)
+
+    def _offer_session_perm(self, chat_id: str, tool: str, sid: str, label: str) -> None:
+        """新建的会话群：电脑上原有的会话给三个权限按钮；飞书开的会话已是全部授权，只说一句。"""
+        from .fleet import sessperm
+
+        perms = getattr(self, "session_perms", None)
+        if perms is not None and perms.from_feishu(tool, sid):
+            logger.info("会话权限 飞书新开 全部授权 tool=%s 会话=%s", tool, str(sid)[:8])
+            return
+        card = self._session_perm_card(chat_id, note="这是电脑上原有的会话，请选这个群里它能做什么：")
+        if card is None:
+            return
+        logger.info("会话权限 建群给按钮 tool=%s 会话=%s", tool, str(sid)[:8])
+        self._send_card_or_text(chat_id, json.dumps(card, ensure_ascii=False),
+                                f"🔑 {sessperm.COMMAND_HINT}")
+
+    def _handle_session_mode(self, chat_id: str, text: str) -> None:
+        """会话群里的 `/权限 [只读|可写|全部授权]`：只改这个群绑定的会话。"""
+        from .fleet import sessperm
+
+        bound = self._session_of_group(chat_id)
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if bound is None:
+            return
+        if not arg:
+            card = self._session_perm_card(chat_id)
+            self._send_card_or_text(chat_id, json.dumps(card, ensure_ascii=False), f"🔑 {sessperm.COMMAND_HINT}")
+            return
+        target = sessperm.parse_mode(arg)
+        if target is None:
+            self._say(chat_id, f"不认识「{_redact_text(arg)[:20]}」。{sessperm.COMMAND_HINT}。")
+            return
+        self._say(chat_id, self._apply_session_mode(bound, target))
+
+    def _apply_session_mode(self, bound, target: str) -> str:
+        from .fleet import sessperm
+
+        perms = getattr(self, "session_perms", None)
+        if perms is None:
+            return "⚠️ 会话权限记录没起来，这次没切成。"
+        saved = perms.set(bound.tool, bound.id, target)
+        applied = self._session_policy(bound.tool, bound.id).mode
+        logger.info("会话权限 切换 tool=%s 会话=%s 要=%s 实际=%s", bound.tool, str(bound.id)[:8], target, applied)
+        lines = [f"🔑 这个会话改成「{sessperm.LABELS[applied]}」：{sessperm.EXPLAIN[applied]}。下一轮生效。"]
+        if applied != target:
+            lines.append(f"⚠️ 这台电脑最多放到「{sessperm.LABELS.get(applied, applied)}」，没能切到「{sessperm.LABELS[target]}」。")
+        if not saved:
+            lines.append("⚠️ 这次没存下来，重启后会回到原来的档位。")
+        self._refresh_status_card_later(bound.chat_id)
+        return "\n".join(lines)
+
+    def _on_session_perm_click(self, event, clicker: str, value: dict):
+        """会话群里那三个权限按钮。闸门：主人 + 形状白名单；会话按点击所在群现查绑定。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet import sessperm
+
+        def reply(kind: str, text: str, card=None):
+            body = {"toast": {"type": kind, "content": text}}
+            if card is not None:
+                body["card"] = {"type": "raw", "data": card}
+            return P2CardActionTriggerResponse(body)
+
+        if clicker not in self.settings.owner_open_ids:
+            return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
+        target = sessperm.resolve_click(value)
+        if target is None:
+            return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
+        chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""
+        bound = self._session_of_group(chat_id)
+        if bound is None:
+            return reply("error", "这里不是会话群，到会话群里再切")
+        text = self._apply_session_mode(bound, target)
+        self._say_later(chat_id, text)
+        return reply("success", f"已切到「{sessperm.LABELS[self._session_policy(bound.tool, bound.id).mode]}」",
+                     self._session_perm_card(chat_id))
 
     def _handle_model(self, chat_id: str, text: str) -> None:
         """`/model` 看当前模型 + 给可选项；`/model claude-opus-5-5` 切换。
