@@ -9,6 +9,7 @@
 5. 至少核对 `bridge/botmenu.py` 和 `bridge/menu_heal.py` 的文件哈希。
 6. 重启 `com.carher.feishu-agent`，确认 launchd 为 `running`，日志出现飞书连接成功。
 7. 按 [`computer-use.md`](computer-use.md) 做真实验收，按 [`menu-update.md`](menu-update.md) 做菜单验收。
+8. 跑真机回归 `SN_DM_CHAT=<林森和 Her remote · Pro 的私聊 chat_id> python3 -u tests/live/live_regression.py`：以林森身份经 lark-cli 发命令、读回群消息判定，覆盖新建 Claude / Codex 会话、群里接着聊、/find。要在前台跑（后台跑会随 shell 退出被杀掉）；它只证明服务端结果，卡片点按和客户端画面仍按第 7 步用 Computer Use 复核。
 
 ## 不让安装包覆盖仓库代码
 
