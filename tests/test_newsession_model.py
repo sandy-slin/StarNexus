@@ -238,3 +238,34 @@ class GroupNameDedupTest(unittest.TestCase):
     def test_project_different_from_name_kept(self):
         name = group_name("claude", "ai-native", "b994d9f4", project="/Users/LinSen/work/AI_native")
         self.assertEqual(name, "SN·Claude·AI_native·ai-native")
+
+
+class SessionNamesPersistTest(unittest.TestCase):
+    def test_names_survive_restart(self):
+        import tempfile
+
+        from bridge.fleet.control import FleetControl
+        from bridge.fleet.sessnames import SessionNames
+
+        home = tempfile.mkdtemp()
+        SessionNames(os.path.join(home, "session_names.json")).put(
+            "6b3b13bd-x", name="ns-greet-check", cwd="/tmp/ns-greet-check")
+        bridge = app_mod.Bridge.__new__(app_mod.Bridge)
+        bridge.fleet = FleetControl(object())
+        bridge.fleet._known[("claude", "6b3b13bd-x")] = SimpleNamespace(title="这是群名和提示复测")
+        bridge._load_session_names(home)
+        self.assertEqual(bridge._new_session_name["6b3b13bd-x"], "ns-greet-check")
+        self.assertEqual(bridge._new_session_cwd["6b3b13bd-x"], "/tmp/ns-greet-check")
+        self.assertEqual(bridge.fleet.set_pending("group:oc", "claude", "6b3b13bd-x").label,
+                         "Claude「ns-greet-check」")
+
+    def test_broken_file_is_empty(self):
+        import tempfile
+
+        from bridge.fleet.sessnames import SessionNames
+
+        home = tempfile.mkdtemp()
+        path = os.path.join(home, "session_names.json")
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(SessionNames(path).names(), {})

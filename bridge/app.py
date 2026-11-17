@@ -735,6 +735,7 @@ class Bridge:
             )
         except Exception:  # noqa: BLE001
             logger.exception("会话总控没起来，/sessions 先用不了")
+        self._load_session_names(home)
         # 会话进入「等你」时推卡（第 7 轮，bridge/fleet/notify.py）。判断全在 notify 里，
         # 这里只接线；起不来只是少了推送，桥照常。
         self.waiting_notifier = None
@@ -4710,6 +4711,9 @@ class Bridge:
         if not hasattr(self, "_new_session_cwd"):
             self._new_session_cwd = {}
         self._new_session_cwd[result.session_id] = cwd
+        store = getattr(self, "session_names", None)
+        if store is not None:
+            store.put(result.session_id, name=armed.get("name") or "", cwd=cwd)
         if armed.get("name"):
             if not hasattr(self, "_new_session_name"):
                 self._new_session_name = {}
@@ -6967,6 +6971,26 @@ class Bridge:
             if line:
                 ok = self._say(bound.chat_id, f"📌 {session_label(sess, _redact_text)} 进展：{line}")
                 logger.info("重要进展 推送 tool=%s 会话=%s 送达=%s", sess.tool, str(sess.id)[:8], ok)
+
+    def _load_session_names(self, home: str) -> None:
+        """/ns 起的名字和目录从磁盘读回来：重启后群名、状态卡、对话标签不退回第一句话。"""
+        self.session_names = None
+        try:
+            from .fleet.sessnames import STATE_FILE, SessionNames
+
+            self.session_names = SessionNames(os.path.join(home, STATE_FILE))
+        except Exception:  # noqa: BLE001
+            logger.exception("会话名记录没起来，重启后标签退回会话标题")
+            return
+        names = self.session_names.names()
+        self._new_session_name = dict(names)
+        self._new_session_cwd = self.session_names.cwds()
+        control = getattr(self, "fleet", None)
+        setter = getattr(control, "set_name", None)
+        if setter is not None:
+            for sid, name in names.items():
+                for tool in ("claude", "codex", "opencode"):
+                    setter(tool, sid, name)
 
     def _push_needs_you(self, push, text: str) -> bool:
         """需要人介入的推送：@ 主人（bot 的主人）。不再加急（§5.8）。"""
