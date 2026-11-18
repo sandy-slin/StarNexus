@@ -3,7 +3,8 @@
 卡上三行（全部在 form 外 ⇒ 每个下拉选了就回调、输入框回车就发）：
 
 1. 【工具 ▾】（默认上次用的）【项目 ▾】（默认最近用的，末项「➕ 新建项目」）
-   选了「➕ 新建项目」⇒ 原地换卡，多一行项目名输入框
+   选了「➕ 新建项目」⇒ 原地换卡，项目那一格直接换成项目名输入框（不再是下拉 + 下面再一个框）；
+   底下多一个「📂 选已有项目」按钮换回下拉
 2. 【模型 ▾】（默认「缺省（具体名）」，随工具变）【强度 ▾】（默认「缺省」，随工具 / 模型变）
 3. 【第一句话（回车就开）】【▶ 开始】 —— 空着点「开始」⇒ 第一句用「hi」
 
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 ACT = "nsc"
-OPS = frozenset({"tool", "proj", "model", "effort", "pname", "send", "go", "cancel"})
+OPS = frozenset({"tool", "proj", "model", "effort", "pname", "back", "send", "go", "cancel"})
 TOOLS = ("claude", "codex", "opencode")
 TOOL_NAMES = {"claude": "Claude", "codex": "Codex", "opencode": "opencode"}
 DEFAULT_PROMPT = "hi"
@@ -40,6 +41,7 @@ DRAFT_TTL_SEC = 30 * 60
 MAX_PROJECTS = 12
 MAX_MODELS = 12
 MAX_PROMPT_CHARS = 1000
+MAX_PROJECT_NAME = 48
 PROJECT_CELLS = 30
 TEXT_INPUT = "nsc_text"
 NAME_INPUT = "nsc_pname"
@@ -167,9 +169,10 @@ def _select(placeholder: str, options: list, initial: str, op: str, nonce: str) 
     return node
 
 
-def _input(name: str, placeholder: str, op: str, nonce: str, default: str = "") -> dict:
+def _input(name: str, placeholder: str, op: str, nonce: str, default: str = "",
+           max_length: int = MAX_PROMPT_CHARS) -> dict:
     node = {
-        "tag": "input", "name": name, "width": "fill", "max_length": MAX_PROMPT_CHARS,
+        "tag": "input", "name": name, "width": "fill", "max_length": max_length,
         "placeholder": {"tag": "plain_text", "content": placeholder},
         "behaviors": [{"type": "callback", "value": value(op, nonce)}],
     }
@@ -216,12 +219,13 @@ def build_card(draft: Draft, tools: tuple, *, default_model: str, efforts: tuple
     proj_opts = [(clip_cells(name, PROJECT_CELLS), f"p{i}") for i, (_path, name) in enumerate(draft.projects)]
     proj_opts.append(("➕ 新建项目", NEW_PROJECT))
     proj_init = NEW_PROJECT if draft.proj is None else f"p{draft.proj}"
-    proj_sel = _select("项目", proj_opts, proj_init, "proj", nonce)
-    elements: list = [_row((tool_sel, 2), (proj_sel, 3))]
     if draft.proj is None:
-        elements.append(_input(NAME_INPUT, "新项目名（如 demo），回车确认", "pname", nonce, draft.new_name))
-        if draft.new_name:
-            elements.append(_md(f"新项目：**{escape(draft.new_name)}**（开的时候建在 ~/work 下）", small=True))
+        proj_cell = _input(NAME_INPUT, "新项目名，回车", "pname", nonce, draft.new_name, MAX_PROJECT_NAME)
+    else:
+        proj_cell = _select("项目", proj_opts, proj_init, "proj", nonce)
+    elements: list = [_row((tool_sel, 2), (proj_cell, 3))]
+    if draft.proj is None and draft.new_name:
+        elements.append(_md(f"新项目：**{escape(draft.new_name)}**（开的时候建在 ~/work 下）", small=True))
     default_text = f"缺省（{default_model}）" if default_model else "缺省"
     model_opts = [(default_text, DEFAULT_OPT)] + [(clip_cells(m, PROJECT_CELLS), f"m{i}")
                                                   for i, m in enumerate(draft.models)]
@@ -241,7 +245,10 @@ def build_card(draft: Draft, tools: tuple, *, default_model: str, efforts: tuple
                          (_button("▶ 开始", "go", nonce, primary=True), 1)))
     elements.append(_md("打了字按回车开；不打字直接点「开始」，第一句用「hi」。开好会自动建群，"
                         "权限和终端一样。", small=True))
-    elements.append(_row((_button("✖️ 不建了", "cancel", nonce), 1)))
+    if draft.proj is None and draft.projects:
+        elements.append(_row((_button("📂 选已有项目", "back", nonce), 1), (_button("✖️ 不建了", "cancel", nonce), 1)))
+    else:
+        elements.append(_row((_button("✖️ 不建了", "cancel", nonce), 1)))
     return _card("➕ 新建会话", "turquoise", elements)
 
 

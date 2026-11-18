@@ -73,11 +73,22 @@ class CardLayoutTest(unittest.TestCase):
                                                "value": "new"})
         self.assertNotIn("/w/a", json.dumps(card))
 
-    def test_ns04_new_project_shows_name_input(self):
+    def test_ns04_new_project_name_input_replaces_project_dropdown(self):
         _, draft = _draft()
         draft.proj = None
         card = self.build(draft)
+        rows = _rows(card)
+        self.assertEqual([n["placeholder"]["content"] for n in _tags(rows[0], "select_static")], ["工具"])
+        self.assertEqual([n["name"] for n in _tags(rows[0], "input")], [nscard.NAME_INPUT])
+        self.assertEqual(_tags(rows[0], "input")[0]["max_length"], nscard.MAX_PROJECT_NAME)
+        self.assertNotIn("项目", [n["placeholder"]["content"] for n in _tags(card, "select_static")])
         self.assertEqual([n["name"] for n in _tags(card, "input")], [nscard.NAME_INPUT, nscard.TEXT_INPUT])
+        self.assertIn("📂 选已有项目", [b["text"]["content"] for b in _tags(card, "button")])
+
+    def test_ns04b_no_back_button_without_projects(self):
+        _, draft = _draft(projects=[])
+        draft.proj = None
+        self.assertNotIn("📂 选已有项目", [b["text"]["content"] for b in _tags(self.build(draft), "button")])
 
     def test_ns05_no_effort_row_cell_for_opencode(self):
         _, draft = _draft(tool="opencode")
@@ -255,6 +266,11 @@ class BridgeFlowTest(unittest.TestCase):
         self.assertIn(nscard.NAME_INPUT, [n["name"] for n in _tags(card, "input")])
         self.assertIn("项目名只能用", self.click("pname", nonce, None, "../etc")[0])
         self.assertEqual(self.click("go", nonce)[0], "先填新项目名")
+        toast, card = self.click("back", nonce)
+        self.assertEqual(toast, "换回已有项目")
+        self.assertIn("项目", [n["placeholder"]["content"] for n in _tags(card, "select_static")])
+        self.assertEqual([n["name"] for n in _tags(card, "input")], [nscard.TEXT_INPUT])
+        self.click("proj", nonce, "new")
         self.assertEqual(self.click("pname", nonce, None, "demo-1")[0], "记下了，接着说第一句")
         jobs = []
         self.bridge._loop = SimpleNamespace(call_soon_threadsafe=lambda f: None)
