@@ -113,8 +113,11 @@ def case_ns_codex(dm: str) -> tuple:
         return False, f"群名不对：{gname}"
     if not wait_bot(chat, "LR-OK", timeout=240):
         return False, "群里没等到 LR-OK"
-    if not any("工具默认" in t for t in bot_texts(chat)):
-        return False, "状态卡没写工具默认模型"
+    if not any(f"Codex「{name}」" in t and "会话状态卡" in t for t in bot_texts(chat)):
+        return False, "状态卡标题没用名字"
+    # 状态卡正文是卡片实体，接口只回占位图 ⇒ 缺省模型看私聊的新建回执（那里是明文）
+    if not any("工具默认" in t for t in bot_texts(dm, 20)):
+        return False, "新建回执没写工具默认模型"
     return True, gname
 
 
