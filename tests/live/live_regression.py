@@ -421,7 +421,7 @@ def case_ns_card(dm: str) -> tuple:
             if (m.get("sender") or {}).get("sender_type") != "app":
                 continue
             body = str(m.get("content") or "")
-            if "新建会话" in body and "开始" in body and "第一句话" in body:
+            if "新建会话" in body and "开始" in body and "第一句话" in body and "会话名" in body:
                 return True, "卡片已发出"
         time.sleep(3)
     return False, "60 秒内没收到新会话卡"

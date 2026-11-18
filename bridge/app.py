@@ -4970,8 +4970,8 @@ class Bridge:
 
         policy = self.policy
         tools = self._ns_tools()
-        tool = tool if tool in tools else (self._ns_last_tool(scope) if self._ns_last_tool(scope) in tools
-                                           else (tools[0] if tools else "claude"))
+        # 1.6.0 林森 11-18：「新建会话用 claude」⇒ 卡上默认固定 Claude（不再跟上次用的走），下拉里还能换
+        tool = tool if tool in tools else ("claude" if "claude" in tools else (tools[0] if tools else "claude"))
         dirs = workspace_mod.recent_repos(policy, project or self._new_current_dir(scope), MAX_PROJECTS)
         projects = [(d, _redact_text(workspace_mod.short_name(d, policy))) for d in dirs]
         draft = self._ns_drafts().new(scope, tool, projects, self._ns_models(tool), proj=0)
@@ -4993,6 +4993,7 @@ class Bridge:
         )
 
         from .fleet import nscard
+        from .fleet.model import short_title
 
         def reply(kind: str, content: str, card=None, result: str = ""):
             logger.info("新建会话卡 点击 op=%s 结果=%s", str(value.get("op") or "")[:8], result or content)
@@ -5004,7 +5005,7 @@ class Bridge:
         if clicker not in self.settings.owner_open_ids:
             return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN], result="拒绝:不是主人")
         action = getattr(event, "action", None)
-        click = nscard.resolve_click(value, getattr(action, "option", None), getattr(action, "input_value", None))
+        click = nscard.resolve_click(value, getattr(action, "option", None), getattr(action, "form_value", None))
         if click is None:
             return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED], result="拒绝:形状不对")
         chat_id, scope = self._click_scope(event, clicker)
@@ -5031,7 +5032,7 @@ class Bridge:
         if op == "proj":
             if pick == nscard.NEW_PROJECT:
                 draft.proj = None
-                return reply("info", "填一个新项目名", self._ns_card(draft), "新建项目")
+                return reply("info", "在「项目」框里填新项目名", self._ns_card(draft), "新建项目")
             idx = nscard.pick_index(pick, "p")
             if idx is None or not 0 <= idx < len(draft.projects):
                 return reply("error", "这个项目认不出来，重新选一下", result="拒绝:项目下标")
@@ -5056,31 +5057,16 @@ class Bridge:
                     return reply("error", "这个强度认不出来，重新选一下", result="拒绝:强度下标")
                 draft.effort = efforts[idx]
             return reply("info", "换好了", self._ns_card(draft), "换强度")
-        if op == "back":
-            draft.proj = 0 if draft.projects else None
-            return reply("info", "换回已有项目", self._ns_card(draft), "选已有项目")
-        if op == "pname":
-            name = click["text"].strip()
-            if not _re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff._-]{0,47}", name or ""):
-                return reply("error", "项目名只能用字母、数字、中文和 . _ -，不带斜杠",
-                             self._ns_card(draft, "项目名只能用字母、数字、中文和 . _ -，不带斜杠"), "拒绝:项目名")
-            draft.new_name = name
-            return reply("info", "记下了，接着说第一句", self._ns_card(draft), "项目名")
-        # send / go：开
-        text = click["text"] if op == "send" else ""
-        text = text or nscard.DEFAULT_PROMPT
+        # go：开（项目 / 会话名 / 第一句话都从 form_value 来）
+        text = click["text"] or nscard.DEFAULT_PROMPT
         if draft.tool not in self._ns_tools():
             return reply("error", "这台电脑上没接上这个工具", self._ns_card(draft, "这台电脑上没接上这个工具，换一个。"),
                          "拒绝:没装")
-        if draft.proj is None:
-            if not draft.new_name:
-                return reply("error", "先填新项目名", self._ns_card(draft, "先在项目那一格填新项目名，按回车。"), "没项目名")
-            project, project_label = "", draft.new_name
-        else:
-            project, project_label = draft.projects[draft.proj]
-            if not self.policy.resolve_workspace(project):
-                return reply("error", "这个项目现在不在手机能用的目录里了",
-                             self._ns_card(draft, "这个项目现在不在手机能用的目录里了，换一个。"), "拒绝:越界")
+        project, new_path, project_label, why = self._ns_pick_project(draft, click["project"])
+        if why:
+            return reply("error", why, self._ns_card(draft, why), "拒绝:项目")
+        session_name = click["session"] or nscard.recommend_session_name(project_label) \
+            or short_title(text, nscard.MAX_SESSION_NAME)
         draft.started = True
         self._ns_drafts().finish(draft)
         self._ns_remember_tool(scope, draft.tool)
@@ -5090,27 +5076,59 @@ class Bridge:
             model_text += f" / {nscard.effort_label(draft.effort)}"
         message_id = getattr(getattr(event, "context", None), "open_message_id", "") or ""
         loop = getattr(self, "_loop", None)
-        job = self._ns_card_run(scope, chat_id, message_id, draft.tool, project, draft.new_name,
-                                draft.model, draft.effort, text)
+        job = self._ns_card_run(scope, chat_id, message_id, draft.tool, project, new_path,
+                                draft.model, draft.effort, text, session_name)
         if loop is not None and hasattr(loop, "call_soon_threadsafe"):
             asyncio.run_coroutine_threadsafe(job, loop)
         else:
             job.close()
             return reply("error", "服务还没准备好，过几秒再点", result="拒绝:没循环")
         return reply("info", "正在开", nscard.build_starting_card(draft.tool, project_label, model_text, text,
-                                                                  _redact_text), "开")
+                                                                  _redact_text, session_name), "开")
+
+    def _ns_pick_project(self, draft, typed: str) -> tuple:
+        """「项目」框里的字 → (已有项目路径, 要新建的路径, 显示名, 为什么不行)。
+
+        空 ⇒ 下拉选中的；等于列表里的显示名 ⇒ 那个项目；纯名字 ⇒ ~/work/<名字>；
+        ~/ 或 / 开头 ⇒ 那个路径。目录已经在 ⇒ 直接用（必须在可用目录内）；不在 ⇒ 开的时候新建。
+        """
+        import re as _re
+
+        typed = (typed or "").strip().strip("'\"")
+        if not typed:
+            if draft.proj is None:
+                return "", "", "", "先在「项目」框里填项目名（新名字会在 ~/work 下新建）"
+            typed = draft.projects[draft.proj][1]
+        for path, label in draft.projects:
+            if typed in (label, path):
+                if not self.policy.resolve_workspace(path):
+                    return "", "", "", "这个项目现在不在手机能用的目录里了，换一个"
+                return path, "", label, ""
+        if _re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff._-]{0,47}", typed):
+            target = os.path.join(getattr(self, "_ns_new_root", "~/work"), typed)
+        elif typed.startswith(("~/", "/")):
+            target = typed
+        else:
+            return "", "", "", "项目名只能用字母、数字、中文和 . _ -；要写路径就从 ~/ 开头"
+        full = os.path.expanduser(target)
+        if os.path.isdir(full):
+            if not self.policy.resolve_workspace(full):
+                return "", "", "", "这个目录不在手机能用的目录里，换一个"
+            return full, "", workspace_mod.short_name(full, self.policy), ""
+        if os.path.lexists(full):
+            return "", "", "", "这个位置已经有同名文件了，换一个名字"
+        return "", target, _redact_text(target), ""
 
     async def _ns_card_run(self, scope: str, chat_id: str, message_id: str, tool: str, project: str,
-                           new_name: str, model: str, effort: str, text: str) -> None:
+                           new_path: str, model: str, effort: str, text: str, session_name: str = "") -> None:
         """后台：（新建项目）→ 起会话 → 建群 → 第一轮回复进群 → 卡片换成「开好了 + 进群」。"""
         if not project:
-            made = await asyncio.to_thread(workspace_mod.create_project, self.policy,
-                                           os.path.join("~/work", new_name))
+            made = await asyncio.to_thread(workspace_mod.create_project, self.policy, new_path)
             if not made.ok or not made.workspace:
                 await self._ns_patch(message_id, self._ns_done_card(tool, "", False, made.reply or "新项目没建成"))
                 return
             project = made.workspace
-        name = os.path.basename(project.rstrip(os.sep))
+        name = session_name or os.path.basename(project.rstrip(os.sep))
         self._newsession_state().arm(scope, tool, project, model, effort, name=name)
         holder: dict = {}
         try:

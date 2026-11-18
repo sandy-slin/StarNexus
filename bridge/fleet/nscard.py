@@ -1,26 +1,27 @@
-"""一张卡开新会话（1.1.0，林森 11-17 定义）。
+"""一张卡开新会话（1.1.0 起；1.6.0 林森 11-18：项目下拉 + 项目输入框联动、会话名、默认 Claude）。
 
-卡上三行（全部在 form 外 ⇒ 每个下拉选了就回调、输入框回车就发）：
+卡上（下拉在 form 外 ⇒ 选了就回调；输入框和「开始」在一个 form 里 ⇒ 点「开始」一次带回所有字）：
 
-1. 【工具 ▾】（默认上次用的）【项目 ▾】（默认最近用的，末项「➕ 新建项目」）
-   选了「➕ 新建项目」⇒ 原地换卡，项目那一格直接换成项目名输入框（不再是下拉 + 下面再一个框）；
-   底下多一个「📂 选已有项目」按钮换回下拉
+1. 【工具 ▾】（默认 Claude）【项目 ▾】（最近用的项目，末项「➕ 新建项目」）
 2. 【模型 ▾】（默认「缺省（具体名）」，随工具变）【强度 ▾】（默认「缺省」，随工具 / 模型变）
-3. 【第一句话（回车就开）】【▶ 开始】 —— 空着点「开始」⇒ 第一句用「hi」
+3. form：【项目（预填所选项目，可改成新名字）】【会话名（预填推荐名，建群用）】
+         【第一句话（不填就发 hi）】【▶ 开始（提交）】
+
+联动：选项目下拉 ⇒ 原地换卡，项目框和会话名框预填所选项目；选「➕ 新建项目」⇒ 两个框清空等你填。
+点「开始」时以项目框里的字为准：是列表里的项目就用它，是 ~/work 下已有的目录就用它，
+否则在 ~/work 下新建这个目录。会话名不填就用项目目录名。
 
 ## 回调值（白名单）
 
-`{"act": "nsc", "op": <OPS>, "n": <服务端草稿序号>}`。工具 / 项目 / 模型 / 强度的**值**来自
-`action.option`（下拉选项的 value），输入框的字来自 `action.input_value`。
-下拉选项的 value 只有枚举词或下标：工具是 `claude|codex|opencode`，项目是 `p<i>` / `new`，
-模型是 `m<i>` / `def`，强度是 `e<i>` / `def`。路径、模型全名都只在服务端草稿里 ⇒
-伪造的回调最多是「换成另一个已列出来的选项」。
+`{"act": "nsc", "op": <OPS>, "n": <服务端草稿序号>}`。下拉的**值**来自 `action.option`
+（工具 `claude|codex|opencode`，项目 `p<i>` / `new`，模型 `m<i>` / `def`，强度 `e<i>` / `def`）；
+输入框的字来自 `action.form_value`（点「开始」时）。路径、模型全名都只在服务端草稿里。
 
-## 为什么「开始」按钮不能读到输入框里的字
+## 为什么用 form
 
-飞书客户端（本机 Lark messenger.asar）的 input 只在**回车**时回调 `input_value`；
-在 form 外，按钮点击不带输入框的值。所以：打了字 ⇒ 回车开；没打字 ⇒ 点「开始」用「hi」开。
-卡上那一行小字把这一点写明，不让人以为打了字再点按钮能发出去。
+飞书客户端（本机 Lark messenger.asar）的 input 不在 form 里时只在**回车**才回传 `input_value`，
+按钮点击不带输入框的值 ⇒ 1.5.1 手机上打完项目名直接点「开始」，名字丢了。放进 form、
+「开始」做成提交按钮后，点一下 `form_value` 带回全部输入框；代价是 form 里回车不再直接开。
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 ACT = "nsc"
-OPS = frozenset({"tool", "proj", "model", "effort", "pname", "back", "send", "go", "cancel"})
+OPS = frozenset({"tool", "proj", "model", "effort", "go", "cancel"})
 TOOLS = ("claude", "codex", "opencode")
 TOOL_NAMES = {"claude": "Claude", "codex": "Codex", "opencode": "opencode"}
 DEFAULT_PROMPT = "hi"
@@ -42,9 +43,13 @@ MAX_PROJECTS = 12
 MAX_MODELS = 12
 MAX_PROMPT_CHARS = 1000
 MAX_PROJECT_NAME = 48
+MAX_PROJECT_PATH = 200
 PROJECT_CELLS = 30
 TEXT_INPUT = "nsc_text"
 NAME_INPUT = "nsc_pname"
+SESSION_INPUT = "nsc_sname"
+FORM_NAME = "nsc_form"
+MAX_SESSION_NAME = 40
 NEW_PROJECT = "new"
 DEFAULT_OPT = "def"
 
@@ -58,7 +63,6 @@ class Draft:
     tool: str
     projects: list                 # [(真实路径, 显示名)]
     proj: Optional[int] = 0        # 选中的下标；None = 选了「新建项目」
-    new_name: str = ""             # 「新建项目」时填的名字
     model: str = ""                # 空 = 缺省
     effort: str = ""               # 空 = 缺省
     models: list = field(default_factory=list)   # 当前工具的模型全名
@@ -115,8 +119,11 @@ def value(op: str, nonce: str) -> dict:
     return {"act": ACT, "op": op, "n": str(nonce)}
 
 
-def resolve_click(raw: Any, option: Any = None, text: Any = None) -> Optional[dict]:
-    """回调 → {"op", "n", "pick", "text"}；形状不对 ⇒ None。`pick` 是下拉选中的 value（已核形状）。"""
+def resolve_click(raw: Any, option: Any = None, form: Any = None) -> Optional[dict]:
+    """回调 → {"op", "n", "pick", "project", "session", "text"}；形状不对 ⇒ None。
+
+    `pick` 是下拉选中的 value（已核形状）；`form` 是 `action.form_value`（点「开始」时三个输入框的字）。
+    """
     if not isinstance(raw, dict) or raw.get("act") != ACT or set(raw) != {"act", "op", "n"}:
         return None
     op, nonce = raw.get("op"), raw.get("n")
@@ -131,8 +138,14 @@ def resolve_click(raw: Any, option: Any = None, text: Any = None) -> Optional[di
         return None
     if op == "effort" and not (pick == DEFAULT_OPT or _index(pick, "e") is not None):
         return None
-    words = text.strip()[:MAX_PROMPT_CHARS] if isinstance(text, str) else ""
-    return {"op": op, "n": nonce, "pick": pick, "text": words}
+    form = form if isinstance(form, dict) else {}
+
+    def field(name: str, limit: int) -> str:
+        got = form.get(name)
+        return " ".join(got.split())[:limit] if isinstance(got, str) else ""
+
+    return {"op": op, "n": nonce, "pick": pick, "project": field(NAME_INPUT, MAX_PROJECT_PATH),
+            "session": field(SESSION_INPUT, MAX_SESSION_NAME), "text": field(TEXT_INPUT, MAX_PROMPT_CHARS)}
 
 
 def _index(pick: str, prefix: str) -> Optional[int]:
@@ -169,16 +182,27 @@ def _select(placeholder: str, options: list, initial: str, op: str, nonce: str) 
     return node
 
 
-def _input(name: str, placeholder: str, op: str, nonce: str, default: str = "",
-           max_length: int = MAX_PROMPT_CHARS) -> dict:
+def _input(name: str, placeholder: str, default: str = "", max_length: int = MAX_PROMPT_CHARS,
+           label: str = "") -> dict:
+    """form 里的输入框：不挂回调（字随「开始」一起提交）。"""
     node = {
         "tag": "input", "name": name, "width": "fill", "max_length": max_length,
         "placeholder": {"tag": "plain_text", "content": placeholder},
-        "behaviors": [{"type": "callback", "value": value(op, nonce)}],
     }
+    if label:
+        node["label"] = {"tag": "plain_text", "content": label}
+        node["label_position"] = "left"
     if default:
         node["default_value"] = default
     return node
+
+
+def _submit(label: str, op: str, nonce: str) -> dict:
+    return {
+        "tag": "button", "name": "nsc_go", "text": {"tag": "plain_text", "content": label},
+        "type": "primary", "width": "fill", "size": "medium", "form_action_type": "submit",
+        "behaviors": [{"type": "callback", "value": value(op, nonce)}],
+    }
 
 
 def _button(label: str, op: str, nonce: str, primary: bool = False) -> dict:
@@ -208,9 +232,15 @@ def _card(title: str, template: str, elements: list) -> dict:
             "body": {"elements": elements}}
 
 
+def recommend_session_name(project_label: str) -> str:
+    """推荐的会话名（建群用）：项目目录的最后一级；项目是主目录 `~` 这种没意义的 ⇒ 空。"""
+    base = str(project_label or "").rstrip("/").rsplit("/", 1)[-1].strip()
+    return "" if base in ("", "~", ".") else base[:MAX_SESSION_NAME]
+
+
 def build_card(draft: Draft, tools: tuple, *, default_model: str, efforts: tuple, default_effort: str = "",
                escape: Callable[[str], str] = lambda s: s, warn: str = "") -> dict:
-    """一张卡：工具/项目 · 模型/强度 · 第一句话/开始。`default_model`：缺省时实际用的模型名（显示用）。"""
+    """工具/项目 · 模型/强度 · form（项目 / 会话名 / 第一句话 / 开始）。`default_model`：缺省时实际用的模型名。"""
     from .cards import clip_cells
 
     nonce = draft.nonce
@@ -219,13 +249,8 @@ def build_card(draft: Draft, tools: tuple, *, default_model: str, efforts: tuple
     proj_opts = [(clip_cells(name, PROJECT_CELLS), f"p{i}") for i, (_path, name) in enumerate(draft.projects)]
     proj_opts.append(("➕ 新建项目", NEW_PROJECT))
     proj_init = NEW_PROJECT if draft.proj is None else f"p{draft.proj}"
-    if draft.proj is None:
-        proj_cell = _input(NAME_INPUT, "新项目名，回车", "pname", nonce, draft.new_name, MAX_PROJECT_NAME)
-    else:
-        proj_cell = _select("项目", proj_opts, proj_init, "proj", nonce)
-    elements: list = [_row((tool_sel, 2), (proj_cell, 3))]
-    if draft.proj is None and draft.new_name:
-        elements.append(_md(f"新项目：**{escape(draft.new_name)}**（开的时候建在 ~/work 下）", small=True))
+    proj_sel = _select("项目", proj_opts, proj_init, "proj", nonce)
+    elements: list = [_row((tool_sel, 2), (proj_sel, 3))]
     default_text = f"缺省（{default_model}）" if default_model else "缺省"
     model_opts = [(default_text, DEFAULT_OPT)] + [(clip_cells(m, PROJECT_CELLS), f"m{i}")
                                                   for i, m in enumerate(draft.models)]
@@ -241,24 +266,28 @@ def build_card(draft: Draft, tools: tuple, *, default_model: str, efforts: tuple
         elements.append(_row((model_sel, 1)))
     if warn:
         elements.append(_md(f"⚠️ {escape(warn)}"))
-    elements.append(_row((_input(TEXT_INPUT, "第一句话，回车就开", "send", nonce), 3),
-                         (_button("▶ 开始", "go", nonce, primary=True), 1)))
-    elements.append(_md("打了字按回车开；不打字直接点「开始」，第一句用「hi」。开好会自动建群，"
-                        "权限和终端一样。", small=True))
-    if draft.proj is None and draft.projects:
-        elements.append(_row((_button("📂 选已有项目", "back", nonce), 1), (_button("✖️ 不建了", "cancel", nonce), 1)))
-    else:
-        elements.append(_row((_button("✖️ 不建了", "cancel", nonce), 1)))
+    picked = "" if draft.proj is None else draft.projects[draft.proj][1]
+    form = {"tag": "form", "name": FORM_NAME, "elements": [
+        _input(NAME_INPUT, "项目名（填新名字就在 ~/work 下新建）", picked, MAX_PROJECT_PATH, "项目"),
+        _input(SESSION_INPUT, "会话名（建群用，不填用项目名）", recommend_session_name(picked),
+               MAX_SESSION_NAME, "会话名"),
+        _row((_input(TEXT_INPUT, "第一句话（不填就发 hi）"), 3), (_submit("▶ 开始", "go", nonce), 1)),
+    ]}
+    elements.append(form)
+    elements.append(_md("选项目会自动填进「项目」框；填一个新名字就新建目录。填好点「开始」，"
+                        "开好会自动建群，权限和终端一样。", small=True))
+    elements.append(_row((_button("✖️ 不建了", "cancel", nonce), 1)))
     return _card("➕ 新建会话", "turquoise", elements)
 
 
 def build_starting_card(tool: str, project: str, model_text: str, prompt: str,
-                        escape: Callable[[str], str] = lambda s: s) -> dict:
-    """回车 / 开始之后原地换成这张：没有输入框（防止再回车又开一个）。"""
+                        escape: Callable[[str], str] = lambda s: s, session_name: str = "") -> dict:
+    """点「开始」之后原地换成这张：没有输入框（防止再点又开一个）。"""
     from .model import short_title
 
     lines = [f"正在新开 **{TOOL_NAMES.get(tool, tool)}** 会话……",
-             f"项目：{escape(project)}", f"模型：{escape(model_text)}",
+             f"项目：{escape(project)}"] + ([f"会话名：{escape(session_name)}"] if session_name else []) + [
+             f"模型：{escape(model_text)}",
              "第一句：" + escape(short_title(prompt, 60))]
     return _card("⏳ 正在开新会话", "wathet", [_md("\n".join(lines)),
                                              _md("开好会建一个群，回复发到群里；这里留一个「进群」按钮。", small=True)])
