@@ -35,7 +35,7 @@ MAX_DIRS = 8
 # 新会话那一句在飞时 `_fleet_inflight` 里的占位 id（真 id 要等它回来才知道）
 INFLIGHT_ID = "(new)"
 
-COMMANDS = frozenset({"/newsession", "/ns", "/新建会话"})
+COMMANDS = frozenset({"/newsession", "/ns"})
 WORDS = frozenset({"新建会话", "新会话", "开新会话"})
 
 START_TOOLS = ("claude", "codex", "opencode")

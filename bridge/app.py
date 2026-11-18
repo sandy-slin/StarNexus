@@ -161,7 +161,7 @@ from .menu import HELP  # noqa: E402
 
 # 会话总控（bridge/fleet）。不带斜杠的说法只认**整条消息就是这个词**，
 # 免得「会话为什么断了」这种正常问题被当成命令吃掉。
-FLEET_COMMANDS = frozenset({"/sessions", "/session", "/会话", "/总控"})
+FLEET_COMMANDS = frozenset({"/sessions"})
 FLEET_WORDS = frozenset({"会话", "总控"})
 CANCEL_COMMANDS = frozenset({"/cancel"})
 # 🔴 2026-11-06 第 9 轮复审 #3：原来只认精确的「取消」两个字 ⇒ 手机输入法自动补的「取消。」、
@@ -173,7 +173,7 @@ CANCEL_WORDS = frozenset({"取消", "退出", "退出对话", "算了", "停止�
 _CANCEL_WORD_ALWAYS = "取消"
 # 诊断卡：同事"坏了"的时候，能转给你和 IT 的那张脱敏卡（bridge/status.py 文件头）。
 # 不带斜杠的「诊断」也要认 —— 同事在手机上打的就是这两个字。
-DIAG_COMMANDS = frozenset({"/诊断", "/diag", "/diagnose"})
+DIAG_COMMANDS = frozenset({"/诊断"})
 DIAG_WORDS = frozenset({"诊断"})
 # 「更新」=「现在就去看有没有新版，有就装」（第 14 轮）。他不用等那 10 分钟一次的检查。
 UPDATE_WORDS = frozenset({"更新", "升级", "更新一下", "检查更新"})
@@ -1840,6 +1840,10 @@ class Bridge:
             return P2CardActionTriggerResponse(
                 {"toast": {"type": "error", "content": _CARD_TOASTS[ApprovalStore.FORBIDDEN]}}
             )
+        if isinstance(value, dict) and value.get("pm") == "?":
+            # 1.4.1 全局权限下拉：选中的档在回调的 option 里，换进来再走原来那条白名单
+            option = getattr(getattr(event, "action", None), "option", None)
+            value = dict(value, pm=option if isinstance(option, str) else "")
         text = resolve_click(value)
         # 记是哪个按钮（只记预设的 cmd / 问句键，不记正文）：第 28 轮想按真实点击给菜单卡排序时，
         # 日志里 33 次点击一次都看不出点的是哪个
@@ -1952,9 +1956,93 @@ class Bridge:
             if not prefs.last_save_ok:
                 said += "\n⚠️ 这次没存下来，重启后会回到配置里那一档。"
             logger.info("菜单卡 全局权限 要=%s 实际=%s", picked, applied)
-            card = build_menu_card("", self.policy, self._default_model_texts())
+            card = self._menu_card_json("")
             return f"全局权限：{label}", card, said
         return None
+
+    def _menu_card_json(self, where: str = "", scope: str = "") -> str:
+        from .menu import build_menu_card
+
+        return build_menu_card(where, self.policy, self._default_model_texts(), self._menu_model_pick(scope))
+
+    def _menu_model_pick(self, scope: str = "", tool: str = "") -> "dict | None":
+        """/m 卡「默认模型」那两行要的东西：工具（默认上次在 /m 选的，没有就上次开新会话用的）、模型、强度。"""
+        from .fleet.catalog import TOOLS
+
+        mp = getattr(self, "model_prefs", None)
+        if mp is None:
+            return None
+        picks = self.__dict__.setdefault("_mm_tool", {})
+        tool = tool or picks.get(scope) or picks.get("*") or ""
+        if tool not in TOOLS:
+            try:
+                tool = self._ns_last_tool(scope)
+            except Exception:  # noqa: BLE001
+                tool = ""
+        if tool not in TOOLS:
+            tool = TOOLS[0]
+        try:
+            choice = mp.default(tool)
+            models = list(mp.catalog.names(tool))
+            efforts = list(mp.catalog.efforts(tool, choice.model))
+        except Exception:  # noqa: BLE001
+            logger.exception("/m 卡默认模型读不出来")
+            return None
+        return {"tool": tool, "tools": list(TOOLS), "models": models[:30], "model": choice.model,
+                "efforts": efforts, "effort": choice.effort}
+
+    def _on_mm_click(self, event, clicker: str, value: dict):
+        """/m 卡上的默认模型下拉：选工具 ⇒ 换成那个工具的模型 / 强度；选模型 / 强度 ⇒ 当场设成默认。卡片原地刷新。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.catalog import LABELS
+        from .menu import resolve_mm_click
+
+        def reply(kind: str, text: str, card: str = ""):
+            body = {"toast": {"type": kind, "content": text}}
+            if card:
+                body["card"] = {"type": "raw", "data": json.loads(card)}
+            return P2CardActionTriggerResponse(body)
+
+        if clicker not in self.settings.owner_open_ids:
+            return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
+        click = resolve_mm_click(value, getattr(getattr(event, "action", None), "option", None))
+        mp = getattr(self, "model_prefs", None)
+        if click is None or mp is None:
+            return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
+        chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""
+        scope = f"dm:{clicker}"
+        tool, pick = click["tool"], click["pick"]
+        picks = self.__dict__.setdefault("_mm_tool", {})
+        picks[scope] = picks["*"] = tool
+        logger.info("菜单卡 默认模型 op=%s tool=%s", click["op"], tool)
+        if click["op"] == "tool":
+            return reply("info", f"选 {LABELS.get(tool, tool)} 的默认模型", self._menu_card_json("", scope))
+        if click["op"] == "model":
+            if pick == "d":
+                name = ""
+            else:
+                names = mp.catalog.names(tool)
+                idx = int(pick[1:])
+                if idx >= len(names):
+                    return reply("error", "模型列表变了，重新选一次", self._menu_card_json("", scope))
+                name = names[idx]
+            ok = mp.set_default(tool, model=name)
+            if ok and name and tool == "claude" and getattr(self, "prefs", None) is not None:
+                from .policy import known_model
+
+                if known_model(name):
+                    self.prefs.set_model(name)
+        else:
+            ok = mp.set_default(tool, effort="" if pick == "d" else pick)
+        if not ok:
+            return reply("error", "这一项现在不能选，刷新后再试", self._menu_card_json("", scope))
+        now = mp.default(tool)
+        if chat_id:
+            self._say_later(chat_id, f"🧠 {LABELS.get(tool, tool)} 默认：**{now.text()}**。以后新建的会话用它。")
+        return reply("success", f"{LABELS.get(tool, tool)} 默认：{now.text()}", self._menu_card_json("", scope))
 
     def _default_model_texts(self) -> list:
         """/m 卡「默认模型」那一行：[(工具名, 现在的默认模型)]。没设过 ⇒ 写工具自己配置的那个。"""
@@ -1999,7 +2087,7 @@ class Bridge:
             if where.startswith(home):
                 where = "~" + where[len(home):]
         sender = getattr(self.replier, "send_card", None)
-        if sender is None or not sender(chat_id, build_menu_card(where, self.policy, self._default_model_texts())):
+        if sender is None or not sender(chat_id, self._menu_card_json(where, scope)):
             # 卡片发不出去就退化成文字帮助 —— 别让用户叫菜单却什么都没收到
             self._say(chat_id, HELP)
 
@@ -2128,6 +2216,8 @@ class Bridge:
                 return self._on_model_click(event, clicker, value)
             if value.get("act") == "sp":
                 return self._on_session_perm_click(event, clicker, value)
+            if value.get("act") == "mm":
+                return self._on_mm_click(event, clicker, value)
             if value.get("act") == "sc":
                 return self._on_status_card_click(event, clicker, value)
             if value.get("act") == "ch":
@@ -2559,10 +2649,10 @@ class Bridge:
                     gate.clear(scope)
             self._say(chat_id, changed.reply)
             return True
-        if command in {"/history", "/历史", "/最近"}:
+        if command == "/history":
             self._send_history_card(scope, chat_id)
             return True
-        if command in {"/help", "/h"}:
+        if command == "/help":
             self._say_with_buttons(chat_id, HELP, self._help_buttons())
             return True
         if command in {"/mode", "/权限", "/p"}:
@@ -2577,7 +2667,7 @@ class Bridge:
             # 和点了确认按钮等价，所以不必再拦一次。
             self._handle_mode(chat_id, text, confirmed=True)
             return True
-        if command in {"/model", "/模型"}:
+        if command == "/model":
             self._handle_model(chat_id, text)
             return True
         if command == "/status":
@@ -2646,7 +2736,7 @@ class Bridge:
                 or "读不出状态。过一分钟再发一次「诊断」。",
             )
             return True
-        if command in {"/update", "/upgrade"} or stripped in UPDATE_WORDS:
+        if command == "/update" or stripped in UPDATE_WORDS:
             # 第 14 轮：他不用等那 10 分钟一次的检查。阻塞的活（查网、下包、跑安装包）丢线程里，
             # 这里先回一句 —— 不然他看着没反应，而安装包最长要跑几分钟。
             self._say(chat_id, "好，去看看有没有新版…")
@@ -2665,15 +2755,15 @@ class Bridge:
             self._say(chat_id, "好，新话题。前面聊的不带了。")
             self._send_menu(chat_id, scope)
             return True
-        if command in {"/find", "/搜会话", "/找会话"} or text.startswith(("找会话 ", "搜会话 ")):
+        if command == "/find" or text.startswith(("找会话 ", "搜会话 ")):
             query = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
             await self._fleet_search(scope, chat_id, query)
             return True
-        if command in {"/fork", "/复制会话", "/archive", "/归档", "/rename", "/重命名"} \
+        if command in {"/fork", "/archive", "/rename"} \
                 or text.strip() in ("复制会话", "归档会话"):
             await self._session_manage(scope, chat_id, command, text)
             return True
-        if command in {"/stop", "/s"}:
+        if command == "/stop":
             event = self._cancels.get(scope)
             # 🔴 「停」要停全部 —— 包括**停在等审批**的那一步。
             # 原来只置位取消事件，待批准的卡片还留着：用户说了停，
@@ -3208,12 +3298,12 @@ class Bridge:
         from .fleet.model import can as _can
 
         if bound is None or not _can(bound.tool, "start"):
-            self._say(chat_id, "这个命令要在会话群里用：复制会话 /fork、归档 /archive、重命名 /rename 新名字。")
+            self._say(chat_id, "这个要在会话群里用：在会话群里发 /m，状态卡上就有。")
             return
         word = text.strip()
-        if command in ("/fork", "/复制会话") or word == "复制会话":
+        if command == "/fork" or word == "复制会话":
             await self._session_fork(scope, chat_id, bound)
-        elif command in ("/archive", "/归档") or word == "归档会话":
+        elif command == "/archive" or word == "归档会话":
             await self._session_archive(chat_id, bound)
         else:
             name = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
@@ -6407,14 +6497,14 @@ class Bridge:
             if value.get("src") == "sc" and chat_id:
                 # 状态卡是置顶的那条：在原地换成模型卡，选完模型状态卡一刷新就把模型卡盖掉
                 # ⇒ 推理强度没法接着选。模型卡另发一条，状态卡留在原位。
-                self._in_background(self._send_card_or_text, chat_id, card, "🧠 发「/model」查看和切换模型")
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /m 再试一次")
                 return reply("info", "模型卡已发到群里")
             return reply("info", "模型总览", card)
         if op == "open":
             card = list_card(mp, to, tool, sid, label)
             if value.get("src") == "m" and chat_id:
                 # 1.4.0 /m 卡上点的：/m 卡留在原位，选模型那张另发一条（下拉选完就生效）
-                self._in_background(self._send_card_or_text, chat_id, card, "🧠 发「/model」查看和切换模型")
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /m 再试一次")
                 return reply("info", f"选 {LABELS.get(tool, tool)} 的默认模型")
             return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", card)
         if op == "m":
@@ -6729,7 +6819,7 @@ class Bridge:
 
         if clicker not in self.settings.owner_open_ids:
             return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
-        target = sessperm.resolve_click(value)
+        target = sessperm.resolve_click(value, getattr(getattr(event, "action", None), "option", None))
         if target is None:
             return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
         chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""

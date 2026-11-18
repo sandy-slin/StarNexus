@@ -450,7 +450,10 @@ def case_session_perm(dm: str) -> tuple:
     if not send(chat, "/权限 只读") or not wait_bot(chat, "改成「只读」", timeout=60):
         return False, "群里切只读没回执"
     send(chat, "在当前目录创建 b.txt 内容 B。如果做不到就只回复 LR-PERM-RO，做到了只回复 LR-PERM-B")
-    if not wait_bot(chat, "LR-PERM-", timeout=240):
+    end = time.time() + 240
+    while time.time() < end and not any(("LR-PERM-RO" in t or "LR-PERM-B" in t) for t in bot_texts(chat, 10)):
+        time.sleep(3)
+    if not any(("LR-PERM-RO" in t or "LR-PERM-B" in t) for t in bot_texts(chat, 10)):
         return False, "只读那一轮没回"
     time.sleep(3)
     if os.path.exists(os.path.join(path, "b.txt")):
@@ -474,7 +477,7 @@ def case_menu_m(dm: str) -> tuple:
     while time.time() < end and not ok_dm:
         for m in messages(dm, 6):
             body = str(m.get("content") or "")
-            if (m.get("sender") or {}).get("sender_type") == "app" and "常用功能" in body and "全局权限" in body:
+            if (m.get("sender") or {}).get("sender_type") == "app" and "常用功能" in body and "全局权限" in body and "默认模型" in body:
                 ok_dm = True
                 break
         time.sleep(3)
@@ -489,7 +492,7 @@ def case_menu_m(dm: str) -> tuple:
     end = time.time() + 60
     while time.time() < end:
         texts = bot_texts(chat, 6)
-        if any("会话状态卡" in t and "这个会话的权限" in t for t in texts) and any("已挪到最下面" in t for t in bot_texts(chat, 40)):
+        if any("会话状态卡" in t and "权限" in t for t in texts) and any("已挪到最下面" in t for t in bot_texts(chat, 40)):
             return True, group_name(chat)
         time.sleep(3)
     return False, "会话群 60 秒内没看到挪到最下面的状态卡"

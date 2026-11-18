@@ -101,7 +101,7 @@ _PINNED_CONTROLS = ("/sessions", "/newsession")
 # 1.4.0：/m 卡上「更多」里的顺序（权限、模型在卡上有自己的一排，不再放按钮）
 _MORE_CONTROLS = ("/dirs", "/history", "/status", "/诊断", "/update", "/help", "/new", "/stop")
 # 卡底那行快捷命令（熟手照着打；新手只记 /m）
-SHORTCUTS = "`/ns` 新建会话 · `/p r|w|f` 权限 · `/stop` 停下 · `/sessions` 会话总览"
+SHORTCUTS = "`/ns` 新建会话 · `/p r|w|f` 权限 · `/stop` 停下"
 ASK_M = "不知道怎么做就发 /m"
 _PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
 
@@ -151,7 +151,7 @@ HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话
 
 电脑睡着时收不到消息，醒了也不会补发 —— 发了没回先看看电脑是不是睡了。
 
-快捷命令（熟了再用）：/ns 新建会话 · /p r|w|f 权限 · /stop 停下 · /sessions 会话总览。
+快捷命令（熟了再用）：/ns 新建会话 · /p r|w|f 权限 · /stop 停下。
 """
 
 
@@ -167,19 +167,19 @@ HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话
 # `_APP_LITERALS` 里重抄一遍，并由 `tests/test_menu.py::test_known_commands_cover_app_branches`
 # 扫 app.py 源码盯着 —— 那条测试红了就是有人加了命令没登记，而不是等用户踩到。
 _APP_LITERALS = frozenset({
-    "/help", "/h",
+    "/help",
     "/mode", "/权限", "/p", "/mode!",
-    "/model", "/模型",
+    "/model",
     "/status",
     "/new",
-    "/stop", "/s",
+    "/stop",
     "/resume",
     "/talk!",
-    "/session", "/sessions", "/会话", "/总控",
+    "/sessions",
     "/cancel",
-    "/诊断", "/diag", "/diagnose",
-    "/update", "/upgrade",   # 第 14 轮：自动更新（「更新」两个字也认，见 app.UPDATE_WORDS）
-    "/history", "/历史", "/最近",   # 「↑ 最近问过」（bridge/history.py）
+    "/诊断",
+    "/update",   # 第 14 轮：自动更新（「更新」两个字也认，见 app.UPDATE_WORDS）
+    "/history",   # 「↑ 最近问过」（bridge/history.py）
 })
 
 # 一个 token 像不像"命令"：`/` 后面跟字母或汉字，中间不能再有 `/`。
@@ -291,30 +291,51 @@ def _row(buttons: list[dict]) -> dict:
     }
 
 
-def build_menu_card(workspace_label: str = "", policy=None, defaults=None) -> str:
-    """私聊里的 /m 卡（1.4.0）：常用的都在这一张上，一步做完。
+def _select(placeholder: str, options: list, initial: str, val: dict) -> dict:
+    node = {
+        "tag": "select_static", "width": "fill",
+        "placeholder": {"tag": "plain_text", "content": placeholder},
+        "options": [{"text": {"tag": "plain_text", "content": text}, "value": v} for text, v in options],
+        "behaviors": [{"type": "callback", "value": val}],
+    }
+    if initial and any(v == initial for _, v in options):
+        node["initial_option"] = initial
+    return node
 
-    从上到下：当前状态 → 会话总览 / 新建会话 → 默认模型（每个工具一个按钮，点开是下拉）
-    → 全局权限（只读 / 可写 / 全部授权，点了直接生效、卡片原地刷新）→ 折叠的「更多」→ 快捷命令。
-    `defaults`：[(工具名, 现在的默认模型文字)]，给「默认模型」那一行显示用；None ⇒ 不显示那一行文字。
+
+def _label_row(label: str, node: dict) -> dict:
+    """「名字 ｜ 下拉」一行：左边一小格写这是什么，右边下拉占满（手机上不截断）。"""
+    return {"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+        {"tag": "column", "width": "auto", "vertical_align": "center",
+         "elements": [{"tag": "markdown", "content": f"**{label}**"}]},
+        {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": [node]},
+    ]}
+
+
+MM_ACT = "mm"          # /m 卡上的下拉（工具 / 模型 / 强度）。值里只带 op，选中项在回调的 option 里。
+MM_OPS = ("tool", "model", "effort")
+
+
+def build_menu_card(workspace_label: str = "", policy=None, defaults=None, model_pick=None) -> str:
+    """私聊里的 /m 卡（1.4.1）：常用的都在这一张上，一步做完。
+
+    设置项（有当前值的）一律下拉：全局权限、默认模型的工具 / 模型 / 强度 —— 收起时只显示当前值，手机上不截断。
+    操作（点了就执行的）仍是按钮，每行两个。
+    `defaults`：[(工具名, 现在的默认模型文字)]；`model_pick`：dict(tool, tools, models, model, efforts, effort)
+    给「默认模型」那两行用（None ⇒ 退回一行文字）。下拉值只是序号 / 档名，真名服务端按本机目录现查。
     """
-    from .fleet.catalog import LABELS as TOOL_LABELS, TOOLS
-    from .fleet.sessperm import LABELS as PERM_LABELS
+    from .fleet.catalog import EFFORT_LABELS, LABELS as TOOL_LABELS
+    from .fleet.sessperm import EXPLAIN, LABELS as PERM_LABELS
 
     elements: list[dict] = []
 
     def rows(buttons: list[dict], per: int = 2) -> list[dict]:
         return [_row(buttons[i : i + per]) for i in range(0, len(buttons), per)]
 
-    status_bits = []
     if workspace_label:
         from .reply import inline_code
 
-        status_bits.append(f"📁 {inline_code(workspace_label)}")
-    if policy is not None:
-        status_bits.append(f"🔑 全局{PERM_LABELS.get(policy.mode, policy.mode)}")
-    if status_bits:
-        elements.append({"tag": "markdown", "content": "　".join(status_bits)})
+        elements.append({"tag": "markdown", "content": f"📁 {inline_code(workspace_label)}"})
 
     labels = dict(CONTROLS)
     elements.extend(rows([
@@ -322,26 +343,35 @@ def build_menu_card(workspace_label: str = "", policy=None, defaults=None) -> st
         _button(labels["/newsession"], {"act": "menu", "cmd": "/newsession"}),
     ]))
 
-    model_line = "**默认模型**"
-    if defaults:
-        model_line += "　" + " · ".join(f"{name} {text}" for name, text in defaults)
-    elements.append({"tag": "markdown", "content": model_line})
-    elements.extend(rows([
-        _button(TOOL_LABELS[t], {"act": "mdl", "op": "open", "to": "d", "tool": t, "src": "m"})
-        for t in TOOLS
-    ], per=3))
+    if model_pick:
+        tool = model_pick["tool"]
+        tool_opts = [(TOOL_LABELS.get(t, t), t) for t in model_pick["tools"]]
+        elements.append(_label_row("默认模型", _select("工具", tool_opts, tool, {"act": MM_ACT, "op": "tool"})))
+        models = list(model_pick.get("models") or [])
+        model_opts = [("缺省（工具自己的配置）", "d")] + [(m, f"m{i}") for i, m in enumerate(models)]
+        current = model_pick.get("model") or ""
+        model_init = f"m{models.index(current)}" if current in models else "d"
+        cells = [(_select("模型", model_opts, model_init, {"act": MM_ACT, "op": "model", "tool": tool}), 3)]
+        efforts = list(model_pick.get("efforts") or [])
+        if efforts:
+            effort_opts = [("缺省", "d")] + [(f"{EFFORT_LABELS.get(e, e)}（{e}）", e) for e in efforts]
+            cells.append((_select("强度", effort_opts, model_pick.get("effort") or "d",
+                                  {"act": MM_ACT, "op": "effort", "tool": tool}), 2))
+        elements.append({"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+            {"tag": "column", "width": "weighted", "weight": w, "vertical_align": "center", "elements": [node]}
+            for node, w in cells]})
+    elif defaults:
+        elements.append({"tag": "markdown",
+                         "content": "**默认模型**　" + " · ".join(f"{name} {text}" for name, text in defaults)})
 
     if policy is not None:
         from .policy import modes_up_to
 
-        elements.append({"tag": "markdown",
-                         "content": "**全局权限**（私聊和没单独设过的会话都用它）"})
-        perm_buttons = []
-        for mode in modes_up_to(getattr(policy, "ceiling_mode", policy.mode)):
-            on = mode == policy.mode
-            perm_buttons.append(_button(("✅ " if on else "") + PERM_LABELS.get(mode, mode),
-                                        {"act": "menu", "pm": mode}, primary=on))
-        elements.extend(rows(perm_buttons, per=3))
+        available = list(modes_up_to(getattr(policy, "ceiling_mode", policy.mode))) or [policy.mode]
+        perm_opts = [(f"{PERM_LABELS.get(m, m)}：{EXPLAIN.get(m, '')}", m) for m in available]
+        elements.append(_label_row("全局权限", _select("全局权限", perm_opts, policy.mode, {"act": "menu", "pm": "?"})))
+        elements.append({"tag": "markdown", "text_size": "notation",
+                         "content": "私聊和没单独设过的会话群都用它；会话群里单独的权限在那个群的状态卡上改。"})
 
     more_controls = [_button(labels[cmd], {"act": "menu", "cmd": cmd}) for cmd in _MORE_CONTROLS]
     more_questions = [_button(label, {"act": "menu", "say": say}) for say, label in QUICK_QUESTIONS]
@@ -375,6 +405,31 @@ def build_menu_card(workspace_label: str = "", policy=None, defaults=None) -> st
         },
         ensure_ascii=False,
     )
+
+
+def resolve_mm_click(raw, option=None):
+    """/m 卡下拉回调 → {"op", "tool", "pick"}；形状不对 ⇒ None。`pick`：工具名 / "d" / "m序号" / 档名。"""
+    from .fleet.catalog import TOOLS
+
+    if not isinstance(raw, dict) or raw.get("act") != MM_ACT:
+        return None
+    op = raw.get("op")
+    if op not in MM_OPS:
+        return None
+    keys = {"act", "op"} if op == "tool" else {"act", "op", "tool"}
+    if set(raw) != keys:
+        return None
+    pick = option if isinstance(option, str) else ""
+    if op == "tool":
+        return {"op": op, "tool": pick, "pick": pick} if pick in TOOLS else None
+    tool = raw.get("tool")
+    if tool not in TOOLS:
+        return None
+    if op == "model" and not (pick == "d" or (pick.startswith("m") and pick[1:].isdigit() and len(pick) <= 3)):
+        return None
+    if op == "effort" and not (pick == "d" or (pick.isalpha() and len(pick) <= 10)):
+        return None
+    return {"op": op, "tool": tool, "pick": pick}
 
 
 def build_confirm_loosen_card(target: str, policy) -> str:
@@ -592,6 +647,7 @@ def resolve_click(value: dict) -> str:
     # 1.4.0 /m 卡上的全局权限按钮：一步生效（产品定义：手机和终端同权；仍被本机上限压住）
     picked = value.get("pm")
     if isinstance(picked, str):
+        # 1.4.1 起是下拉：值里固定 "?"，选中项由回调的 option 填进来（app._on_menu_click 先换好）
         return f"/mode! {picked}" if picked in MODE_RANK else ""
     confirmed = value.get("mode2")
     if isinstance(confirmed, str):

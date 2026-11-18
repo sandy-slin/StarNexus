@@ -134,15 +134,39 @@ def value(mode: str) -> dict:
     return {"act": ACT, "m": mode}
 
 
-def resolve_click(raw: Any) -> Optional[str]:
-    """回调 → 档位；形状不对 ⇒ None。只认 {"act": "sp", "m": 三档之一}，可带 "src": "sc"（来自状态卡）。"""
+def resolve_click(raw: Any, option: Any = None) -> Optional[str]:
+    """回调 → 档位；形状不对 ⇒ None。
+
+    认三种：按钮 {"act": "sp", "m": 档}；放在状态卡上的按钮再带 "src": "sc"；
+    1.4.1 状态卡上的下拉 {"act": "sp", "m": "?", "src": "sc"}，选中的档在 `option`。
+    """
     if not isinstance(raw, dict) or raw.get("act") != ACT:
         return None
     keys = set(raw)
     if keys != {"act", "m"} and not (keys == {"act", "m", "src"} and raw.get("src") == "sc"):
         return None
     mode = raw.get("m")
+    if mode == "?":
+        mode = option if isinstance(option, str) else ""
     return mode if mode in MODES else None
+
+
+def select(current: str, modes: tuple = MODES, src: str = "sc") -> dict:
+    """状态卡上的权限下拉：收起时只显示当前档，选完就生效。"""
+    opts = [m for m in MODES if m in modes] or [current]
+    val = {"act": ACT, "m": "?"}
+    if src:
+        val["src"] = src
+    node = {
+        "tag": "select_static", "width": "fill",
+        "placeholder": {"tag": "plain_text", "content": "这个会话的权限"},
+        "options": [{"text": {"tag": "plain_text", "content": f"{LABELS[m]}：{EXPLAIN[m]}"}, "value": m}
+                    for m in opts],
+        "behaviors": [{"type": "callback", "value": val}],
+    }
+    if current in opts:
+        node["initial_option"] = current
+    return node
 
 
 def buttons(current: str, modes: tuple = MODES, src: str = "") -> list:

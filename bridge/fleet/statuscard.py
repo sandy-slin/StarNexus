@@ -116,9 +116,10 @@ def build_card(info: CardInfo) -> str:
         f"**工具**：{tool}",
         f"**模型**：{info.model or '工具默认'}",
         f"**项目**：{info.project or '未知'}",
-        f"**权限**：{info.mode or '未知'}",
         f"**状态**：{state}",
     ]
+    if not (info.perm and info.perm_modes):
+        lines.insert(3, f"**权限**：{info.mode or '未知'}")   # 没有下拉时（取不到档位）仍用文字说
     turn = TURN_TEXT.get(info.last_turn, "")
     if turn:
         lines.append(f"**最近一轮**：{turn}" + (f"（{_clock(info.last_turn_at)}）" if info.last_turn_at else ""))
@@ -137,12 +138,13 @@ def build_card(info: CardInfo) -> str:
     ]
     perm_rows = []
     if info.perm and info.perm_modes:
-        from .sessperm import buttons as perm_buttons
+        from .sessperm import select as perm_select
 
-        perm_rows = [{"tag": "markdown", "content": "**这个会话的权限**（点了下一轮生效）", "text_size": "notation"},
-                     {"tag": "column_set", "horizontal_spacing": "8px", "columns": [
-                         {"tag": "column", "width": "weighted", "weight": 1, "elements": [b]}
-                         for b in perm_buttons(info.perm, info.perm_modes, src="sc")]}]
+        perm_rows = [{"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+            {"tag": "column", "width": "auto", "vertical_align": "center",
+             "elements": [{"tag": "markdown", "content": "**权限**"}]},
+            {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+             "elements": [perm_select(info.perm, info.perm_modes)]}]}]
     title = f"{tool}「{info.title or info.sid[:8]}」"
     card = {
         "schema": "2.0",
