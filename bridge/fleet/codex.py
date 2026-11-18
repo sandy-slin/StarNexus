@@ -150,6 +150,8 @@ WHY_NOT_STOP_APP = "它开在 Codex App 里，只能在 App 里停。"
 WHY_NOT_STOP_TERMINAL = "它开在终端里，只能在终端里停；从外面停会直接关掉整个会话。"
 WHY_NOT_STOP_IDLE = "它现在没有在跑从手机上发的任务，没有可停的。"
 STOPPED_BY_OWNER = "这一轮已按你的要求停下。会话还在，直接说下一句就能接着聊。"
+STEER_OK = "↪️ 已插进正在跑的这一轮，它做完手上这一步就会看到。"
+WHY_STEER_NOT_RUNNING = "这一轮已经结束或不是从飞书起的，插不进去。"
 
 # relay 的拒绝话术（每条都要有「能做到的替代」）
 WHY_RELAY_BAD_ID = "会话编号不对，发不了。"
@@ -341,6 +343,9 @@ class CodexAdapter(Adapter):
         # rollout 里没有失败事件（见 `_turn_end`），这是唯一读得到的失败信号 ⇒ 只记在内存；
         # 那之后 rollout 里又开了新的一轮（task_started 更晚）就作废。
         self._failed_at: dict = {}
+        # 1.9.0：桥自己起的、正在跑的那一轮（线程 id → codex_appserver.LiveTurn），插话 / 停下用
+        self._live: dict = {}
+        self._live_guard = threading.Lock()
 
     # ---------- 路径 ----------
 
@@ -874,6 +879,9 @@ class CodexAdapter(Adapter):
             return ActionResult(False, "这个会话的项目文件夹不在了，没法接着聊。", tid)
 
         codex = self._codex()
+        if callable(getattr(self.runner, "popen", None)):
+            return self._send_appserver(tid, text, timeout, mode, spawned if spawned is not None else [],
+                                        model=model, effort=effort, approval_dir=approval_dir, cwd=cwd)
         argv = [codex, "exec", "resume", "--json", "--skip-git-repo-check"]
         env = self._env(codex)
         if mode is not None:
@@ -939,6 +947,88 @@ class CodexAdapter(Adapter):
         if not reply:
             return ActionResult(True, "Codex 跑完了，但没有文字回复。", tid)
         return ActionResult(True, reply, tid)
+
+    # ---------- 1.9.0：接着聊走 app-server，一轮在跑时能插话 ----------
+
+    def _appserver_args(self, mode: Optional[str], approval_dir: str, env: dict) -> tuple:
+        """(app-server 参数, sandbox, 要不要 bypass_hook_trust)。档位映射和 `_sandbox_args` 同一张表。"""
+        if mode is None:
+            return [], "", False
+        sandbox = SANDBOX_BY_MODE.get(mode or "readonly", SANDBOX_BY_MODE["readonly"])
+        extra: list = []
+        bypass = False
+        if sandbox == "danger-full-access":
+            guard = self._guard() if approval_dir else ""
+            if guard:
+                # 实测：app-server 只认 `-c hooks.PreToolUse=…` + thread 的 config.bypass_hook_trust
+                extra = guard_args(guard)[1:]
+                env["CARHER_APPROVAL_DIR"] = approval_dir
+                env["CARHER_HOOK_FLAVOR"] = "codex"
+                bypass = True
+            else:
+                sandbox = SANDBOX_FALLBACK_TRUSTED
+        return extra, sandbox, bypass
+
+    def _send_appserver(self, tid: str, text: str, timeout: float, mode: Optional[str], spawned: list,
+                        model: str = "", effort: str = "", approval_dir: str = "", cwd: str = "") -> ActionResult:
+        from . import codex_appserver as cas
+
+        if model and not safe_model_name(model):
+            return ActionResult(False, f"模型名不对：{short_title(str(model), 40)}", tid)
+        if effort and not (isinstance(effort, str) and _EFFORT_NAME_RE.match(effort)):
+            return ActionResult(False, f"推理强度不对：{short_title(str(effort), 20)}", tid)
+        codex = self._codex()
+        env = self._env(codex)
+        extra, sandbox, bypass = self._appserver_args(mode, approval_dir, env)
+        try:
+            proc = self.runner.popen([codex, "app-server"] + extra, cwd=cwd, env=env)
+        except (OSError, ValueError) as exc:
+            return ActionResult(False, friendly_error(exc, "没能启动 Codex"), tid)
+        spawned.append(proc.pid)
+        self.jobs.register_spawned(proc.pid, self.tool, tid)
+
+        def on_live(live) -> None:
+            with self._live_guard:
+                self._live[tid] = live
+
+        try:
+            out = cas.run_turn(proc, tid, text, cwd=cwd, sandbox=sandbox, bypass_hook_trust=bypass,
+                               model=model, effort=effort, timeout=timeout, on_live=on_live)
+        finally:
+            with self._live_guard:
+                self._live.pop(tid, None)
+            cas.reap(proc)
+            self.jobs.forget(proc.pid)
+        if out.failure and not out.reply and "active writer" not in out.failure and not out.interrupted:
+            self._note_turn_failed(tid)
+        if self.jobs.take_stopped(self.tool, tid):
+            return ActionResult(False, STOPPED_BY_OWNER, tid, delivered=True)
+        if out.timed_out:
+            return ActionResult(False, "Codex 太久没回完，已经让它停下了。", tid, delivered=True)
+        if "active writer" in out.failure:
+            return ActionResult(False, "它刚刚被 Codex App 或终端打开了，现在发不进去。", tid)
+        if out.interrupted:
+            return ActionResult(False, "已经停下了。", tid, delivered=True)
+        if out.failure and not out.reply:
+            return ActionResult(False, "Codex 没回成功：" + short_title(out.failure, 120), tid, delivered=True)
+        return ActionResult(True, out.reply or "Codex 跑完了，但没有文字回复。", tid, delivered=True)
+
+    def steerable(self, id: str) -> bool:
+        live = self._live.get(str(id or "").lower())
+        return live is not None and live.open()
+
+    def steer(self, id: str, text: str) -> ActionResult:
+        """把一句话插进**桥自己起的、正在跑的**那一轮（`turn/steer`，同一个 turnId）。插不进 ⇒ ok=False。"""
+        tid = str(id or "").lower()
+        text = str(text or "").strip()
+        if not text:
+            return ActionResult(False, "要发的内容是空的。", tid)
+        with self._live_guard:
+            live = self._live.get(tid)
+        if live is None or not live.steer(text):
+            return ActionResult(False, WHY_STEER_NOT_RUNNING, tid)
+        logger.info("中途插话 写入 Codex 会话=%s 字数=%d 第%d条", tid[:8], len(text), live.steered)
+        return ActionResult(True, STEER_OK, tid, delivered=True)
 
     # ---------- start：手机上新建会话 ----------
 
@@ -1252,6 +1342,11 @@ class CodexAdapter(Adapter):
         if not is_thread_id(id):
             return ActionResult(False, "会话编号不对。", str(id or ""))
         tid = id.lower()
+        with self._live_guard:
+            live = self._live.get(tid)
+        if live is not None and live.interrupt():
+            self.jobs.mark_stopped(self.tool, tid)
+            return ActionResult(True, "已经让它停下了。这一轮不再继续，会话还在，可以接着说。", tid)
         if self.jobs.jobs(tool=self.tool, session_id=tid):
             return self.stop_own(tid)
         try:
