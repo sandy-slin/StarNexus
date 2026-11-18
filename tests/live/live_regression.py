@@ -247,6 +247,37 @@ def case_stop(dm: str) -> tuple:
     return True, "停下后会话保留并继续回复"
 
 
+def case_steer_claude(dm: str) -> tuple:
+    """FC-38（1.7.0）：Claude 会话一轮在跑时群里再说一句 ⇒ 插进这一轮、同一轮改做新指令，不再回「上一条还在发」。"""
+    name = "lr-steer-" + time.strftime("%H%M%S")
+    chat, why = _new_session(dm, "claude", name, "回归测试，只回复 LR-START")
+    if not chat or not wait_bot(chat, "LR-START", timeout=240):
+        return False, why or "首句没回"
+    send(chat, "用 Bash 工具依次执行 10 次 `sleep 4 && date >> steer.txt`，每次单独调用一次工具，全部做完后回复 LR-ORIG")
+    time.sleep(25)
+    send(chat, "改主意了：立即停止剩下的 sleep，不要再调用任何工具，只回复 LR-STEER")
+    if not wait_bot(chat, "已插进正在跑的这一轮", timeout=30):
+        return False, "没看到「已插进正在跑的这一轮」回执"
+    if not wait_bot(chat, "LR-STEER", timeout=180):
+        return False, "插话后没回 LR-STEER"
+    texts = bot_texts(chat, 30)
+    if any("LR-ORIG" in t for t in texts):
+        return False, "原任务照样做完了，插话没生效"
+    if any("上一条还在发" in t for t in texts):
+        return False, "仍回了「上一条还在发」"
+    if any(t.find("提示：") >= 0 and "照常发过去" in t for t in texts):
+        return False, "仍冒出无需处理的「提示」"
+    lines = 0
+    try:
+        with open(os.path.join(WORK, name, "steer.txt"), encoding="utf-8") as fh:
+            lines = sum(1 for _ in fh)
+    except OSError:
+        pass
+    if lines >= 10:
+        return False, f"10 次都跑完了（{lines}）"
+    return True, f"插进同一轮，跑了 {lines} 次后改做新指令"
+
+
 def case_choices(dm: str) -> tuple:
     """FC-07：回复结尾是编号选项 ⇒ 群里出现「👉 选项」按钮。点按钮要 Computer Use 复核。"""
     name = "lr-choice-" + time.strftime("%H%M%S")
@@ -507,6 +538,7 @@ CASES = {
     "long_reply": case_long_reply,
     "image": case_image,
     "stop": case_stop,
+    "steer_claude": case_steer_claude,
     "choices": case_choices,
     "codex_trusted": case_codex_trusted,
     "term_stop": case_term_stop,

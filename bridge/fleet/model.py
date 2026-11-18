@@ -35,7 +35,8 @@ TOOLS = ("claude", "codex", "cursor", "opencode")
 # 每个工具声明自己支持什么（产品定义 §5.9「能力声明」）。菜单、卡片、新建会话按这张表显示或隐藏，
 # 不再到处写 `tool in ("claude", "codex")`。新加工具：写一个 adapter + 在这里加一行。
 CAPS = {
-    "claude": frozenset({"start", "send", "stop", "fork", "model", "effort", "approval", "progress", "choices"}),
+    "claude": frozenset({"start", "send", "stop", "fork", "model", "effort", "approval", "progress", "choices",
+                         "steer"}),
     "codex": frozenset({"start", "send", "stop", "fork", "archive", "model", "effort", "approval", "progress",
                         "choices"}),
     "opencode": frozenset({"start", "send", "stop", "fork", "model", "choices"}),
@@ -322,6 +323,21 @@ class SubprocessRunner:
                 timed_out=True,
                 pid=proc.pid,
             )
+
+    def popen(self, argv: Sequence[str], *, cwd: Optional[str] = None, env: Optional[dict] = None):
+        """常驻一轮用（中途插话）：stdin / stdout / stderr 都是管道，调用方自己读、自己收。"""
+        return subprocess.Popen(
+            list(argv),
+            cwd=cwd or None,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
 
 
 # ---------- 时间 ----------

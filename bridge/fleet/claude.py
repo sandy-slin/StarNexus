@@ -137,6 +137,8 @@ WHY_RELAY_OLD_VERSION = "这个会话的 Claude 版本还不支持从别处送�
 WHY_RELAY_SUSPENDED = "它在电脑上被挂起了（按过 Ctrl-Z），送进去不会有人理。到电脑上敲 fg 让它继续。"
 
 STOPPED_BY_OWNER = "这一轮已按你的要求停下。会话还在，直接说下一句就能接着聊。"
+STEER_OK = "↪️ 已插进正在跑的这一轮，它做完手上这一步就会看到。"
+WHY_STEER_NOT_RUNNING = "这一轮已经结束或不是从飞书起的，插不进去。"
 WHY_STOP_TERMINAL = "终端里的会话只能在终端里停，从外面停会直接关掉整个会话。"
 # 和 WHY_SEND_APP 在详情卡上紧挨着出现 ⇒ 不再重复「这是 App 里的会话」，只说停的那一步
 WHY_STOP_APP = "要停它，也只能在 App 里点停止。"
@@ -458,6 +460,9 @@ class ClaudeAdapter(Adapter):
         self._send_locks: dict = {}
         self._send_locks_guard = threading.Lock()
         self._last_own_write: dict = {}  # sessionId → 我们最后一次发完的时间（别把自己的写入当成「有人在用」）
+        # sessionId → 正在跑的那一轮（stream-json 输入开着，能中途插话）。见 docs/product/steering.md
+        self._live: dict = {}
+        self._live_guard = threading.Lock()
 
     # ---------- 进程 / 注册表 ----------
 
@@ -1002,10 +1007,15 @@ class ClaudeAdapter(Adapter):
             self.jobs.register_spawned(pid, TOOL, sid)
 
         try:
-            result = self.runner.run(
-                argv, timeout=float(timeout or DEFAULT_SEND_TIMEOUT), cwd=cwd, env=env,
-                on_spawn=on_spawn,  # stdin 默认 DEVNULL
-            )
+            if callable(getattr(self.runner, "popen", None)):
+                # 1.7.0 中途插话：这一轮的 stdin 开着（stream-json），跑的过程中再说的话由 steer() 写进去
+                result = self._run_streaming(sid, argv, text, float(timeout or DEFAULT_SEND_TIMEOUT), cwd, env,
+                                             on_spawn)
+            else:
+                result = self.runner.run(
+                    argv, timeout=float(timeout or DEFAULT_SEND_TIMEOUT), cwd=cwd, env=env,
+                    on_spawn=on_spawn,  # stdin 默认 DEVNULL
+                )
         finally:
             for pid in spawned:
                 self.jobs.forget(pid)
@@ -1016,6 +1026,123 @@ class ClaudeAdapter(Adapter):
         if spawned:
             out = ActionResult(out.ok, out.text, out.session_id, delivered=True)
         return out
+
+    # ---------- steer：一轮在跑时中途插话 ----------
+
+    def steerable(self, id: str) -> bool:
+        live = getattr(self, "_live", {}).get(str(id or ""))
+        return live is not None and live.open()
+
+    def steer(self, id: str, text: str) -> ActionResult:
+        """把一句话写进**桥自己起的、正在跑的**那一轮。它在当前工具调用结束后读到，同一轮里改方向。
+
+        只认 `_live` 里登记的那一轮（`send()` 起的）；终端 / App 里开着的会话不碰。
+        写不进去（这一轮刚结束、进程退了）⇒ ok=False，调用方退回原来的处理，不丢话。
+        """
+        sid = str(id or "")
+        text = str(text or "").strip()
+        if not text:
+            return ActionResult(False, "要发的内容是空的。", sid)
+        with self._live_guard:
+            live = self._live.get(sid)
+        if live is None or not live.write(text):
+            return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+        logger.info("中途插话 写入 会话=%s 字数=%d 第%d条", sid[:8], len(text), live.written - 1)
+        return ActionResult(True, STEER_OK, sid, delivered=True)
+
+    def _run_streaming(self, sid: str, argv: list, text: str, timeout: float, cwd: str, env: dict,
+                       on_spawn: Callable[[int], None]) -> Any:
+        """`claude -p --input-format stream-json` 跑一轮，返回和 `runner.run` 同形状的结果。
+
+        - 第一句写进 stdin；跑的过程中 `steer()` 可以再写
+        - 收到 `result` 且写进去的话都被它读过（`--replay-user-messages` 回显计数）⇒ 关 stdin，读到 EOF
+        - 关 stdin 之后还有没读完的话（插话和收尾撞上）⇒ 它会再跑一轮，后面的 result 一起收
+        - 超时 ⇒ kill（和 runner.run 一样）
+        """
+        from .model import RunResult
+
+        argv = _stream_argv(argv)
+        try:
+            proc = self.runner.popen(argv, cwd=cwd, env=env)
+        except (OSError, ValueError) as exc:
+            return RunResult(returncode=-1, error=friendly_error(exc, "没能启动 claude"))
+        try:
+            on_spawn(proc.pid)
+        except Exception:  # noqa: BLE001 —— 登记失败也要把这一轮收好
+            logger.exception("on_spawn 回调失败 pid=%s", proc.pid)
+        live = _LiveTurn(proc)
+        err_tail: list = []
+
+        def drain() -> None:
+            try:
+                for line in proc.stderr:
+                    err_tail.append(line)
+                    del err_tail[:-40]
+            except (OSError, ValueError):
+                pass
+
+        threading.Thread(target=drain, daemon=True, name=f"claude-stderr-{sid[:8]}").start()
+        timed_out = threading.Event()
+
+        def on_timeout() -> None:
+            timed_out.set()
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+        timer = threading.Timer(max(1.0, timeout), on_timeout)
+        timer.daemon = True
+        timer.start()
+        results: list = []
+        with self._live_guard:
+            self._live[sid] = live
+        try:
+            if live.write(text):
+                for line in proc.stdout:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    kind = event.get("type")
+                    if kind == "user" and event.get("isReplay"):
+                        live.replayed += 1
+                    elif kind == "result":
+                        results.append(event)
+                        if live.replayed >= live.written or live.replayed == 0:
+                            live.close()
+            else:
+                live.close()
+        except (OSError, ValueError):
+            logger.debug("读 claude 输出中断 会话=%s", sid[:8], exc_info=True)
+        finally:
+            timer.cancel()
+            with self._live_guard:
+                if self._live.get(sid) is live:
+                    del self._live[sid]
+            live.close()
+            try:
+                proc.wait(timeout=30)
+            except Exception:  # noqa: BLE001
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    pass
+        stdout = ""
+        if results:
+            final = dict(results[-1])
+            if len(results) > 1:
+                texts = [str(r.get("result") or "").strip() for r in results]
+                final["result"] = "\n\n".join(t for t in texts if t)
+            stdout = json.dumps(final, ensure_ascii=False)
+        rc = proc.returncode if proc.returncode is not None else -1
+        if results and not timed_out.is_set() and rc != 0 and not results[-1].get("is_error"):
+            rc = 0  # 关 stdin 后的正常退出码不稳定；以 result 为准
+        return RunResult(returncode=rc, stdout=stdout, stderr="".join(err_tail),
+                         timed_out=timed_out.is_set(), pid=proc.pid)
 
     # ---------- relay：进会话聊天（送进终端里开着的那个会话） ----------
 
@@ -1362,6 +1489,55 @@ def _pending_ask(records: list) -> Optional[PendingAsk]:
         if questions:
             return PendingAsk(tool=name, questions=questions)
     return PendingAsk(tool=name, summary=_pending_summary(inp))
+
+
+class _LiveTurn:
+    """一轮在跑的 `claude -p --input-format stream-json`：往 stdin 写 user 消息，写和关都在锁里。"""
+
+    def __init__(self, proc: Any) -> None:
+        self.proc = proc
+        self.lock = threading.Lock()
+        self.written = 0
+        self.replayed = 0
+        self.closed = False
+
+    def open(self) -> bool:
+        return not self.closed and self.proc.poll() is None
+
+    def write(self, text: str) -> bool:
+        line = json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=False)
+        with self.lock:
+            if self.closed or self.proc.poll() is not None:
+                return False
+            try:
+                self.proc.stdin.write(line + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                self.closed = True
+                return False
+            self.written += 1
+            return True
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+
+def _stream_argv(argv: list) -> list:
+    """`_send_argv` 的一次性形状 → stream-json 输入输出：去掉 `-p` 后面的 prompt，输出格式换掉。"""
+    out = list(argv)
+    at = out.index("-p")
+    del out[at + 1]
+    at = out.index("--output-format")
+    out[at:at + 2] = ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                      "--replay-user-messages"]
+    return out
 
 
 def _send_result(sid: str, result: Any) -> ActionResult:

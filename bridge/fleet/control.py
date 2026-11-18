@@ -295,6 +295,19 @@ class FleetControl:
             # 不带前缀：app.py 那边已经套了「❌ 没发进去：」，再加一层就是「没发进去：没发出去：」
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
 
+    def steer(self, tool: str, sid: str, text: str) -> ActionResult:
+        """一轮在跑时中途插话（docs/product/steering.md）。不支持 / 插不进 ⇒ ok=False，调用方照旧处理。"""
+        from .model import can
+
+        adapter = self.fleet.adapter(tool)
+        method = getattr(adapter, "steer", None) if adapter is not None and can(tool, "steer") else None
+        if method is None:
+            return ActionResult(False, "", sid)
+        try:
+            return method(sid, text)
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, log_as=f"中途插话失败 tool={tool}"), sid)
+
     def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
               timeout: float = 600, model: str = "", on_pid: Any = None, effort: str = "",
               fork_from: str = "") -> ActionResult:
