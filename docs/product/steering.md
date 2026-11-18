@@ -1,6 +1,9 @@
 # 中途插话（steering）：调研结论与实现方案
 
-> 状态：调研完成，未实现。计划版本 `1.7.0`。验收用例 FC-38~FC-43 见 [`full-control.md`](full-control.md) §8。
+> 状态：**1.7.0 已实现 Claude 会话群的中途插话**；opencode（1.8.0）、Codex（1.9.0）未实现。验收用例 FC-38~FC-43 见 [`full-control.md`](full-control.md) §8。
+>
+> 1.7.0 范围：会话群 / 对话模式里，**桥自己起的** Claude 那一轮（`ClaudeAdapter._run_streaming`，stream-json 输入开着）。
+> 不在范围：私聊里桥自己的 claude（`_run_locally`，仍排队）、新建会话的第一轮（`INFLIGHT_ID` 占位，仍提示“还在发”）、终端 / App 里开着的会话。
 
 ## 1. 要解决的问题
 
@@ -81,3 +84,12 @@
 - <span style="color:red">插话会改变正在跑的任务。插错会话的代价比排队大，所以“发给别的会话的还在跑”时仍然拒收，不做跨会话插话。</span>
 - 插话的时机由模型决定：Claude 和 opencode 在当前工具调用结束后才读到，长命令（比如跑 10 分钟的测试）中途插话要等这条命令跑完。要立刻停，用 `/stop`。
 - 一轮恰好在插话时结束：Codex 会因 `expectedTurnId` 不匹配报错，Claude 的 stdin 已关闭；两种都退回排队，这句作为下一轮发出，不会丢。
+
+## 6. 1.7.0 实现记录
+
+- `ClaudeAdapter._send_locked`：真实进程出口（有 `runner.popen`）走 `_run_streaming`；测试替身没有 `popen` 时照旧一次性运行。
+- `_run_streaming`：`_stream_argv` 把一次性参数换成 `--input-format stream-json --output-format stream-json --verbose --replay-user-messages`，其余参数（权限、钩子、白名单、模型）不变；第一句写 stdin；收到 `result` 且回显数 ≥ 写入数才关 stdin；插话撞上收尾时它会再跑一轮，多个 `result` 的文字合并成一次回复。
+- `steer()` 只写 `_live` 里登记的那一轮；`FleetControl.steer` 按 `can(tool, "steer")` 分派。
+- 桥：`_maybe_send_to_fleet` 发现同一个会话在飞 ⇒ `_try_steer`（先过暂停和审查）⇒ 回「↪️ 已插进正在跑的这一轮」；插不进照旧回「上一条还在发」。
+- 顺带修掉一条多余提示：桥自己起的那一轮在扫描里是 `owner=bridge`，原来被当成「电脑上又打开了那个会话」，每次发话都冒「提示：…和刚才不一样。这条照常发过去了」。现在 `owner=bridge` 和 `none` 同一条路；这类提示不需要人处理，改为只记日志。
+- 测试：`tests/test_steering.py`（假 stream-json 进程覆盖插进同一轮、撞上收尾不丢、结束后拒收、桥的插话 / 回退 / 暂停 / 去提示）；真机探针（10 次 sleep，20 秒插话）跑 3 次后停、回 STEER-OK；插话后 `/stop` 立即结束。

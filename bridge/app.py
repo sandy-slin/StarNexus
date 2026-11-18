@@ -3494,6 +3494,38 @@ class Bridge:
         gate.write_workspaces(scope, (project,) if project and os.path.isdir(project) else policy.workspaces)
         return gate.dir_for(scope)
 
+    async def _try_steer(self, scope: str, chat_id: str, target, text: str) -> bool:
+        """同一个会话这一轮还在跑 ⇒ 把这句插进去（docs/product/steering.md）。插进去了返回 True。
+
+        和正常发送一样先过暂停和审查；插不进（工具不支持、这一轮刚结束、不是桥起的）⇒ False，走原来的提示。
+        """
+        from .fleet.model import can
+
+        control = getattr(self, "fleet", None)
+        if control is None or not can(target.tool, "steer") or not hasattr(control, "steer"):
+            return False
+        if scope in getattr(self, "_paused", {}):
+            return False
+        policy = self._session_policy(target.tool, target.id)
+        reviewer = getattr(self, "reviewer", None)
+        if reviewer is not None:
+            decision = reviewer.review_request(ReviewContext(text=text, source="human", mode=policy.mode))
+            if decision.verdict is Verdict.DENY:
+                logger.info("中途插话 拒收：审查拦下 tool=%s 会话=%s", target.tool, str(target.id)[:8])
+                self._say(chat_id, f"⛔️ {decision.reason}")
+                return True
+        try:
+            got = await asyncio.to_thread(control.steer, target.tool, target.id, text)
+        except Exception:  # noqa: BLE001
+            logger.debug("中途插话失败", exc_info=True)
+            return False
+        logger.info("中途插话 结果=%s tool=%s 会话=%s 字数=%d", "插进" if got.ok else "没插进",
+                    target.tool, str(target.id)[:8], len(text))
+        if not got.ok:
+            return False
+        self._say(chat_id, got.text or "↪️ 已插进正在跑的这一轮。")
+        return True
+
     async def _maybe_send_to_fleet(self, scope: str, chat_id: str, text: str) -> bool:
         """这个聊天有待发目标 ⇒ 把这条发过去，回复贴回来。没有目标返回 False（走正常流程）。"""
         control = getattr(self, "fleet", None)
@@ -3539,6 +3571,8 @@ class Bridge:
         if scope in self._fleet_inflight:
             busy_tool, busy_id = self._fleet_inflight[scope]
             same = (busy_tool, busy_id) == (target.tool, target.id)
+            if same and await self._try_steer(scope, chat_id, target, text):
+                return True
             logger.info("对话模式 拒收：上一条还在发 tool=%s 会话=%s 同一个=%s 字数=%d",
                         target.tool, str(target.id)[:8], same, len(text))
             # 带下一步：不想等就退出 / 停（**能停才放**）。
@@ -4038,9 +4072,8 @@ class Bridge:
             # 直接按现在的样子记下确认并发过去；会话改名 / 换项目 / 关掉时只提示一句，不再挡着。
             changed = self._talk_changed_why(scope, bound.tool, bound.id)
             logger.info("群绑定 主人发言即确认 tool=%s 会话=%s 变了=%s", bound.tool, bound.id[:8], bool(changed))
+            # 1.7.0：不再发「提示：…这条照常发过去了」—— 不需要他做任何事，只记日志（只有要人介入才说话）
             self._grant_by_open_click(scope, bound.tool, bound.id)
-            if changed:
-                self._say(chat_id, f"提示：{changed}。这条照常发过去了。")
         control.set_pending(scope, bound.tool, bound.id)
         return False
 
@@ -5708,7 +5741,9 @@ class Bridge:
         所以这一位要进确认的指纹：路变了，他确认过的就不是这回事了。
         Codex 跟随当前权限档位；Cursor 保持自身的权限映射。开没开着不改变权限规则，不算会话身份变化。
         """
-        return getattr(sess, "tool", "") == "claude" and getattr(sess, "owner", "") == "none"
+        # 1.7.0：桥自己起的那一轮（owner=bridge）也是这条路、同一套权限 —— 原来算成「电脑上又打开了」，
+        # 每次发话前后都冒一句「提示：…和刚才不一样」（11-18 林森截图两张）。
+        return getattr(sess, "tool", "") == "claude" and getattr(sess, "owner", "") in ("none", "bridge")
 
     def _remember_talk_ident(self, scope: str, tool: str, sid: str, ident: str) -> None:
         """记下「这个聊天现在是按哪个样子的会话确认的」（内存）。群里那条捷径靠它复查。"""
