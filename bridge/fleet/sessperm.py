@@ -135,24 +135,30 @@ def value(mode: str) -> dict:
 
 
 def resolve_click(raw: Any) -> Optional[str]:
-    """回调 → 档位；形状不对 ⇒ None。只认 {"act": "sp", "m": 三档之一}，多一个键都不认。"""
-    if not isinstance(raw, dict) or raw.get("act") != ACT or set(raw) != {"act", "m"}:
+    """回调 → 档位；形状不对 ⇒ None。只认 {"act": "sp", "m": 三档之一}，可带 "src": "sc"（来自状态卡）。"""
+    if not isinstance(raw, dict) or raw.get("act") != ACT:
+        return None
+    keys = set(raw)
+    if keys != {"act", "m"} and not (keys == {"act", "m", "src"} and raw.get("src") == "sc"):
         return None
     mode = raw.get("m")
     return mode if mode in MODES else None
 
 
-def buttons(current: str) -> list:
-    """三个按钮，当前档打 ✅ 并高亮。"""
+def buttons(current: str, modes: tuple = MODES, src: str = "") -> list:
+    """三个按钮，当前档打 ✅ 并高亮。`modes`：这台机器上限以内的档位；`src="sc"`：放在状态卡上。"""
     out = []
-    for mode in MODES:
+    for mode in [m for m in MODES if m in modes] or [current]:
+        val = value(mode)
+        if src:
+            val["src"] = src
         on = mode == current
         out.append({
             "tag": "button",
             "text": {"tag": "plain_text", "content": ("✅ " if on else "") + LABELS[mode]},
             "type": "primary" if on else "default",
             "width": "fill", "size": "medium",
-            "behaviors": [{"type": "callback", "value": value(mode)}],
+            "behaviors": [{"type": "callback", "value": val}],
         })
     return out
 

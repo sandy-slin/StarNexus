@@ -50,10 +50,13 @@ class CardInfo:
     last_turn_at: float = 0.0
     progress: str = ""
     finished: bool = False
+    perm: str = ""                 # 1.4.0：这个会话的档位（readonly / write / trusted），给权限那一排打 ✅
+    perm_modes: tuple = ()         # 这台机器上限以内能选的档位；空 ⇒ 不画权限那一排
 
     def signature(self) -> str:
         return json.dumps([self.model, self.mode, self.status, self.last_turn, self.last_turn_at,
-                           self.progress, self.finished, self.title, self.project], ensure_ascii=False)
+                           self.progress, self.finished, self.title, self.project,
+                           self.perm, list(self.perm_modes)], ensure_ascii=False)
 
 
 def value(op: str) -> dict:
@@ -96,6 +99,13 @@ def _clock(ts: float) -> str:
     return time.strftime("%m-%d %H:%M", time.localtime(ts))
 
 
+MOVED_CARD = json.dumps({
+    "schema": "2.0", "config": {"wide_screen_mode": True, "update_multi": True},
+    "header": {"title": {"tag": "plain_text", "content": "📌 状态卡已挪到最下面"}, "template": "grey"},
+    "body": {"elements": [{"tag": "markdown", "content": "最新的状态卡在下面，按钮都在那张上。"}]},
+}, ensure_ascii=False)
+
+
 def build_card(info: CardInfo) -> str:
     tool = TOOL_LABELS.get(info.tool, info.tool)
     if info.finished:
@@ -115,7 +125,7 @@ def build_card(info: CardInfo) -> str:
     if info.progress:
         lines.append(f"**最近进展**：{info.progress}")
     lines.append("")
-    lines.append("💬 继续：直接在群里说话，就发给这个会话。改群名发「/rename 新名字」。")
+    lines.append("💬 继续：直接在群里说话，就发给这个会话。不知道怎么做就发 /m，这张卡会挪到最下面。")
     buttons = [
         _button("🧠 模型", {"act": "mdl", "op": "home", "to": "s", "src": "sc"}),
         _button("⏹ 停下", {"act": "do", "op": "stop"}),
@@ -125,6 +135,14 @@ def build_card(info: CardInfo) -> str:
         _button("🧬 复制会话", {"act": "do", "op": "fork"}),
         _button("🗄 归档", {"act": "do", "op": "archive"}),
     ]
+    perm_rows = []
+    if info.perm and info.perm_modes:
+        from .sessperm import buttons as perm_buttons
+
+        perm_rows = [{"tag": "markdown", "content": "**这个会话的权限**（点了下一轮生效）", "text_size": "notation"},
+                     {"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+                         {"tag": "column", "width": "weighted", "weight": 1, "elements": [b]}
+                         for b in perm_buttons(info.perm, info.perm_modes, src="sc")]}]
     title = f"{tool}「{info.title or info.sid[:8]}」"
     card = {
         "schema": "2.0",
@@ -134,7 +152,9 @@ def build_card(info: CardInfo) -> str:
             "subtitle": {"tag": "plain_text", "content": "会话状态卡"},
             "template": "green" if info.finished else ("orange" if info.status == "waiting" else "blue"),
         },
-        "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines)}] + _rows(buttons)},
+        "body": {"elements": [{"tag": "markdown", "content": "\n".join(lines)}] + perm_rows + _rows(buttons)
+                 + [{"tag": "markdown", "text_size": "notation",
+                     "content": "快捷命令：`/p r|w|f` 权限 · `/stop` 停下 · `/rename 新名字` 改群名"}]},
     }
     return json.dumps(card, ensure_ascii=False)
 
@@ -205,6 +225,41 @@ class StatusCardKeeper:
         self._patch = patch
         self._pin = pin
         self._lock = threading.Lock()
+
+    def resend(self, chat_id: str, info: CardInfo) -> str:
+        """群里发 /m：把状态卡挪到最下面 —— 新发一张并置顶，旧的那张原地改成一句「已挪到最下面」。
+
+        这样群里始终只有一张带按钮的状态卡（旧卡上的按钮不会和新卡重复）。新卡发不出去 ⇒ 旧卡不动。
+        """
+        with self._lock:
+            old = self.store.get(chat_id).get("message_id") or ""
+            card = build_card(info)
+            try:
+                new_mid = self._send(chat_id, card)
+            except Exception:  # noqa: BLE001
+                logger.exception("状态卡重发抛异常")
+                new_mid = None
+            if not new_mid:
+                return "failed"
+            pinned = False
+            if self._pin is not None:
+                try:
+                    pinned = bool(self._pin(new_mid)[0])
+                except Exception:  # noqa: BLE001
+                    logger.exception("状态卡置顶抛异常")
+            self.store.put(chat_id, message_id=new_mid, pinned=pinned, sig=info.signature())
+            if old and old != new_mid:
+                try:
+                    self._patch(old, MOVED_CARD)
+                except Exception:  # noqa: BLE001
+                    logger.exception("旧状态卡改成「已挪走」失败")
+            return "moved_pinned" if pinned else "moved"
+
+    def card_for(self, chat_id: str, info: CardInfo) -> str:
+        """按钮回调里原地刷新用：返回新卡 JSON，并把签名记下（后台那一拍就不会再改一遍）。"""
+        card = build_card(info)
+        self.store.put(chat_id, sig=info.signature())
+        return card
 
     def finished(self, chat_id: str) -> bool:
         return bool(self.store.get(chat_id).get("finished"))

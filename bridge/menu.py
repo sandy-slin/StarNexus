@@ -89,13 +89,20 @@ CONTROLS = (
     ("/new", "🆕 新话题"),
     ("/status", "ℹ️ 现在状态"),
     ("/诊断", "🩺 运行诊断"),
+    ("/update", "⬆️ 版本和更新"),
+    ("/help", "❓ 帮助"),
 )
 
 # 卡上**直接露出来**的那几个；其余收进底下的折叠面板（点开才看见，不走回调）。
 # 判据：悬浮栏上真有人点过的才露出来（数据见上面两段注释）。
 # 「换项目」点得不多也露着：别的卡、帮助都叫他「点📂 换项目」，而它不在悬浮栏里 ——
 # 再收进面板就从 3 下变 4 下（tests/test_r17_taps.py 的那套算法）。
-_PINNED_CONTROLS = ("/sessions", "/newsession", "/history", "/mode", "/model", "/dirs", "/stop")
+_PINNED_CONTROLS = ("/sessions", "/newsession")
+# 1.4.0：/m 卡上「更多」里的顺序（权限、模型在卡上有自己的一排，不再放按钮）
+_MORE_CONTROLS = ("/dirs", "/history", "/status", "/诊断", "/update", "/help", "/new", "/stop")
+# 卡底那行快捷命令（熟手照着打；新手只记 /m）
+SHORTCUTS = "`/ns` 新建会话 · `/p r|w|f` 权限 · `/stop` 停下 · `/sessions` 会话总览"
+ASK_M = "不知道怎么做就发 /m"
 _PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
 
 # 折叠面板标题右边的小箭头。和 `fleet.cards.PANEL_ICON` 同一个（主会话 2026-11-08 真发过、
@@ -124,41 +131,27 @@ def is_menu_request(text: str) -> bool:
 #
 # 例句里**不许写死任何仓库名或文件名**（同 `pairing.BOUND_MESSAGE` 的红字）。
 # 这段帮助会被 `/help`、「❓ 帮助」按钮、菜单卡发不出去时三个地方发出去（都在 app.py）。
-HELP = """**我在你的电脑上干活，结果发回这里。**
+HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话总览、新建会话、默认模型、权限，其余在「更多」里。
 
-直接说要干什么，不用记命令：
+也可以直接说要干什么，不用记命令：
 · 这个文件夹里都有什么？
 · 随便挑一个文档，用三句话告诉我它在讲什么
 · 这里面有没有表格？里面大概是什么数据
 
-**不想打字就点按钮**
-输入框上面那一排常驻菜单随时能点；想要全部按钮，发「菜单」两个字。
-· 「📂 换项目」— 换到别的项目，列出来点一下就行
-· 「🔑 权限」（在「⚡ 常用」里）— 现在是「全授权」，项目里的事不问就做；想让它每步先问你，切到「只读」
-· 「🧠 模型」— 用哪个模型（均衡 / 最聪明 / 最快）
-· 「ℹ️ 现在状态」— 看现在在哪、什么权限
-· 「⏹ 停下」— 停下正在跑的那一轮
-· 「🆕 新话题」— 开个新话题（忘掉前面聊的）
-· 被暂停时，那句话下面会带「▶️ 继续」
-
-**电脑上的其他会话**
-点「🖥 会话」（或发「会话」两个字）— 看电脑上开着的 Claude / Codex 会话，点一个看最近几条
-点「➕ 新建会话」（或发「新建会话」）— 选 Claude / Codex 和项目，在电脑上新开一个会话，之后直接在这里接着聊
-点 [接着聊] 会给这个会话建一个群，点「进群说话」进去直接打字就行：每一句都进电脑上那个会话，它的回复发回群里
-· 群里第一句会说清它用哪套权限（手机和终端共用当前权限档位，默认全授权；需要收紧时切到只读）
-· 会话在电脑上改了名、换了项目或关了终端，会再问你一次
-· 不想聊了点「🚪 退出对话」，或说「取消」「退出」「算了」
-· 它手里那一轮**停不了** —— 只能到电脑上按 Esc（点「⏹ 停下」也会照实告诉你）
+**会话群**
+· 每个电脑上的会话一个群，群里说的话直接发给那个会话，回复也发回群里
+· 群里发 /m，会把这个会话的状态卡挪到最下面：模型、权限（只读 / 可写 / 全部授权）、停下、完成都在卡上
+· 从飞书新开的会话默认全部授权；电脑上原有的会话可以在群里单独设权限
+· 它手里那一轮**停不了**时（终端里开着的 Claude），点「⏹ 停下」会照实告诉你
 
 **它做不到的**
-· 只在你指定的项目里动手；要动项目以外的东西会先问你（想换项目点「📂 换项目」）
+· 只在你指定的项目里动手；要动项目以外的东西会先问你
 · 不会删掉你的整个家目录，点同意也不行
 · 读私钥/密码这类凭据、推代码、提权（sudo）会先弹卡问你，点同意才做；凭据内容回到飞书前会打码
 
 电脑睡着时收不到消息，醒了也不会补发 —— 发了没回先看看电脑是不是睡了。
-电脑不在身边时，点输入框上面「⚡ 常用」里的「🌐 网页版」，在网页里问（不经过电脑，查不了电脑上的文件）。
 
-按钮出不来的时候，也可以直接发文字：/stop 停下、/sessions 看会话、/cd 加项目名 换项目。
+快捷命令（熟了再用）：/ns 新建会话 · /p r|w|f 权限 · /stop 停下 · /sessions 会话总览。
 """
 
 
@@ -263,7 +256,7 @@ def unknown_command_reply(text: str):
         ops.append(guessed_op)
     # 菜单和帮助是**认不出时唯一有用的两个出口**，始终给。
     # 猜中的就是它们之一时不重复放（去重按 op，不按按钮长相）。
-    for op in ("menu", "help"):
+    for op in ("menu",):
         if op not in ops:
             ops.append(op)
     buttons = [do_button(op, primary=(i == 0)) for i, op in enumerate(ops)]
@@ -271,8 +264,7 @@ def unknown_command_reply(text: str):
     line = f"没有「{token}」这个用法。"
     if guess:
         line += f"你是想发 `{guess}` 吗？下面点一下就行。"
-    else:
-        line += "点下面的按钮，或者直接把要做的事说给我。"
+    line += f"{ASK_M}，常用的都在那张卡上。"
     return line, buttons
 
 
@@ -299,98 +291,84 @@ def _row(buttons: list[dict]) -> dict:
     }
 
 
-def build_menu_card(workspace_label: str = "", policy=None) -> str:
-    """菜单卡片 JSON（「全部按钮」）。
+def build_menu_card(workspace_label: str = "", policy=None, defaults=None) -> str:
+    """私聊里的 /m 卡（1.4.0）：常用的都在这一张上，一步做完。
 
-    从上到下：当前状态 → 常用控制（点得多的在前）→ 常用问题 → 折叠面板「更多」。
-    折叠面板是客户端本地展开的，不走回调；面板里的按钮和外面的一样走 `resolve_click`。
-
-    顶上一行是**当前状态**：在哪个目录、哪一档权限、哪个模型。
-    这是照着豆包工作那排抄的 —— 他们把这三样直接写在输入框下面，
-    用户不用点进去就知道"我现在是什么配置"。
-    不然他点了「哪里有改动」会不知道查的是哪个目录，
-    点了「改一下」才发现是只读。
+    从上到下：当前状态 → 会话总览 / 新建会话 → 默认模型（每个工具一个按钮，点开是下拉）
+    → 全局权限（只读 / 可写 / 全部授权，点了直接生效、卡片原地刷新）→ 折叠的「更多」→ 快捷命令。
+    `defaults`：[(工具名, 现在的默认模型文字)]，给「默认模型」那一行显示用；None ⇒ 不显示那一行文字。
     """
+    from .fleet.catalog import LABELS as TOOL_LABELS, TOOLS
+    from .fleet.sessperm import LABELS as PERM_LABELS
+
     elements: list[dict] = []
+
+    def rows(buttons: list[dict], per: int = 2) -> list[dict]:
+        return [_row(buttons[i : i + per]) for i in range(0, len(buttons), per)]
+
     status_bits = []
     if workspace_label:
-        # 路径用行内代码：`~/codes/my_app` 裸写的话 `_app` 会被当成斜体
         from .reply import inline_code
 
         status_bits.append(f"📁 {inline_code(workspace_label)}")
     if policy is not None:
-        from .policy import MODE_LABELS, MODEL_LABELS
-
-        status_bits.append(f"🔑 {MODE_LABELS.get(policy.mode, policy.mode)}")
-        status_bits.append(f"🧠 {MODEL_LABELS.get(policy.model, policy.model)}")
+        status_bits.append(f"🔑 全局{PERM_LABELS.get(policy.mode, policy.mode)}")
     if status_bits:
         elements.append({"tag": "markdown", "content": "　".join(status_bits)})
 
-    # 🔴 第 28 轮：常用的放最上面（数据见 CONTROLS 的注释），没数据的收进折叠面板。
-    # 点得最多的「看看会话」（悬浮栏 60 / 147）用主色，一眼找到。
-    def rows(buttons: list[dict]) -> list[dict]:
-        return [_row(buttons[i : i + 2]) for i in range(0, len(buttons), 2)]
+    labels = dict(CONTROLS)
+    elements.extend(rows([
+        _button(labels["/sessions"], {"act": "menu", "cmd": "/sessions"}, primary=True),
+        _button(labels["/newsession"], {"act": "menu", "cmd": "/newsession"}),
+    ]))
 
-    pinned_says = {_QUESTION_TEXT[key] for key in _PINNED_QUESTIONS}
-    controls = [
-        _button(label, {"act": "menu", "cmd": cmd}, primary=(cmd == _PINNED_CONTROLS[0]))
-        for cmd, label in CONTROLS
-        if cmd in _PINNED_CONTROLS
-    ]
-    elements.extend(rows(controls))
+    model_line = "**默认模型**"
+    if defaults:
+        model_line += "　" + " · ".join(f"{name} {text}" for name, text in defaults)
+    elements.append({"tag": "markdown", "content": model_line})
+    elements.extend(rows([
+        _button(TOOL_LABELS[t], {"act": "mdl", "op": "open", "to": "d", "tool": t, "src": "m"})
+        for t in TOOLS
+    ], per=3))
 
-    elements.append({"tag": "markdown", "content": "**点一下就问：**"})
-    questions = [
-        _button(label, {"act": "menu", "say": say})
-        for say, label in QUICK_QUESTIONS
-        if say in pinned_says
-    ]
-    elements.extend(rows(questions))
+    if policy is not None:
+        from .policy import modes_up_to
 
-    more_questions = [
-        _button(label, {"act": "menu", "say": say})
-        for say, label in QUICK_QUESTIONS
-        if say not in pinned_says
-    ]
-    more_controls = [
-        _button(label, {"act": "menu", "cmd": cmd})
-        for cmd, label in CONTROLS
-        if cmd not in _PINNED_CONTROLS
-    ]
-    if more_questions or more_controls:
-        # 标题里把面板里有什么写出来 —— 收起来的东西不说名字，就等于没有。
-        names = [label.split(" ", 1)[-1] for cmd, label in CONTROLS if cmd not in _PINNED_CONTROLS]
-        if more_questions:
-            names.append("更多问题")
-        elements.append(
-            {
-                "tag": "collapsible_panel",
-                "expanded": False,
-                "header": {
-                    "title": {"tag": "markdown", "content": "**更多**：" + " · ".join(names)},
-                    "width": "fill",
-                    "icon": _PANEL_ICON,
-                    "icon_position": "right",
-                    "icon_expanded_angle": -180,
-                },
-                "elements": rows(more_controls) + rows(more_questions),  # 和标题的先后一致
-            }
-        )
+        elements.append({"tag": "markdown",
+                         "content": "**全局权限**（私聊和没单独设过的会话都用它）"})
+        perm_buttons = []
+        for mode in modes_up_to(getattr(policy, "ceiling_mode", policy.mode)):
+            on = mode == policy.mode
+            perm_buttons.append(_button(("✅ " if on else "") + PERM_LABELS.get(mode, mode),
+                                        {"act": "menu", "pm": mode}, primary=on))
+        elements.extend(rows(perm_buttons, per=3))
 
+    more_controls = [_button(labels[cmd], {"act": "menu", "cmd": cmd}) for cmd in _MORE_CONTROLS]
+    more_questions = [_button(label, {"act": "menu", "say": say}) for say, label in QUICK_QUESTIONS]
+    names = [labels[cmd].split(" ", 1)[-1] for cmd in _MORE_CONTROLS] + ["常用问题"]
     elements.append(
         {
-            "tag": "markdown",
-            "content": "也可以直接打字问别的。再叫出这个菜单发「菜单」。",
-            "text_size": "notation",
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "header": {
+                "title": {"tag": "markdown", "content": "**更多**：" + " · ".join(names)},
+                "width": "fill",
+                "icon": _PANEL_ICON,
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
+            "elements": rows(more_controls) + rows(more_questions),
         }
     )
+    elements.append({"tag": "markdown", "text_size": "notation",
+                     "content": f"{ASK_M}。也可以直接打字说要做什么。快捷命令：{SHORTCUTS}"})
 
     return json.dumps(
         {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True},
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "想让我干点啥？"},
+                "title": {"tag": "plain_text", "content": "📋 /m 常用功能"},
                 "template": "blue",
             },
             "body": {"elements": elements},
@@ -611,6 +589,10 @@ def resolve_click(value: dict) -> str:
     # 主人自己打 `/mode! x` 也会生效 —— 这是**有意的**文字确认通道（确认卡发不出去时
     # 回话里就教他这么打，见 app._handle_mode）。打出带 `!` 的命令本身就是明确意图；
     # 非主人发的消息在鉴权那层就被丢了。超过本机上限照样压回去。
+    # 1.4.0 /m 卡上的全局权限按钮：一步生效（产品定义：手机和终端同权；仍被本机上限压住）
+    picked = value.get("pm")
+    if isinstance(picked, str):
+        return f"/mode! {picked}" if picked in MODE_RANK else ""
     confirmed = value.get("mode2")
     if isinstance(confirmed, str):
         return f"/mode! {confirmed}" if confirmed in MODE_RANK else ""

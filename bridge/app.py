@@ -1935,7 +1935,58 @@ class Bridge:
             if not prefs.last_save_ok:
                 said += "\n⚠️ 这次没存下来，重启后会回到配置里那一档。"
             return f"现在是「{label}」", build_mode_card(self.policy), said
+        picked = value.get("pm")
+        if isinstance(picked, str) and picked in MODE_RANK:
+            # 1.4.0 /m 卡上的全局权限：点了直接生效（手机和终端同权），/m 卡原地刷新。仍被本机上限压住。
+            from .fleet.sessperm import EXPLAIN, LABELS as PERM_LABELS
+            from .menu import build_menu_card
+
+            applied, clamped = prefs.set_mode(picked)
+            config_path = getattr(self.settings, "config_path", "") or ""
+            if config_path and os.path.exists(config_path):
+                self._erase_migration_marker(config_path)
+            label = PERM_LABELS.get(applied, applied)
+            said = f"🔑 全局权限改成「{label}」：{EXPLAIN.get(applied, '')}。下一条消息开始生效；单独设过的会话群不受影响。"
+            if clamped:
+                said += f"\n⚠️ 这台电脑最多放到「{PERM_LABELS.get(applied, applied)}」。"
+            if not prefs.last_save_ok:
+                said += "\n⚠️ 这次没存下来，重启后会回到配置里那一档。"
+            logger.info("菜单卡 全局权限 要=%s 实际=%s", picked, applied)
+            card = build_menu_card("", self.policy, self._default_model_texts())
+            return f"全局权限：{label}", card, said
         return None
+
+    def _default_model_texts(self) -> list:
+        """/m 卡「默认模型」那一行：[(工具名, 现在的默认模型)]。没设过 ⇒ 写工具自己配置的那个。"""
+        from .fleet.catalog import LABELS, TOOLS
+
+        mp = getattr(self, "model_prefs", None)
+        if mp is None:
+            return []
+        out = []
+        for tool in TOOLS:
+            try:
+                choice = mp.default(tool)
+                text = choice.text() if (choice.model or choice.effort) else ""
+                if not text:
+                    native = mp.catalog.native(tool)
+                    text = f"缺省（{native.model}）" if native is not None and native.model else "缺省"
+            except Exception:  # noqa: BLE001
+                text = "缺省"
+            out.append((LABELS.get(tool, tool), text))
+        return out
+
+    def _send_session_menu(self, chat_id: str) -> None:
+        """会话群里的 /m：状态卡挪到最下面，群里只留这一张带按钮的卡。"""
+        keeper = getattr(self, "status_cards", None)
+        info = self._status_card_info(chat_id)
+        if keeper is None or info is None:
+            self._say(chat_id, "这个群的状态卡没起来。直接说话就发给这个会话；权限发 /p r|w|f，停下发 /stop。")
+            return
+        how = keeper.resend(chat_id, info)
+        logger.info("会话群 /m 状态卡 %s chat=%s tool=%s", how, chat_id[:12], info.tool)
+        if how == "failed":
+            self._say(chat_id, "状态卡这次没发出去，过一会儿再发 /m 试试。")
 
     def _send_menu(self, chat_id: str, scope: str) -> None:
         from .menu import build_menu_card
@@ -1948,7 +1999,7 @@ class Bridge:
             if where.startswith(home):
                 where = "~" + where[len(home):]
         sender = getattr(self.replier, "send_card", None)
-        if sender is None or not sender(chat_id, build_menu_card(where, self.policy)):
+        if sender is None or not sender(chat_id, build_menu_card(where, self.policy, self._default_model_texts())):
             # 卡片发不出去就退化成文字帮助 —— 别让用户叫菜单却什么都没收到
             self._say(chat_id, HELP)
 
@@ -2400,6 +2451,11 @@ class Bridge:
         from .menu import is_menu_request
 
         if is_menu_request(text):
+            # 1.4.0：会话群里 /m = 把这个会话的状态卡挪到最下面（模型、权限、停下都在那张上）；
+            # CEO 群保持原样（CEO 自己的命令那一套）；其余（私聊、普通群）= 全局常用功能卡。
+            if str(scope).startswith("group:") and self._session_of_group(chat_id) is not None:
+                self._send_session_menu(chat_id)
+                return True
             self._send_menu(chat_id, scope)
             return True
 
@@ -6355,7 +6411,12 @@ class Bridge:
                 return reply("info", "模型卡已发到群里")
             return reply("info", "模型总览", card)
         if op == "open":
-            return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", list_card(mp, to, tool, sid, label))
+            card = list_card(mp, to, tool, sid, label)
+            if value.get("src") == "m" and chat_id:
+                # 1.4.0 /m 卡上点的：/m 卡留在原位，选模型那张另发一条（下拉选完就生效）
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 发「/model」查看和切换模型")
+                return reply("info", f"选 {LABELS.get(tool, tool)} 的默认模型")
+            return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", card)
         if op == "m":
             names = mp.catalog.names(tool)
             if click["i"] >= len(names):
@@ -6436,7 +6497,20 @@ class Bridge:
             last_turn_at=float(getattr(sess, "last_turn_at", 0) or 0) if sess is not None else 0.0,
             progress=progress,
             finished=bool(keeper.finished(chat_id)) if keeper is not None else False,
+            perm=self._session_policy(bound.tool, bound.id).mode,
+            perm_modes=self._perm_modes(),
         )
+
+    def _perm_modes(self) -> tuple:
+        """这台机器上限以内能选的档位（给状态卡 / 权限卡画按钮）。拿不到 ⇒ 三档都给，切的时候照样被上限压住。"""
+        from .policy import modes_up_to
+
+        policy = getattr(self, "policy", None)
+        ceiling = getattr(policy, "ceiling_mode", "") or getattr(policy, "mode", "") or "trusted"
+        try:
+            return tuple(modes_up_to(ceiling))
+        except Exception:  # noqa: BLE001
+            return ("readonly", "write", "trusted")
 
     def _refresh_status_card(self, chat_id: str, force: bool = False) -> str:
         """会话群的状态卡：没有就发并置顶，有就原地更新。返回 keeper 的结果（测试和日志用）。"""
@@ -6664,8 +6738,13 @@ class Bridge:
             return reply("error", "这里不是会话群，到会话群里再切")
         text = self._apply_session_mode(bound, target)
         self._say_later(chat_id, text)
-        return reply("success", f"已切到「{sessperm.LABELS[self._session_policy(bound.tool, bound.id).mode]}」",
-                     self._session_perm_card(chat_id))
+        done = f"已切到「{sessperm.LABELS[self._session_policy(bound.tool, bound.id).mode]}」"
+        if value.get("src") == "sc":
+            keeper = getattr(self, "status_cards", None)
+            info = self._status_card_info(chat_id)
+            if keeper is not None and info is not None:
+                return reply("success", done, json.loads(keeper.card_for(chat_id, info)))
+        return reply("success", done, self._session_perm_card(chat_id))
 
     def _handle_model(self, chat_id: str, text: str) -> None:
         """`/model` 看当前模型 + 给可选项；`/model claude-opus-5-5` 切换。
