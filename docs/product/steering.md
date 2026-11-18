@@ -1,10 +1,11 @@
 # 中途插话（steering）：调研结论与实现方案
 
-> 状态：**1.8.0 已实现 Claude（会话群、私聊、新建会话第一轮）和 opencode（接着聊）的中途插话**；Codex（1.9.0）未实现。验收用例 FC-38~FC-43 见 [`full-control.md`](full-control.md) §8。
+> 状态：**1.9.0 已实现 Claude（会话群、私聊、新建会话第一轮）、opencode（接着聊）和 Codex（接着聊）的中途插话**。验收用例 FC-38~FC-43 见 [`full-control.md`](full-control.md) §8。
 >
 > 1.7.0 范围：会话群 / 对话模式里，**桥自己起的** Claude 那一轮（`ClaudeAdapter._run_streaming`，stream-json 输入开着）。
-> 1.8.0 补上：私聊里桥自己跑的 Claude（`ClaudeRunner`，`_run_locally`）、Claude 新建会话的第一轮、opencode 接着聊的那一轮。
-> 不在范围：终端 / App 里开着的会话、Cursor、opencode 新建会话的第一轮（仍是 `--standalone` 私有服务，插不进，照旧提示）。
+> 1.8.0 补上：私聊里桥自己跑的 Claude（`ClaudeRunner`）、Claude 新建会话的第一轮、opencode 接着聊的那一轮。
+> 1.9.0 补上：Codex 接着聊的那一轮（发送通道从一次性 `codex exec resume` 换成按轮的 `codex app-server`）。
+> 不在范围：终端 / App 里开着的会话、Cursor；新建会话的第一轮还插不进（Claude 除外）：Codex 和 opencode 的第一轮仍是独立的一次性进程，等这一轮回完再处理。
 
 ## 1. 要解决的问题
 
@@ -103,3 +104,13 @@
 - **opencode 停下**：走常驻服务时 `/stop` 先调 `/interrupt`。实测只杀掉 `opencode run` 客户端，服务里那一轮还会继续跑。
 - **opencode 新建会话**仍走 `--standalone`（第一轮没有会话号，连不到同一个服务），所以第一轮不能插话，照旧提示。
 - 测试：`tests/test_steering_dm.py`（假 stream-json 进程）、`tests/test_steering_opencode.py`（假 HTTP 服务）；真机回归 `steer_dm`、`steer_first_turn`、`steer_opencode`、`steer_claude` 全过。
+
+## 8. 1.9.0 实现记录（Codex）
+
+- **按轮起 app-server，不做常驻**：`bridge/fleet/codex_appserver.py` 一轮 = 起一个 `codex app-server` → `initialize` → `thread/resume` → `turn/start` → 等 `turn/completed` → 关掉。和 Claude 的按轮 stream-json 同一个生命周期，崩了不用重连：下一轮重新起、重新 resume。
+- **插话**：`turn/steer {threadId, expectedTurnId, input}`，返回的 turnId 和当前这一轮一致才算插进；不一致（这一轮刚结束）⇒ 返回不支持，桥退回原来的提示。
+- **停下**：`/stop` 先 `turn/interrupt`，再关进程。实测停在插话后，文件行数 10 秒内不再增加。
+- **审批钩子**（实测的坑）：顶层 `--dangerously-bypass-hook-trust` 对 app-server **不生效**（`hooks/list` 显示钩子登记了但 `trustStatus=untrusted`，不会跑，`echo hi > file` 照样执行）；必须 `-c hooks.PreToolUse=…` 加上 `thread/resume|start` 的 `config.bypass_hook_trust=true`。改好之后实测同一句话被钩子拦下、文件没有创建。
+- **权限档位**：和 `codex exec` 同一张表（`readonly`/`write`/`trusted`）；`trusted` 映射 `danger-full-access` + 钩子，钩子没装上退回 `workspace-write`。模型和强度在 `turn/start` 上带。
+- **新会话第一轮**仍走 `codex exec`（`start()` 没换），所以那一段不能插话，和 opencode 一样。
+- 测试：`tests/test_steering_codex.py`（假 app-server 覆盖插进同一轮、结束后拒收、停下、超时、失败、钩子参数、模型强度）；真机探针（10 次 sleep 4，18 秒插话）跑 2 次后停、回 CX-STEER-OK；真机回归 `steer_codex`、`stop`、`codex_trusted`、`ns_codex`、`model_effort`、`group_relay`、`long_reply` 全过。
