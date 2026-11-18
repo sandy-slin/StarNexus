@@ -568,7 +568,9 @@ def _classify_readonly(command: str) -> bool:
     return True
 _HOME_OR_ROOT = '[\\"\']?(?:~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s\\"\';&|]+|/home/[^/\\s\\"\';&|]+|/Users|/home|/)(?:/\\.?|/\\*|\\*)?[\\"\']?(?![^\\s;&|]*/[^\\s;&|])'
 _NEVER_APPROVABLE = ((re.compile('\\brm\\b(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*[rR]|--recursive)))(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*f|--force)))[^;&|]*\\s' + _HOME_OR_ROOT + '(?=\\s|$|;|&|\\|)'), '递归删除根目录或家目录'), (re.compile('\\bfind\\s+' + _HOME_OR_ROOT + '(?=\\s)[^;&|]*\\s-(?:delete\\b|exec(?:dir)?\\s+rm\\b|ok(?:dir)?\\s+rm\\b)'), '把根目录或家目录整个删掉'))
-_NEEDS_APPROVAL_CMDS = ((re.compile('\\b(python3?|node|ruby|perl|php|osascript|deno|bun)\\b\\s+(-c|-e|-r|--eval)'), '用解释器跑内联代码'), (re.compile('\\b(python3?|node|ruby|perl|sh|bash|zsh)\\b[^|;&\\n]*<<'), '用 heredoc 喂脚本'), (re.compile('\\|\\s*(sh|bash|zsh|python3?|node)\\b'), '把输出管进解释器'), (re.compile('\\beval\\b|\\bexec\\b'), 'eval/exec 执行拼出来的命令'), (re.compile('(?:^|[;&|(]\\s*)su\\b(?!-)'), '提权'), (re.compile('\\bgit\\s+push\\b'), '把代码推到远端'), (re.compile('\\bgit\\s+reset\\s+--hard\\b|\\bgit\\s+clean\\s+-[a-z]*f'), '丢弃本地改动'), (re.compile('\\bsudo\\b|\\bdoas\\b'), '提权'), (re.compile('\\bdd\\b.*\\bof=/dev/'), '裸写磁盘'), (re.compile(':\\(\\)\\s*\\{.*\\}\\s*;?\\s*:'), 'fork 炸弹'), (re.compile('\\bkubectl\\s+delete\\b|\\bhelm\\s+(delete|uninstall)\\b'), '删线上资源'), (re.compile('\\b(curl|wget)\\b.*\\|\\s*(sh|bash)'), '下载直接执行'), (re.compile('\\bchmod\\s+-R\\s+777\\b|\\bchown\\s+-R\\b.*\\s/\\s*$'), '递归改权限'), (re.compile('\\bdiskutil\\s+(erase|reformat)|\\bmkfs\\b'), '格式化磁盘'), (re.compile('\\blaunchctl\\s+(bootout|unload)\\b.*\\bcom\\.apple\\b'), '卸载系统服务'), (re.compile('\\bdefaults\\s+(write|delete)\\b'), '改系统设置'))
+_SCRIPT_CMDS = ((re.compile('\\b(python3?|node|ruby|perl|php|osascript|deno|bun)\\b\\s+(-c|-e|-r|--eval)'), '用解释器跑内联代码'), (re.compile('\\b(python3?|node|ruby|perl|sh|bash|zsh)\\b[^|;&\\n]*<<'), '用 heredoc 喂脚本'), (re.compile('\\|\\s*(sh|bash|zsh|python3?|node)\\b'), '把输出管进解释器'), (re.compile('\\beval\\b|\\bexec\\b'), 'eval/exec 执行拼出来的命令'))
+_SCRIPT_DELETES = re.compile('rmtree|removedirs|os\\.remove|os\\.unlink|\\.unlink\\(|shutil\\.move|fs\\.rm|rmSync|unlinkSync|\\brm\\s+-[a-zA-Z]*[rRf]|File\\.delete|FileUtils\\.rm')
+_NEEDS_APPROVAL_CMDS = ((re.compile('(?:^|[;&|(]\\s*)su\\b(?!-)'), '提权'), (re.compile('\\bgit\\s+push\\b'), '把代码推到远端'), (re.compile('\\bgit\\s+reset\\s+--hard\\b|\\bgit\\s+clean\\s+-[a-z]*f'), '丢弃本地改动'), (re.compile('\\bsudo\\b|\\bdoas\\b'), '提权'), (re.compile('\\bdd\\b.*\\bof=/dev/'), '裸写磁盘'), (re.compile(':\\(\\)\\s*\\{.*\\}\\s*;?\\s*:'), 'fork 炸弹'), (re.compile('\\bkubectl\\s+delete\\b|\\bhelm\\s+(delete|uninstall)\\b'), '删线上资源'), (re.compile('\\b(curl|wget)\\b.*\\|\\s*(sh|bash)'), '下载直接执行'), (re.compile('\\bchmod\\s+-R\\s+777\\b|\\bchown\\s+-R\\b.*\\s/\\s*$'), '递归改权限'), (re.compile('\\bdiskutil\\s+(erase|reformat)|\\bmkfs\\b'), '格式化磁盘'), (re.compile('\\blaunchctl\\s+(bootout|unload)\\b.*\\bcom\\.apple\\b'), '卸载系统服务'), (re.compile('\\bdefaults\\s+(write|delete)\\b'), '改系统设置'))
 
 def _flag_only_ok(tokens: list, start: int, spec: dict) -> str:
     """这一段是不是**只有**被认可的只读 token。返回空串 = 是；否则返回要问的原因。
@@ -608,7 +610,7 @@ def _flag_only_ok(tokens: list, start: int, spec: dict) -> str:
     if need is not None and (not need.search(' '.join(_segment(tokens, start)))):
         return '没带限定次数/范围的选项，可能会一直跑或者拉回整份清单'
     return ''
-_CRED_PATHS = re.compile('(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root|/etc)?/?\\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|pgpass|my\\.cnf|git-credentials|keychain|Keychains/)|(^|[\\s=\\"\'(:/])\\.env(\\.[A-Za-z0-9_.-]+)?(\\s|$|[\\"\';)])|\\.(pem|p12|pfx|jks)(\\s|$|[\\"\';)])|\\bid_(rsa|dsa|ecdsa|ed25519)\\b|/etc/(shadow|master\\.passwd|sudoers)|\\.keychain(-db)?\\b|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\\s(~|\\$HOME|/Users/|/home/)|\\s-r[a-zA-Z]*\\s+[^;&|]*(~|\\$HOME)/\\.(config|aws|ssh|gnupg)\\b|(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root)/\\.(ssh|aws|gnupg)(?=\\s|$|[\\"\';)/])|/\\.config/(gh|gcloud|rclone|doctl|flyctl|heroku|npm|composer|gspread)\\b|\\bsecurity\\s+(find-(generic|internet)-password|dump-keychain|export)\\b', re.I)
+_CRED_PATHS = re.compile('(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root|/etc)?/?\\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|pgpass|my\\.cnf|git-credentials|keychain|Keychains/)|(^|[\\s=\\"\'(:/])\\.env(?!\\.(example|sample|template|dist)\\b)(\\.[A-Za-z0-9_.-]+)?(\\s|$|[\\"\';)])|\\.(pem|p12|pfx|jks)(\\s|$|[\\"\';)])|\\bid_(rsa|dsa|ecdsa|ed25519)\\b|/etc/(shadow|master\\.passwd|sudoers)|\\.keychain(-db)?\\b|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\\s(~|\\$HOME|/Users/|/home/)|\\s-r[a-zA-Z]*\\s+[^;&|]*(~|\\$HOME)/\\.(config|aws|ssh|gnupg)\\b|(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root)/\\.(ssh|aws|gnupg)(?=\\s|$|[\\"\';)/])|/\\.config/(gh|gcloud|rclone|doctl|flyctl|heroku|npm|composer|gspread)\\b|\\bsecurity\\s+(find-(generic|internet)-password|dump-keychain|export)\\b', re.I)
 
 def _touches_credentials(command: str) -> str:
     """这条命令碰到了凭据文件吗。返回原因，空串 = 没碰到。
@@ -705,7 +707,7 @@ def never_approvable(command: str) -> str:
                 return reason
     return ''
 
-def approval_reason(command: str) -> str:
+def approval_reason(command: str, trusted: bool=False) -> str:
     """这条命令要不要**逐次审批**（任何档位都先出卡）。返回原因，空串 = 不需要。
 
     读凭据、git push、提权、丢弃改动、删线上资源、内联解释器等。全授权档也不直接放行。
@@ -729,6 +731,15 @@ def approval_reason(command: str) -> str:
         for pattern, reason in _NEEDS_APPROVAL_CMDS:
             if pattern.search(candidate):
                 return reason
+    for candidate in (text, normalized):
+        if not candidate:
+            continue
+        for pattern, reason in _SCRIPT_CMDS:
+            if pattern.search(candidate):
+                if not trusted:
+                    return reason
+                if _SCRIPT_DELETES.search(candidate):
+                    return reason + '（脚本里有删除动作）'
     return ''
 _SYSTEM_PREFIXES = ('/dev/', '/tmp/', '/private/tmp/', '/var/tmp/', '/private/var/folders/', '/var/folders/', '/usr/', '/bin/', '/sbin/', '/opt/', '/System/', '/Library/', '/proc/', '/sys/', '/etc/')
 _SYSTEM_EXACT = frozenset({'/dev/null', '/dev/stdin', '/dev/stdout', '/dev/stderr', '/tmp', '/usr', '/bin', '/opt', '/etc'})
@@ -826,7 +837,7 @@ def _candidate_paths(command: str) -> list[str]:
             found.append(cleaned)
     return found
 
-def _outside_workspace(command: str, workspaces: tuple[str, ...], cwd: str='') -> str:
+def _outside_workspace(command: str, workspaces: tuple[str, ...], cwd: str='', trusted: bool=False) -> str:
     """命令里有没有伸出 workspace 的路径。返回越界的那个，空串表示没有。
 
     workspaces 是 `Policy.workspaces`（绝对路径元组）。
@@ -845,11 +856,19 @@ def _outside_workspace(command: str, workspaces: tuple[str, ...], cwd: str='') -
     base = cwd or roots[0]
     for raw in _candidate_paths(command):
         if _EXPANDS.search(raw):
+            # 全授权档：运行时才知道的路径（`$R/$f` 这类多半是接口路径）不按越界拦（2026-11-18 D01 群实测）
+            if trusted:
+                continue
             return raw
+        if trusted and raw == '/':
+            continue
         expanded = os.path.expanduser(raw)
         if not os.path.isabs(expanded):
             expanded = os.path.join(base, expanded)
         if _is_system_path(expanded):
+            continue
+        # 全授权档：顶层目录都不存在的绝对路径（`/open-apis/...` 接口地址）不是电脑上的文件
+        if trusted and os.path.isabs(raw) and not os.path.exists('/' + raw.strip('/').split('/', 1)[0]):
             continue
         try:
             resolved = os.path.realpath(expanded)
@@ -1025,7 +1044,8 @@ def main() -> None:
                            "告诉用户你本来要做什么、为什么。")
         # 🔴 2026-11-17（FC-13）：读凭据、git push、提权、丢弃改动等**逐次审批**，
         # 在全授权放行之前判：全授权也要先出卡，点同意后才执行。
-        ask = approval_reason(str(tool_input.get("command") or ""))
+        ask = approval_reason(str(tool_input.get("command") or ""),
+                              os.path.exists(os.path.join(directory, "TRUSTED")))
         if ask:
             if _consume_grant(directory, digest(tool_name, tool_input)):
                 decide("allow", "你在飞书里批准了这一步")
@@ -1060,7 +1080,8 @@ def main() -> None:
     # 照样能读到，因为命令里的路径是运行时才知道的。
     if tool_name == "Bash":
         command = str(tool_input.get("command") or "")
-        outside = _outside_workspace(command, workspaces, cwd)
+        outside = _outside_workspace(command, workspaces, cwd,
+                                     os.path.exists(os.path.join(directory, "TRUSTED")))
         # 🔴 第 16 轮（用户原话：「终端历史、桌面、下载、别的项目都在外面，这些都是基本的
         # 查阅操作，为啥还有弹卡呢，要做放开到整台电脑」）：
         # **全授权 + 这条命令是只读 ⇒ 目录外也放行**。读边界原来排在全授权前面，

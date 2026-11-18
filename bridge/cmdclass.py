@@ -1356,8 +1356,10 @@ _NEVER_APPROVABLE = (
 # 🔴 2026-11-17（FC-13，产品定义 §2 原则 1）：硬红线只剩「删家目录 / 根目录」。
 # 下面这些原来点同意也不许，现在改成**逐次审批**：任何档位都先出审批卡，点同意后执行。
 # 全授权档也不会直接放行它们（钩子在 TRUSTED 之前判）。
-_NEEDS_APPROVAL_CMDS = (
-    # 任意代码执行：绕开所有命令级判据
+# 🔴 2026-11-18（D01 群实测）：全授权档下一轮弹了 29 张卡，17 张是 `python3 -c` 读 JSON。
+# 内联脚本只在**只读 / 可改档**逐次审批；全授权档直接放行，除非脚本里有删除动作
+# （`_SCRIPT_DELETES`）。凭据路径和删家目录照旧先判，不因为写成脚本就放过。
+_SCRIPT_CMDS = (
     (re.compile(r"\b(python3?|node|ruby|perl|php|osascript|deno|bun)\b\s+(-c|-e|-r|--eval)"),
      "用解释器跑内联代码"),
     (re.compile(r"\b(python3?|node|ruby|perl|sh|bash|zsh)\b[^|;&\n]*<<"),
@@ -1366,6 +1368,12 @@ _NEEDS_APPROVAL_CMDS = (
      "把输出管进解释器"),
     (re.compile(r"\beval\b|\bexec\b"),
      "eval/exec 执行拼出来的命令"),
+)
+_SCRIPT_DELETES = re.compile(
+    r"rmtree|removedirs|os\.remove|os\.unlink|\.unlink\(|shutil\.move|fs\.rm|rmSync|unlinkSync"
+    r"|\brm\s+-[a-zA-Z]*[rRf]|File\.delete|FileUtils\.rm")
+
+_NEEDS_APPROVAL_CMDS = (
     (re.compile(r"(?:^|[;&|(]\s*)su\b(?!-)"),
      "提权"),
     (re.compile(r"\bgit\s+push\b"),
@@ -1448,7 +1456,7 @@ _CRED_PATHS = re.compile(
     r"(~|\$HOME|\$\{HOME\}|/Users/[^/\s]+|/home/[^/\s]+|/root|/etc)?"   # 可选的家目录前缀
     r"/?\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|pgpass|my\.cnf"
     r"|git-credentials|keychain|Keychains/)"
-    r"|(^|[\s=\"'(:/])\.env(\.[A-Za-z0-9_.-]+)?(\s|$|[\"';)])"          # .env / .env.local
+    r"|(^|[\s=\"'(:/])\.env(?!\.(example|sample|template|dist)\b)(\.[A-Za-z0-9_.-]+)?(\s|$|[\"';)])"  # .env / .env.local；模板不算
     r"|\.(pem|p12|pfx|jks)(\s|$|[\"';)])"                                  # 证书私钥
     r"|\bid_(rsa|dsa|ecdsa|ed25519)\b"
     r"|/etc/(shadow|master\.passwd|sudoers)"
@@ -1612,7 +1620,7 @@ def never_approvable(command: str) -> str:
     return ""
 
 
-def approval_reason(command: str) -> str:
+def approval_reason(command: str, trusted: bool = False) -> str:
     """这条命令要不要**逐次审批**（任何档位都先出卡）。返回原因，空串 = 不需要。
 
     读凭据、git push、提权、丢弃改动、删线上资源、内联解释器等。全授权档也不直接放行。
@@ -1637,4 +1645,13 @@ def approval_reason(command: str) -> str:
         for pattern, reason in _NEEDS_APPROVAL_CMDS:
             if pattern.search(candidate):
                 return reason
+    for candidate in (text, normalized):
+        if not candidate:
+            continue
+        for pattern, reason in _SCRIPT_CMDS:
+            if pattern.search(candidate):
+                if not trusted:
+                    return reason
+                if _SCRIPT_DELETES.search(candidate):
+                    return reason + "（脚本里有删除动作）"
     return ""

@@ -34,13 +34,41 @@ class RedLineSplitTest(unittest.TestCase):
         for cmd in self.PLAIN:
             self.assertEqual(cmdclass.approval_reason(cmd), "", cmd)
 
+    # 2026-11-18 D01 群实测：全授权档一轮 29 张卡，下面这几类是原样摘出来的
+    TRUSTED_SCRIPTS = [
+        "cd ~/work/d01cc && python3 -c \"import json;d=json.load(open('chat1.json'));print(len(d))\"",
+        "python3 - <<'EOF'\nimport json\nprint(1)\nEOF",
+        "lark-cli im +chat-messages-list --chat-id oc_x | python3 -c 'import sys,json;print(1)'",
+        "gh api repos/a/b/contents/.env.example -q .content | base64 -d | head",
+    ]
+    TRUSTED_STILL_ASK = [
+        "python3 -c \"import shutil;shutil.rmtree('/Users/x/proj')\"",
+        "node -e \"require('fs').rmSync('x',{recursive:true})\"",
+        "grep -rIl -i -e FIGMA_TOKEN -e figd_ ~/work",
+        "cat ~/.ssh/id_rsa", "cat .env", "cat .env.local", "git push origin main", "sudo ls",
+    ]
+
+    def test_trusted_lets_plain_scripts_run(self):
+        for cmd in self.TRUSTED_SCRIPTS:
+            self.assertEqual(cmdclass.approval_reason(cmd, trusted=True), "", cmd)
+
+    def test_trusted_still_asks_for_deletes_creds_push(self):
+        for cmd in self.TRUSTED_STILL_ASK:
+            self.assertTrue(cmdclass.approval_reason(cmd, trusted=True), cmd)
+
+    def test_untrusted_still_asks_for_scripts(self):
+        for cmd in self.TRUSTED_SCRIPTS[:3]:
+            self.assertTrue(cmdclass.approval_reason(cmd), cmd)
+
     def test_hook_copy_matches_module(self):
         ns = {}
         exec(compile(approval.HOOK_SOURCE.replace('if __name__ == "__main__":', "if False:"),
                      "hook", "exec"), ns)
-        for cmd in self.HARD + self.ASK + self.PLAIN:
+        for cmd in self.HARD + self.ASK + self.PLAIN + self.TRUSTED_SCRIPTS + self.TRUSTED_STILL_ASK:
             self.assertEqual(ns["never_approvable"](cmd), cmdclass.never_approvable(cmd), cmd)
-            self.assertEqual(ns["approval_reason"](cmd), cmdclass.approval_reason(cmd), cmd)
+            for trusted in (False, True):
+                self.assertEqual(ns["approval_reason"](cmd, trusted),
+                                 cmdclass.approval_reason(cmd, trusted), (cmd, trusted))
 
     def test_claude_hard_deny_list_is_empty(self):
         self.assertEqual(ALWAYS_DENY, ())
@@ -104,6 +132,35 @@ class HookRunTest(unittest.TestCase):
             handle.write("1")
         self.assertEqual(self.run_hook("Bash", cmd)[0], "allow")
         self.assertEqual(self.run_hook("Bash", cmd)[0], "defer")  # 一次批准只放一次
+
+    def test_claude_trusted_inline_script_allowed(self):
+        cmd = {"command": "python3 -c \"import json;print(json.load(open('a.json')))\""}
+        self.assertEqual(self.run_hook("Bash", cmd)[0], "allow")
+        self.assertEqual(self.pending(), [])
+
+    def test_claude_trusted_api_paths_not_outside(self):
+        for command in ['R=repos/a/b/contents; for f in a b; do gh api "$R/$f" > out_$f; done',
+                        'lark-cli api GET "/open-apis/sheets/v3/spreadsheets/x/sheets/query" > s.json',
+                        'echo a/b | tr / _ > n.txt']:
+            self.assertEqual(self.run_hook("Bash", {"command": command})[0], "allow", command)
+
+    def test_claude_trusted_real_outside_write_still_deferred(self):
+        # 临时目录算系统路径不查越界，这里用家目录下一个不存在的文件（不会真写，只判）
+        target = os.path.expanduser("~/sn-hook-test-never-written.txt")
+        self.assertEqual(self.run_hook("Bash", {"command": f"echo hi > {target}"})[0], "defer")
+
+    def test_claude_untrusted_expansion_still_deferred(self):
+        os.remove(os.path.join(self.dir, "TRUSTED"))
+        self.assertEqual(self.run_hook("Bash", {"command": 'gh api "$R/$f" > out.txt'})[0], "defer")
+
+    def test_claude_trusted_deleting_script_deferred(self):
+        cmd = {"command": "python3 -c \"import shutil;shutil.rmtree('build')\""}
+        self.assertEqual(self.run_hook("Bash", cmd)[0], "defer")
+
+    def test_claude_untrusted_inline_script_deferred(self):
+        os.remove(os.path.join(self.dir, "TRUSTED"))
+        cmd = {"command": "python3 -c \"print(1)\""}
+        self.assertEqual(self.run_hook("Bash", cmd)[0], "defer")
 
     def test_claude_credential_read_deferred(self):
         self.assertEqual(self.run_hook("Bash", {"command": "cat ~/.ssh/id_rsa"})[0], "defer")
