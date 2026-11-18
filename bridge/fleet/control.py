@@ -310,7 +310,7 @@ class FleetControl:
 
     def start(self, tool: str, cwd: str, text: str, *, policy: Any = None, approval_dir: str = "",
               timeout: float = 600, model: str = "", on_pid: Any = None, effort: str = "",
-              fork_from: str = "") -> ActionResult:
+              fork_from: str = "", session_id: str = "") -> ActionResult:
         """`fork_from`：复制那个会话的上下文开新会话（同一个工具）。手机上「➕ 新建会话」：在 `cwd` 新开一个会话，`text` 是第一句。
 
         闸门和 `send()` 同一套：工作目录先过 `policy.resolve_workspace`；Claude 按手机档位 + 审批钩子；
@@ -333,6 +333,9 @@ class FleetControl:
                 extra["on_pid"] = on_pid
             if fork_from and can(tool, "fork"):
                 extra["fork_from"] = fork_from
+            if session_id and tool == "claude":
+                # 先定好会话号：这一轮还在跑时，桥上就能按它插话（新建会话第一轮）
+                extra["session_id"] = session_id
             if tool == "claude":
                 result = adapter.start(resolved, text, timeout=timeout, policy=policy, approval_dir=approval_dir,
                                        **extra)

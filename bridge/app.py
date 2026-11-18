@@ -1355,6 +1355,9 @@ class Bridge:
             self._say(chat_id, "我正在装新版，十几秒后就好。好了再发一次这句话。")
             return
 
+        # 一轮还在跑 ⇒ 先说这句话能不能插进去（1.8.0）。插不进才排队。
+        if session.lock.locked() and self._try_steer_local(scope, chat_id, text):
+            return
         # 入队要立刻说一声、带排队深度。否则用户以为机器人死了。
         if session.lock.locked():
             session.waiting += 1
@@ -1373,6 +1376,38 @@ class Bridge:
             finally:
                 session.supersede_next = False
                 session.supersede_text = ""
+
+    def _try_steer_local(self, scope: str, chat_id: str, text: str) -> bool:
+        """私聊里桥自己跑的那一轮还在飞 ⇒ 把这句写进去（docs/product/steering.md）。插进去了 True。
+
+        只认「这一轮真的还开着 stdin」：在等确认卡的那一轮进程已经退了，`steerable` 为假，
+        照旧走作废确认卡 + 排队那条老路。
+        """
+        runner = getattr(self, "runner", None)
+        steerable = getattr(runner, "steerable", None)
+        if steerable is None or not steerable(scope):
+            return False
+        if scope in getattr(self, "_paused", {}):
+            return False
+        reviewer = getattr(self, "reviewer", None)
+        if reviewer is not None:
+            mode = getattr(getattr(self, "policy", None), "mode", "trusted")
+            decision = reviewer.review_request(ReviewContext(text=text, source="human", mode=mode))
+            if decision.verdict is Verdict.DENY:
+                self._say(chat_id, f"⛔️ {decision.reason}")
+                return True
+        try:
+            ok = bool(runner.steer(scope, text))
+        except Exception:  # noqa: BLE001
+            logger.debug("私聊插话失败", exc_info=True)
+            return False
+        if not ok:
+            return False
+        from .fleet.claude import STEER_OK
+
+        logger.info("私聊插话 结果=插进 scope=%s 字数=%d", scope[:16], len(text))
+        self._say(chat_id, STEER_OK)
+        return True
 
     def _supersede_pending_approvals(self, scope: str, chat_id: str) -> None:
         """有确认卡挂着、他又发了一句新话 ⇒ 先把那张卡作废，并明说一句。
@@ -1615,6 +1650,7 @@ class Bridge:
                     policy=policy,
                     on_text=on_text,
                     on_session=on_session,
+                    steer_key=scope,
                 )
             finally:
                 stop.set()
@@ -3551,6 +3587,21 @@ class Bridge:
             return True
         target, expired = control.peek_pending_fresh(scope)
         if target is None:
+            # 新建会话的第一轮还在跑、群还没建好 ⇒ 这句也插进去（1.8.0），不落进桥自己的 claude
+            busy = (getattr(self, "_fleet_inflight", {}) or {}).get(scope)
+            from .fleet.newsession import INFLIGHT_ID as _NEW_ID
+
+            if busy and busy[1] != _NEW_ID:
+                from types import SimpleNamespace
+
+                from .fleet.model import can as _can
+
+                if _can(busy[0], "steer") and await self._try_steer(
+                        scope, chat_id, SimpleNamespace(tool=busy[0], id=busy[1]), text):
+                    return True
+                if _can(busy[0], "steer"):
+                    self._say(chat_id, "新会话第一轮正好在收尾，这句没插进去。等它回来再说一次。")
+                    return True
             if expired:
                 logger.info("对话模式 过期：目标超过时限，这条按平常处理 scope=%s", scope[:16])
                 stale = control.clear_pending(scope)
@@ -5332,7 +5383,14 @@ class Bridge:
         policy = _full_access(policy)
         state.disarm(scope)
         label = TOOL_LABELS.get(tool, tool)
-        inflight[scope] = (tool, INFLIGHT_ID)
+        if tool == "claude":
+            # 1.8.0：会话号先定好、先登记 ⇒ 第一轮还在跑时再说的话能插进去（见 _maybe_send_to_fleet）
+            import uuid
+
+            new_sid = str(uuid.uuid4())
+        else:
+            new_sid = ""
+        inflight[scope] = (tool, new_sid or INFLIGHT_ID)
         logger.info("新建会话 发出 tool=%s 字数=%d", tool, len(text))
         quiet = bool(card_msg_id)
         if not quiet:
@@ -5359,6 +5417,7 @@ class Bridge:
                 timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
                 model=start_model, effort=start_effort,
                 **({"fork_from": armed["fork_from"]} if armed.get("fork_from") else {}),
+                **({"session_id": new_sid} if new_sid else {}),
             )
         finally:
             inflight.pop(scope, None)
