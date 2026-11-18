@@ -1840,6 +1840,10 @@ class Bridge:
             return P2CardActionTriggerResponse(
                 {"toast": {"type": "error", "content": _CARD_TOASTS[ApprovalStore.FORBIDDEN]}}
             )
+        if isinstance(value, dict) and value.get("pm") == "?":
+            # 1.4.1 全局权限下拉：选中的档在回调的 option 里，换进来再走原来那条白名单
+            option = getattr(getattr(event, "action", None), "option", None)
+            value = dict(value, pm=option if isinstance(option, str) else "")
         text = resolve_click(value)
         # 记是哪个按钮（只记预设的 cmd / 问句键，不记正文）：第 28 轮想按真实点击给菜单卡排序时，
         # 日志里 33 次点击一次都看不出点的是哪个
@@ -1952,9 +1956,93 @@ class Bridge:
             if not prefs.last_save_ok:
                 said += "\n⚠️ 这次没存下来，重启后会回到配置里那一档。"
             logger.info("菜单卡 全局权限 要=%s 实际=%s", picked, applied)
-            card = build_menu_card("", self.policy, self._default_model_texts())
+            card = self._menu_card_json("")
             return f"全局权限：{label}", card, said
         return None
+
+    def _menu_card_json(self, where: str = "", scope: str = "") -> str:
+        from .menu import build_menu_card
+
+        return build_menu_card(where, self.policy, self._default_model_texts(), self._menu_model_pick(scope))
+
+    def _menu_model_pick(self, scope: str = "", tool: str = "") -> "dict | None":
+        """/m 卡「默认模型」那两行要的东西：工具（默认上次在 /m 选的，没有就上次开新会话用的）、模型、强度。"""
+        from .fleet.catalog import TOOLS
+
+        mp = getattr(self, "model_prefs", None)
+        if mp is None:
+            return None
+        picks = self.__dict__.setdefault("_mm_tool", {})
+        tool = tool or picks.get(scope) or picks.get("*") or ""
+        if tool not in TOOLS:
+            try:
+                tool = self._ns_last_tool(scope)
+            except Exception:  # noqa: BLE001
+                tool = ""
+        if tool not in TOOLS:
+            tool = TOOLS[0]
+        try:
+            choice = mp.default(tool)
+            models = list(mp.catalog.names(tool))
+            efforts = list(mp.catalog.efforts(tool, choice.model))
+        except Exception:  # noqa: BLE001
+            logger.exception("/m 卡默认模型读不出来")
+            return None
+        return {"tool": tool, "tools": list(TOOLS), "models": models[:30], "model": choice.model,
+                "efforts": efforts, "effort": choice.effort}
+
+    def _on_mm_click(self, event, clicker: str, value: dict):
+        """/m 卡上的默认模型下拉：选工具 ⇒ 换成那个工具的模型 / 强度；选模型 / 强度 ⇒ 当场设成默认。卡片原地刷新。"""
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            P2CardActionTriggerResponse,
+        )
+
+        from .fleet.catalog import LABELS
+        from .menu import resolve_mm_click
+
+        def reply(kind: str, text: str, card: str = ""):
+            body = {"toast": {"type": kind, "content": text}}
+            if card:
+                body["card"] = {"type": "raw", "data": json.loads(card)}
+            return P2CardActionTriggerResponse(body)
+
+        if clicker not in self.settings.owner_open_ids:
+            return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
+        click = resolve_mm_click(value, getattr(getattr(event, "action", None), "option", None))
+        mp = getattr(self, "model_prefs", None)
+        if click is None or mp is None:
+            return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
+        chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""
+        scope = f"dm:{clicker}"
+        tool, pick = click["tool"], click["pick"]
+        picks = self.__dict__.setdefault("_mm_tool", {})
+        picks[scope] = picks["*"] = tool
+        logger.info("菜单卡 默认模型 op=%s tool=%s", click["op"], tool)
+        if click["op"] == "tool":
+            return reply("info", f"选 {LABELS.get(tool, tool)} 的默认模型", self._menu_card_json("", scope))
+        if click["op"] == "model":
+            if pick == "d":
+                name = ""
+            else:
+                names = mp.catalog.names(tool)
+                idx = int(pick[1:])
+                if idx >= len(names):
+                    return reply("error", "模型列表变了，重新选一次", self._menu_card_json("", scope))
+                name = names[idx]
+            ok = mp.set_default(tool, model=name)
+            if ok and name and tool == "claude" and getattr(self, "prefs", None) is not None:
+                from .policy import known_model
+
+                if known_model(name):
+                    self.prefs.set_model(name)
+        else:
+            ok = mp.set_default(tool, effort="" if pick == "d" else pick)
+        if not ok:
+            return reply("error", "这一项现在不能选，刷新后再试", self._menu_card_json("", scope))
+        now = mp.default(tool)
+        if chat_id:
+            self._say_later(chat_id, f"🧠 {LABELS.get(tool, tool)} 默认：**{now.text()}**。以后新建的会话用它。")
+        return reply("success", f"{LABELS.get(tool, tool)} 默认：{now.text()}", self._menu_card_json("", scope))
 
     def _default_model_texts(self) -> list:
         """/m 卡「默认模型」那一行：[(工具名, 现在的默认模型)]。没设过 ⇒ 写工具自己配置的那个。"""
@@ -1999,7 +2087,7 @@ class Bridge:
             if where.startswith(home):
                 where = "~" + where[len(home):]
         sender = getattr(self.replier, "send_card", None)
-        if sender is None or not sender(chat_id, build_menu_card(where, self.policy, self._default_model_texts())):
+        if sender is None or not sender(chat_id, self._menu_card_json(where, scope)):
             # 卡片发不出去就退化成文字帮助 —— 别让用户叫菜单却什么都没收到
             self._say(chat_id, HELP)
 
@@ -2128,6 +2216,8 @@ class Bridge:
                 return self._on_model_click(event, clicker, value)
             if value.get("act") == "sp":
                 return self._on_session_perm_click(event, clicker, value)
+            if value.get("act") == "mm":
+                return self._on_mm_click(event, clicker, value)
             if value.get("act") == "sc":
                 return self._on_status_card_click(event, clicker, value)
             if value.get("act") == "ch":
@@ -6729,7 +6819,7 @@ class Bridge:
 
         if clicker not in self.settings.owner_open_ids:
             return reply("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN])
-        target = sessperm.resolve_click(value)
+        target = sessperm.resolve_click(value, getattr(getattr(event, "action", None), "option", None))
         if target is None:
             return reply("error", _CARD_TOASTS[ApprovalStore.MALFORMED])
         chat_id = getattr(getattr(event, "context", None), "open_chat_id", "") or ""
