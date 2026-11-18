@@ -51,8 +51,12 @@ class CardLayoutTest(unittest.TestCase):
         second = [n.get("placeholder", {}).get("content") for n in _tags(rows[1], "select_static")]
         self.assertEqual(first, ["工具", "项目"])
         self.assertEqual(second, ["模型", "强度"])
-        self.assertEqual([n["name"] for n in _tags(rows[2], "input")], [nscard.TEXT_INPUT])
-        self.assertEqual([b["text"]["content"] for b in _tags(rows[2], "button")], ["▶ 开始"])
+        form = _tags(card, "form")[0]
+        self.assertEqual([n["name"] for n in _tags(form, "input")],
+                         [nscard.NAME_INPUT, nscard.SESSION_INPUT, nscard.TEXT_INPUT])
+        start = [b for b in _tags(form, "button")]
+        self.assertEqual([b["text"]["content"] for b in start], ["▶ 开始"])
+        self.assertEqual(start[0]["form_action_type"], "submit")
 
     def test_ns02_defaults_selected(self):
         _, draft = _draft(tool="codex")
@@ -73,33 +77,45 @@ class CardLayoutTest(unittest.TestCase):
                                                "value": "new"})
         self.assertNotIn("/w/a", json.dumps(card))
 
-    def test_ns04_new_project_name_input_replaces_project_dropdown(self):
+    def test_ns04_project_box_prefilled_from_dropdown_and_session_name_recommended(self):
+        _, draft = _draft()
+        draft.proj = 1
+        boxes = {n["name"]: n for n in _tags(self.build(draft), "input")}
+        self.assertEqual(boxes[nscard.NAME_INPUT]["default_value"], "b")
+        self.assertEqual(boxes[nscard.SESSION_INPUT]["default_value"], "b")
+        self.assertNotIn("default_value", boxes[nscard.TEXT_INPUT])
+
+    def test_ns04b_new_project_clears_boxes_keeps_dropdown(self):
         _, draft = _draft()
         draft.proj = None
         card = self.build(draft)
-        rows = _rows(card)
-        self.assertEqual([n["placeholder"]["content"] for n in _tags(rows[0], "select_static")], ["工具"])
-        self.assertEqual([n["name"] for n in _tags(rows[0], "input")], [nscard.NAME_INPUT])
-        self.assertEqual(_tags(rows[0], "input")[0]["max_length"], nscard.MAX_PROJECT_NAME)
-        self.assertNotIn("项目", [n["placeholder"]["content"] for n in _tags(card, "select_static")])
-        self.assertEqual([n["name"] for n in _tags(card, "input")], [nscard.NAME_INPUT, nscard.TEXT_INPUT])
-        self.assertIn("📂 选已有项目", [b["text"]["content"] for b in _tags(card, "button")])
+        proj = next(n for n in _tags(card, "select_static") if n["placeholder"]["content"] == "项目")
+        self.assertEqual(proj["initial_option"], "new")
+        boxes = {n["name"]: n for n in _tags(card, "input")}
+        self.assertNotIn("default_value", boxes[nscard.NAME_INPUT])
+        self.assertNotIn("default_value", boxes[nscard.SESSION_INPUT])
+        self.assertNotIn("📂 选已有项目", json.dumps(card, ensure_ascii=False))
 
-    def test_ns04b_no_back_button_without_projects(self):
-        _, draft = _draft(projects=[])
-        draft.proj = None
-        self.assertNotIn("📂 选已有项目", [b["text"]["content"] for b in _tags(self.build(draft), "button")])
+    def test_ns04c_recommend_session_name(self):
+        self.assertEqual(nscard.recommend_session_name("~/work/AI_native"), "AI_native")
+        self.assertEqual(nscard.recommend_session_name("~"), "")
+        self.assertEqual(nscard.recommend_session_name(""), "")
 
     def test_ns05_no_effort_row_cell_for_opencode(self):
         _, draft = _draft(tool="opencode")
         card = self.build(draft, efforts=())
         self.assertEqual([n["placeholder"]["content"] for n in _tags(_rows(card)[1], "select_static")], ["模型"])
 
-    def test_ns06_nothing_inside_form(self):
+    def test_ns06_dropdowns_outside_form_inputs_inside(self):
         _, draft = _draft()
-        self.assertEqual(_tags(self.build(draft), "form"), [])
-        for node in _tags(self.build(draft), "input") + _tags(self.build(draft), "select_static"):
+        card = self.build(draft)
+        form = _tags(card, "form")[0]
+        self.assertEqual(_tags(form, "select_static"), [])
+        for node in _tags(card, "select_static"):
             self.assertEqual(node["behaviors"][0]["type"], "callback")
+        self.assertEqual(len(_tags(card, "input")), len(_tags(form, "input")))
+        for node in _tags(form, "input"):
+            self.assertNotIn("behaviors", node)
 
     def test_starting_card_has_no_input(self):
         card = nscard.build_starting_card("codex", "proj", "缺省（gpt-6-sol）", "hi")
@@ -117,7 +133,10 @@ class ResolveClickTest(unittest.TestCase):
         self.assertIsNone(nscard.resolve_click(nscard.value("proj", "abc"), "/etc"))
         self.assertIsNone(nscard.resolve_click(nscard.value("model", "abc"), "gpt-6-sol"))
         self.assertEqual(nscard.resolve_click(nscard.value("model", "abc"), "m3")["pick"], "m3")
-        self.assertEqual(nscard.resolve_click(nscard.value("send", "abc"), None, "  hello ")["text"], "hello")
+        got = nscard.resolve_click(nscard.value("go", "abc"), None,
+                                   {nscard.TEXT_INPUT: "  hello ", nscard.NAME_INPUT: " demo ", nscard.SESSION_INPUT: 3})
+        self.assertEqual((got["text"], got["project"], got["session"]), ("hello", "demo", ""))
+        self.assertIsNone(nscard.resolve_click(nscard.value("go", "abc"), None, None)["text"] or None)
         self.assertIsNone(nscard.resolve_click({"act": "nsc", "op": "go", "n": "../x"}))
 
     def test_draft_scope_and_expiry(self):
@@ -179,8 +198,8 @@ def make_bridge(root):
     return bridge
 
 
-def event(value, option=None, text=None, mid="om_card"):
-    return SimpleNamespace(action=SimpleNamespace(value=value, option=option, input_value=text),
+def event(value, option=None, form=None, mid="om_card"):
+    return SimpleNamespace(action=SimpleNamespace(value=value, option=option, form_value=form, input_value=None),
                            context=SimpleNamespace(open_message_id=mid, open_chat_id="oc_dm"))
 
 
@@ -202,10 +221,21 @@ class BridgeFlowTest(unittest.TestCase):
         nonce = next(n for n in _walk(card) if n.get("act") == "nsc")["n"]
         return card, nonce
 
-    def click(self, op, nonce, option=None, text=None):
-        res = self.bridge._on_ns_card_click(event(nscard.value(op, nonce), option, text), "ou_me",
+    def click(self, op, nonce, option=None, form=None):
+        res = self.bridge._on_ns_card_click(event(nscard.value(op, nonce), option, form), "ou_me",
                                             nscard.value(op, nonce))
         return res.toast.content if res.toast else "", (res.card.data if res.card else None)
+
+    def go(self, nonce, project=None, session=None, text=None):
+        """点「开始」：form_value 带回三个框（None = 那个框没出现在 form_value 里）。"""
+        form = {k: v for k, v in ((nscard.NAME_INPUT, project), (nscard.SESSION_INPUT, session),
+                                  (nscard.TEXT_INPUT, text)) if v is not None}
+        jobs = []
+        self.bridge._loop = SimpleNamespace(call_soon_threadsafe=lambda f: None)
+        self.bridge._ns_card_run = lambda *a: jobs.append(a) or _noop()
+        with mock.patch.object(asyncio, "run_coroutine_threadsafe", lambda coro, loop: coro.close()):
+            toast, card = self.click("go", nonce, None, form)
+        return toast, card, jobs
 
     def test_ns09_menu_and_ns_send_same_card(self):
         asyncio.run(self.bridge._handle_newsession_command("dm:ou_me", "oc_dm", "/ns"))
@@ -222,62 +252,65 @@ class BridgeFlowTest(unittest.TestCase):
                          ["缺省（gpt-6-sol）", "gpt-6-sol", "gpt-6-luna"])
         self.assertEqual(model_sel["initial_option"], "def")
 
-    def test_ns11_last_tool_is_default_next_time(self):
+    def test_ns11_default_tool_is_claude_even_after_codex(self):
         _, nonce = self.send_card("codex")
-        with mock.patch.object(asyncio, "run_coroutine_threadsafe", lambda coro, loop: coro.close()):
-            self.bridge._loop = SimpleNamespace(call_soon_threadsafe=lambda f: None)
-            self.click("go", nonce)
+        self.go(nonce)
         fresh = make_bridge(self.root)
         fresh._send_ns_card("dm:ou_me", "oc_dm")
         tool_sel = next(n for n in _tags(fresh.cards[-1], "select_static") if n["placeholder"]["content"] == "工具")
-        self.assertEqual(tool_sel["initial_option"], "codex")
+        self.assertEqual(tool_sel["initial_option"], "claude")
 
     def test_ns12_go_without_text_uses_hi_and_starting_card(self):
         _, nonce = self.send_card("claude")
-        jobs = []
-        self.bridge._loop = SimpleNamespace(call_soon_threadsafe=lambda f: None)
-        self.bridge._ns_card_run = lambda *a: jobs.append(a) or _noop()
-        with mock.patch.object(asyncio, "run_coroutine_threadsafe", lambda coro, loop: coro.close()):
-            toast, card = self.click("go", nonce)
+        toast, card, jobs = self.go(nonce)
         self.assertEqual(toast, "正在开")
         self.assertEqual(card["header"]["title"]["content"], "⏳ 正在开新会话")
-        self.assertEqual(jobs[0][-1], "hi")
+        self.assertEqual(jobs[0][8], "hi")
         self.assertEqual(jobs[0][2], "om_card")
-        self.assertEqual(jobs[0][3:5], ("claude", os.path.join(self.root, "alpha")))
+        self.assertEqual(jobs[0][3:6], ("claude", os.path.join(self.root, "alpha"), ""))
+        self.assertEqual(jobs[0][9], "alpha")
+        self.assertIn("会话名：alpha", json.dumps(card, ensure_ascii=False))
         self.assertEqual(self.click("go", nonce)[0], "这张卡已经过期了，点「➕ 新建会话」再开一张")
 
-    def test_ns13_enter_sends_text_with_model_and_effort(self):
+    def test_ns13_start_carries_form_text_model_effort_and_session_name(self):
+        """FC-35：填完字直接点「开始」，不按回车，字都要带上（1.5.1 手机上丢字的回归）。"""
         _, nonce = self.send_card("codex")
-        self.click("proj", nonce, "p1")
+        _, card = self.click("proj", nonce, "p1")
+        box = next(n for n in _tags(card, "input") if n["name"] == nscard.NAME_INPUT)
+        self.assertEqual(box["default_value"], os.path.join(self.root, "beta"))
         self.click("model", nonce, "m1")
         self.click("effort", nonce, "e2")
-        jobs = []
-        self.bridge._loop = SimpleNamespace(call_soon_threadsafe=lambda f: None)
-        self.bridge._ns_card_run = lambda *a: jobs.append(a) or _noop()
-        with mock.patch.object(asyncio, "run_coroutine_threadsafe", lambda coro, loop: coro.close()):
-            self.click("send", nonce, None, "只回复 OK")
-        scope, chat, mid, tool, project, new_name, model, effort, text = jobs[0]
-        self.assertEqual((tool, project, model, effort, text),
-                         ("codex", os.path.join(self.root, "beta"), "gpt-6-luna", "high", "只回复 OK"))
+        _, _, jobs = self.go(nonce, project=os.path.join(self.root, "beta"), session="修登录", text="只回复 OK")
+        scope, chat, mid, tool, project, new_path, model, effort, text, name = jobs[0]
+        self.assertEqual((tool, project, new_path, model, effort, text, name),
+                         ("codex", os.path.join(self.root, "beta"), "", "gpt-6-luna", "high", "只回复 OK", "修登录"))
 
-    def test_ns14_new_project_requires_valid_name(self):
+    def test_ns14_typed_project_name_creates_new_dir(self):
+        """FC-36：项目框里填新名字 ⇒ 在新建根下建目录；会话名不填 ⇒ 用新项目名。"""
+        self.bridge._ns_new_root = self.root
         _, nonce = self.send_card()
         _, card = self.click("proj", nonce, "new")
-        self.assertIn(nscard.NAME_INPUT, [n["name"] for n in _tags(card, "input")])
-        self.assertIn("项目名只能用", self.click("pname", nonce, None, "../etc")[0])
-        self.assertEqual(self.click("go", nonce)[0], "先填新项目名")
-        toast, card = self.click("back", nonce)
-        self.assertEqual(toast, "换回已有项目")
-        self.assertIn("项目", [n["placeholder"]["content"] for n in _tags(card, "select_static")])
-        self.assertEqual([n["name"] for n in _tags(card, "input")], [nscard.TEXT_INPUT])
-        self.click("proj", nonce, "new")
-        self.assertEqual(self.click("pname", nonce, None, "demo-1")[0], "记下了，接着说第一句")
-        jobs = []
-        self.bridge._loop = SimpleNamespace(call_soon_threadsafe=lambda f: None)
-        self.bridge._ns_card_run = lambda *a: jobs.append(a) or _noop()
-        with mock.patch.object(asyncio, "run_coroutine_threadsafe", lambda coro, loop: coro.close()):
-            self.click("go", nonce)
-        self.assertEqual((jobs[0][4], jobs[0][5]), ("", "demo-1"))
+        self.assertEqual(self.go(nonce)[0], "先在「项目」框里填项目名（新名字会在 ~/work 下新建）")
+        _, nonce = self.send_card()
+        self.assertIn("项目名只能用", self.go(nonce, project="../etc")[0])
+        _, nonce = self.send_card()
+        toast, card, jobs = self.go(nonce, project="demo-1")
+        self.assertEqual(toast, "正在开")
+        self.assertEqual((jobs[0][4], jobs[0][5], jobs[0][9]), ("", os.path.join(self.root, "demo-1"), "demo-1"))
+
+    def test_ns14b_typed_existing_dir_or_label_reuses_it(self):
+        """FC-37：项目框里填的是已有目录 / 列表里的项目 ⇒ 直接用，不新建。"""
+        self.bridge._ns_new_root = self.root
+        os.makedirs(os.path.join(self.root, "gamma"))
+        _, nonce = self.send_card()
+        _, _, jobs = self.go(nonce, project="gamma")
+        self.assertEqual((jobs[0][4], jobs[0][5], jobs[0][9]), (os.path.join(self.root, "gamma"), "", "gamma"))
+        _, nonce = self.send_card()
+        _, _, jobs = self.go(nonce, project=os.path.join(self.root, "beta"), session="")
+        self.assertEqual((jobs[0][4], jobs[0][5], jobs[0][9]), (os.path.join(self.root, "beta"), "", "beta"))
+        open(os.path.join(self.root, "afile"), "w").close()
+        _, nonce = self.send_card()
+        self.assertIn("同名文件", self.go(nonce, project="afile")[0])
 
     def test_ns15_non_owner_and_forged_rejected(self):
         _, nonce = self.send_card()
@@ -307,6 +340,11 @@ class BridgeFlowTest(unittest.TestCase):
         asyncio.run(bridge._ns_card_run("dm:ou_me", "oc_dm", "om_card", "codex", os.path.join(self.root, "beta"),
                                         "", "gpt-6-luna", "high", "hi"))
         self.assertEqual(calls["armed"]["model"], "gpt-6-luna")
+        asyncio.run(bridge._ns_card_run("dm:ou_me", "oc_dm", "om_card", "codex", os.path.join(self.root, "beta"),
+                                        "", "", "", "hi", "修登录"))
+        self.assertEqual(calls["armed"]["name"], "修登录")
+        asyncio.run(bridge._ns_card_run("dm:ou_me", "oc_dm", "om_card", "codex", os.path.join(self.root, "beta"),
+                                        "", "gpt-6-luna", "high", "hi"))
         self.assertEqual(calls["armed"]["effort"], "high")
         self.assertEqual(calls["armed"]["name"], "beta")
         self.assertEqual(calls["card"], "om_card")
