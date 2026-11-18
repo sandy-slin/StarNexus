@@ -5056,6 +5056,9 @@ class Bridge:
                     return reply("error", "这个强度认不出来，重新选一下", result="拒绝:强度下标")
                 draft.effort = efforts[idx]
             return reply("info", "换好了", self._ns_card(draft), "换强度")
+        if op == "back":
+            draft.proj = 0 if draft.projects else None
+            return reply("info", "换回已有项目", self._ns_card(draft), "选已有项目")
         if op == "pname":
             name = click["text"].strip()
             if not _re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff._-]{0,47}", name or ""):
@@ -5071,7 +5074,7 @@ class Bridge:
                          "拒绝:没装")
         if draft.proj is None:
             if not draft.new_name:
-                return reply("error", "先填新项目名", self._ns_card(draft, "先在上面填新项目名，回车确认。"), "没项目名")
+                return reply("error", "先填新项目名", self._ns_card(draft, "先在项目那一格填新项目名，按回车。"), "没项目名")
             project, project_label = "", draft.new_name
         else:
             project, project_label = draft.projects[draft.proj]
