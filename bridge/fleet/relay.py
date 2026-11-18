@@ -656,7 +656,14 @@ class Relay:
         self._sleep = sleep
         self.resend_guard_sec = float(resend_guard_sec)
         self.last_error = ""
+        # 🔴 1.9.4：原来一把锁管所有会话 ⇒ 一个会话在等回复（最长几分钟），别的会话群里
+        # 说话全回「上一句还在送」（2026-11-18 22:38 两个 multica 群互相挡住）。
+        # 现在：同一个会话一次一句（`_sid_locks`）；共用的信使只在「写进去」那一下加锁（`_courier_lock`），
+        # 等送达 / 等回复各读各的 jsonl，可以并行。
         self._lock = threading.Lock()
+        self._sid_locks: dict = {}
+        self._sid_guard = threading.Lock()
+        self._courier_lock = threading.Lock()
         self._attempts: dict = {}
         cwd = courier_cwd or os.path.join(
             os.path.expanduser(getattr(adapter, "bridge_home", "~/.claude-feishu-bridge")), "relay"
@@ -802,6 +809,11 @@ class Relay:
 
     def _remember(self, sid: str, text: str, *, delivered: bool, replied: bool,
                   handed: bool = False) -> None:
+        with self._lock:  # 几个会话并行发 ⇒ 这张表要锁着改
+            self._remember_locked(sid, text, delivered=delivered, replied=replied, handed=handed)
+
+    def _remember_locked(self, sid: str, text: str, *, delivered: bool, replied: bool,
+                         handed: bool = False) -> None:
         key = self._attempt_key(sid, text)
         att = self._attempts.get(key)
         if att is None or self._now() - att.at >= self.resend_guard_sec:
@@ -835,7 +847,9 @@ class Relay:
             return ActionResult(False, WHY_BAD_ID, sid)
         if not text:
             return ActionResult(False, WHY_EMPTY, sid)
-        if not self._lock.acquire(blocking=False):
+        with self._sid_guard:
+            lock = self._sid_locks.setdefault(sid, threading.Lock())
+        if not lock.acquire(blocking=False):
             return ActionResult(False, WHY_BUSY_RELAY, sid)
         try:
             blocked = self._blocked_attempt(sid, text)
@@ -851,7 +865,7 @@ class Relay:
         except Exception as exc:  # 绝不抛给上层
             return ActionResult(False, friendly_error(exc, log_as=f"relay 发送失败 sid={sid}"), sid)
         finally:
-            self._lock.release()
+            lock.release()
 
     def _send_locked(self, sid: str, text: str, timeout: float, delivery_timeout: float) -> ActionResult:
         decision = self.check(sid)
@@ -865,10 +879,11 @@ class Relay:
         # 落地判据要一字不差 ⇒ 后面比对也得用 `wire` 这一份。
         wire = wire_text(text)
         courier = self.courier_for(target.mode_class)
-        why = courier.write(target.name, wire)
-        if why:
-            return ActionResult(False, why, sid)
-        ident = courier.identity()
+        with self._courier_lock:
+            why = courier.write(target.name, wire)
+            if why:
+                return ActionResult(False, why, sid)
+            ident = courier.identity()
         deadline = self._now() + max(timeout, 0)
         hit, offset = self._wait_delivery(
             target.jsonl, start, wire, ident,

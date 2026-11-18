@@ -3530,6 +3530,17 @@ class Bridge:
         gate.write_workspaces(scope, (project,) if project and os.path.isdir(project) else policy.workspaces)
         return gate.dir_for(scope)
 
+    def _moved_away(self, scope: str, tool: str, sid: str) -> bool:
+        """这个群原来绑着这个会话、现在被挪到别的群了（绑定 on=False）⇒ True，不能再往它转发（1.9.4）。"""
+        if not str(scope).startswith("group:"):
+            return False
+        binds = getattr(self, "chat_binds", None)
+        try:
+            bound = binds.of_scope(scope) if binds is not None else None
+        except Exception:  # noqa: BLE001
+            return False
+        return bound is not None and not bound.on and (bound.tool, bound.id) == (tool, sid)
+
     async def _try_steer(self, scope: str, chat_id: str, target, text: str) -> bool:
         """同一个会话这一轮还在跑 ⇒ 把这句插进去（docs/product/steering.md）。插进去了返回 True。
 
@@ -3746,7 +3757,11 @@ class Bridge:
         quit_asked = getattr(self, "_talk_quit", {}).pop(scope, None)
         now_target = control.peek_pending(scope)
         switched = now_target is not None and (now_target.tool, now_target.id) != (target.tool, target.id)
-        if quit_asked:
+        # 🔴 1.9.4：这一轮在跑时会话被挪到了别的群（旧群绑定 on=False）⇒ 不能把目标续回来。
+        # 2026-11-18 22:42 实测：旧群已经说了「不再往它转发」，22:43 那轮回来又把目标续上，
+        # 22:44 旧群里的话照样进了那个会话。
+        moved_away = self._moved_away(scope, target.tool, target.id)
+        if quit_asked or moved_away:
             control.clear_pending(scope)
         elif result.delivered or result.ok:
             if not switched:

@@ -123,3 +123,11 @@
 - 范围：会话群里的 Claude（`fleet/claude.py`）和私聊里桥自己跑的 Claude（`runner.py`）。Codex 用 turn/steer、opencode 用 delivery=steer，不需要这层提醒。
 - 代价：插话后，正在排队的下一步工具调用会被拦一次。模型如果判断插话和这一步无关，会重新发起这一步。
 - 验证：单测 `tests/test_steer_nudge.py` 8 条；真机回归 steer_claude 连续 3 次通过，steer_dm、steer_first_turn 通过。
+
+
+## 1.9.4：几个会话群同时聊不再互相挡住
+
+- 现象（2026-11-18 22:38–22:44 两个 multica 群）：一个群在等终端 Claude 回复时，另一个群说话全回「❌ 没发进去：上一句还在送」。
+- 根因：进会话聊天（relay）只有一把全局锁，等回复的几分钟里所有会话都被挡住。现在改成每个会话一把锁；共用的信使只在写进去那一下加锁，等回复各读各的会话记录。
+- 同一轮还修了两处：会话改绑到新群后，旧群那一轮回来不再把转发目标续上（`Bridge._moved_away`）；Codex App 正在跑这个会话时，排队的那句不再被说成「电脑上没人开着」（`RELAY_QUEUED_BUSY`）。
+- 验证：单测 `tests/test_relay_concurrency.py` 9 条；两个真实终端 Claude 会话复现：旧代码 B 12 秒就回「上一句还在送」，新代码 B 在 A 忙的时候回了 RELAY-B-OK；真机回归 13 条全过。

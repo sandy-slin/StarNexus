@@ -173,6 +173,12 @@ RELAY_QUEUED_NOBODY_HOME = (
     "话已经排进去了，但这会儿电脑上没人开着这个会话，所以没人处理。"
     "等在 Codex App 或终端里打开它，这句会自动接上。"
 )
+# 🔴 1.9.4：App / 终端开着、正忙着上一轮 ⇒ 不是「没人开着」（2026-11-18 22:58 实测误报：
+# Codex App 正在跑这个会话的长任务，手机上那句排在队里，等这一轮干完才会被取走）。
+RELAY_QUEUED_BUSY = (
+    "话已经排进去了。电脑上这个会话正忙着上一轮，干完就会处理这句，回复会出现在电脑上那个会话里。"
+    "不用重发。"
+)
 RELAY_DELIVERED_NO_TEXT = "它处理完了这句，但没有写文字回复。"
 RELAY_ABORTED = "它把这一轮取消了（电脑上按了停，或者它自己中断了）。"
 # 停：实测只能在对方自己那边停，别装；排进去的那句也撤不回来
@@ -1286,10 +1292,11 @@ class CodexAdapter(Adapter):
             detail = short_title(blob.strip().splitlines()[-1] if blob.strip() else "", 120)
             return ActionResult(False, "没排进去" + (f"：{detail}" if detail else "。"), tid)
         # 行写进去了 ⇒ 从这里开始，一律 delivered=True：绝不说「没发进去」（用户会重发）
-        return self._await_reply(tid, text, marks, timeout, poll, min_timeout)
+        return self._await_reply(tid, text, marks, timeout, poll, min_timeout, owner=owner)
 
     def _await_reply(self, tid: str, text: str, marks: dict, timeout: float,
-                     poll: float, min_timeout: float = RELAY_MIN_TIMEOUT_SEC) -> ActionResult:
+                     poll: float, min_timeout: float = RELAY_MIN_TIMEOUT_SEC,
+                     owner: str = "") -> ActionResult:
         """盯目标自己的 rollout：先等我们这句的 user 回显（真送达），再等它后面的回复。"""
         limit = max(float(min_timeout or 0.0), float(timeout or RELAY_TIMEOUT_SEC))
         step = max(0.05, float(poll or RELAY_POLL_SEC))
@@ -1314,6 +1321,8 @@ class CodexAdapter(Adapter):
             return ActionResult(False, RELAY_DELIVERED_NO_TEXT, tid, delivered=True)
         pending = self.pending_queued(tid)
         if pending:
+            if owner in ("app", "terminal"):
+                return ActionResult(False, RELAY_QUEUED_BUSY, tid, delivered=True)
             return ActionResult(False, RELAY_QUEUED_NOBODY_HOME, tid, delivered=True)
         return ActionResult(False, RELAY_QUEUED_NO_REPLY, tid, delivered=True)
 
