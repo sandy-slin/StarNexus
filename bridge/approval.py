@@ -1021,6 +1021,16 @@ def main() -> None:
     # Claude Code 会**用同一个 tool_use_id 再调一次钩子**；这里 deny ⇒ 会话里那条 tool_result
     # 就是下面这句（原来是 `[Tool result missing due to internal error]`，模型不知道是你没批）。
     # 只会更严：deny 永远不放行任何东西，红线照样挡（下面那段在它之后也是 deny）。
+    # 1.9.3 中途插话：Claude Code 把插话放进 system-reminder，模型常常无视它、继续原计划
+    # （2026-11-18 22:35 自动更新后 steer_claude 连续失败，会话记录里插话在，模型照跑 10 次 sleep）。
+    # 服务端写插话时落一个 STEER 标记；下一次工具调用拦一下，让模型先看新消息。只拦一次。
+    steer = _take_steer(directory)
+    if steer is not None:
+        decide("deny", "先别执行这一步：用户刚在聊天里插了一句新的话（就在这条消息附近的"
+                       "「The user sent a new message」提示里）。先读那句话，按它的最新要求做；"
+                       "如果它让你停下或换方向，就不要再继续原来的计划。"
+                       + (f"他说的是：「{steer}」" if steer else ""))
+
     reply = _take_reply(directory, digest(tool_name, tool_input), session_id)
     if reply is not None:
         if reply:
@@ -1187,6 +1197,30 @@ def _consume_grant(directory, key):
     except OSError:
         pass
     return age <= _GRANT_TTL_SEC
+
+
+_STEER_TTL_SEC = 600
+
+
+def _take_steer(directory):
+    """服务端刚写进一句插话 ⇒ 兑换掉 STEER 标记（一次性），返回原话；没有或过期返回 None。"""
+    path = os.path.join(directory, "STEER")
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        text = ""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    if age > _STEER_TTL_SEC:
+        return None
+    return text.strip()[:300]
 
 
 def _take_reply(directory, key, session_id):
@@ -1704,6 +1738,35 @@ _INHERIT_ENV_KEYS = (
 )
 
 _INHERIT_TOP_KEYS = ("apiKeyHelper", "awsAuthRefresh", "model")
+
+
+def mark_steer(directory: str, text: str) -> bool:
+    """插话写进正在跑的这一轮之后调用：让审批钩子在下一次工具调用前提醒模型先看新消息（1.9.3）。
+
+    原话先脱敏再截断才落盘（钩子会把它带给模型）。没有审批目录就什么都不做。
+    """
+    if not directory:
+        return False
+    try:
+        safe = _redact_then_cut(str(text or ""), 300)
+    except Exception:  # noqa: BLE001
+        safe = ""
+    try:
+        with open(os.path.join(directory, "STEER"), "w", encoding="utf-8") as handle:
+            handle.write(safe)
+        return True
+    except OSError:
+        return False
+
+
+def clear_steer(directory: str) -> None:
+    """一轮结束时撤掉没兑换的 STEER 标记：别让它拦到下一轮。"""
+    if not directory:
+        return
+    try:
+        os.unlink(os.path.join(directory, "STEER"))
+    except OSError:
+        pass
 
 
 def write_safe_prefixes(directory: str) -> None:

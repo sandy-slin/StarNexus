@@ -125,6 +125,7 @@ class LiveTurn:
         self.written = 0
         self.replayed = 0
         self.closed = False
+        self.approval_dir = ""
 
     def open(self) -> bool:
         return not self.closed and self.proc.returncode is None
@@ -156,6 +157,16 @@ class LiveTurn:
                     self.proc.stdin.close()
             except (OSError, ValueError):
                 pass
+
+
+def _clear_steer(directory: str) -> None:
+    if not directory:
+        return
+    try:
+        from .approval import clear_steer
+        clear_steer(directory)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stream_argv(argv: list) -> list:
@@ -205,6 +216,12 @@ class ClaudeRunner:
             except (OSError, ValueError):
                 live.closed = True
                 return False
+        if live.approval_dir:
+            try:
+                from .approval import mark_steer
+                mark_steer(live.approval_dir, text)
+            except Exception:  # noqa: BLE001 —— 提醒落不下不影响插话本身
+                logger.debug("插话提醒没落下", exc_info=True)
         logger.info("私聊插话 写入 scope=%s 字数=%d 第%d条", str(key)[:16], len(text), live.written - 1)
         return True
 
@@ -315,6 +332,8 @@ class ClaudeRunner:
         # ↓↓↓ 这里到 gather 之间不要加任何 await —— 见文件头第 1 条。
         # 第一句同步写进 stdin（spawn 之后、gather 之前，见文件头第 1 条）
         live = LiveTurn(proc)
+        live.approval_dir = approval_dir or ""
+        _clear_steer(live.approval_dir)
         live.write_sync(prompt)
         progress = Progress(last_event_at=time.monotonic())
         collected: list[str] = []
@@ -527,6 +546,7 @@ class ClaudeRunner:
             # 这一轮无论怎么结束（正常 / 超时 / /stop / 异常）都把 stdin 关掉、把登记撤掉：
             # 不关的话子进程会一直等下一条输入；不撤的话 steer() 会写进一个已经结束的轮次。
             live.close()
+            _clear_steer(live.approval_dir)
             if steer_key:
                 with self._live_guard:
                     if self._live.get(steer_key) is live:

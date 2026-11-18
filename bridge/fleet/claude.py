@@ -1047,6 +1047,7 @@ class ClaudeAdapter(Adapter):
             live = self._live.get(sid)
         if live is None or not live.write(text):
             return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+        _mark_steer(getattr(live, "approval_dir", ""), text)
         logger.info("中途插话 写入 会话=%s 字数=%d 第%d条", sid[:8], len(text), live.written - 1)
         return ActionResult(True, STEER_OK, sid, delivered=True)
 
@@ -1071,6 +1072,8 @@ class ClaudeAdapter(Adapter):
         except Exception:  # noqa: BLE001 —— 登记失败也要把这一轮收好
             logger.exception("on_spawn 回调失败 pid=%s", proc.pid)
         live = _LiveTurn(proc)
+        live.approval_dir = str((env or {}).get("CARHER_APPROVAL_DIR") or "")
+        _clear_steer(live.approval_dir)
         err_tail: list = []
 
         def drain() -> None:
@@ -1123,6 +1126,7 @@ class ClaudeAdapter(Adapter):
                 if self._live.get(sid) is live:
                     del self._live[sid]
             live.close()
+            _clear_steer(live.approval_dir)
             try:
                 proc.wait(timeout=30)
             except Exception:  # noqa: BLE001
@@ -1498,6 +1502,27 @@ def _pending_ask(records: list) -> Optional[PendingAsk]:
     return PendingAsk(tool=name, summary=_pending_summary(inp))
 
 
+def _mark_steer(directory: str, text: str) -> None:
+    """插话写进去了 ⇒ 让审批钩子在下一次工具调用前提醒模型先看新消息（1.9.3）。"""
+    if not directory:
+        return
+    try:
+        from ..approval import mark_steer
+        mark_steer(directory, text)
+    except Exception:  # noqa: BLE001 —— 提醒落不下不影响插话本身
+        logger.debug("插话提醒没落下", exc_info=True)
+
+
+def _clear_steer(directory: str) -> None:
+    if not directory:
+        return
+    try:
+        from ..approval import clear_steer
+        clear_steer(directory)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _LiveTurn:
     """一轮在跑的 `claude -p --input-format stream-json`：往 stdin 写 user 消息，写和关都在锁里。"""
 
@@ -1507,6 +1532,7 @@ class _LiveTurn:
         self.written = 0
         self.replayed = 0
         self.closed = False
+        self.approval_dir = ""
 
     def open(self) -> bool:
         return not self.closed and self.proc.poll() is None

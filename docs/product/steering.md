@@ -114,3 +114,12 @@
 - **权限档位**：和 `codex exec` 同一张表（`readonly`/`write`/`trusted`）；`trusted` 映射 `danger-full-access` + 钩子，钩子没装上退回 `workspace-write`。模型和强度在 `turn/start` 上带。
 - **新会话第一轮**仍走 `codex exec`（`start()` 没换），所以那一段不能插话，和 opencode 一样。
 - 测试：`tests/test_steering_codex.py`（假 app-server 覆盖插进同一轮、结束后拒收、停下、超时、失败、钩子参数、模型强度）；真机探针（10 次 sleep 4，18 秒插话）跑 2 次后停、回 CX-STEER-OK；真机回归 `steer_codex`、`stop`、`codex_trusted`、`ns_codex`、`model_effort`、`group_relay`、`long_reply` 全过。
+
+
+## 1.9.3：插话后提醒 Claude 先看新消息
+
+- 现象：2026-11-18 22:35 Claude Code 自动更新（2.1.327）后，插话照样送进了这一轮（会话记录里有 `queued_command` 和「The user sent a new message」提醒），但模型不理它，继续跑完原计划。真机回归 steer_claude 连续 3 次失败。
+- 做法：服务端把插话写进 stdin 后，同时在这一轮的审批目录里放一个 `STEER` 标记（原话先脱敏，最多 300 字）。审批钩子在下一次工具调用前兑换它：这一步 deny，理由是「用户刚插了一句新的话，先读它再决定」。只拦一次，10 分钟过期，一轮结束时清掉。
+- 范围：会话群里的 Claude（`fleet/claude.py`）和私聊里桥自己跑的 Claude（`runner.py`）。Codex 用 turn/steer、opencode 用 delivery=steer，不需要这层提醒。
+- 代价：插话后，正在排队的下一步工具调用会被拦一次。模型如果判断插话和这一步无关，会重新发起这一步。
+- 验证：单测 `tests/test_steer_nudge.py` 8 条；真机回归 steer_claude 连续 3 次通过，steer_dm、steer_first_turn 通过。
