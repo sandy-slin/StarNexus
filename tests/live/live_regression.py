@@ -465,6 +465,36 @@ def case_session_perm(dm: str) -> tuple:
     return True, group_name(chat)
 
 
+def case_menu_m(dm: str) -> tuple:
+    """FC-26 / FC-29（服务端部分）：私聊 /m 出常用功能卡；会话群 /m 把状态卡挪到最下面，卡上有权限一排。"""
+    if not send(dm, "/m"):
+        return False, "私聊发 /m 失败"
+    end = time.time() + 60
+    ok_dm = False
+    while time.time() < end and not ok_dm:
+        for m in messages(dm, 6):
+            body = str(m.get("content") or "")
+            if (m.get("sender") or {}).get("sender_type") == "app" and "常用功能" in body and "全局权限" in body:
+                ok_dm = True
+                break
+        time.sleep(3)
+    if not ok_dm:
+        return False, "私聊 60 秒内没收到 /m 常用功能卡"
+    groups = binds()
+    chat = next(iter(sorted(groups, key=lambda c: groups[c].get("created_at", 0), reverse=True)), "")
+    if not chat:
+        return False, "没有会话群可测"
+    if not send(chat, "/m"):
+        return False, "会话群发 /m 失败"
+    end = time.time() + 60
+    while time.time() < end:
+        texts = bot_texts(chat, 6)
+        if any("会话状态卡" in t and "这个会话的权限" in t for t in texts) and any("已挪到最下面" in t for t in bot_texts(chat, 40)):
+            return True, group_name(chat)
+        time.sleep(3)
+    return False, "会话群 60 秒内没看到挪到最下面的状态卡"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -481,6 +511,7 @@ CASES = {
     "ns_one_line": case_ns_one_line,
     "ns_card": case_ns_card,
     "session_perm": case_session_perm,
+    "menu_m": case_menu_m,
 }
 
 
