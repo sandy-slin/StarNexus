@@ -297,7 +297,8 @@ def case_codex_trusted(dm: str) -> tuple:
     """FC-13：Codex trusted 档 ⇒ 工作区内能写；工作区外和 git push 先出审批卡、不直接执行。"""
     name = "lr-trust-" + time.strftime("%H%M%S")
     outside = os.path.expanduser(f"~/sn-outside-{name}.txt")
-    chat, why = _new_session(dm, "codex", name, "回归测试，在当前目录创建文件 inside.txt，内容 LR-IN，然后回复 LR-WROTE")
+    # 不写「回归测试」：Codex 会按用户级 AGENTS.md 的 her-regression 规则先跑技能同步脚本（2026-11-18 实测）
+    chat, why = _new_session(dm, "codex", name, "在当前目录创建文件 inside.txt，内容 LR-IN，然后只回复 LR-WROTE")
     if not chat or not wait_bot(chat, "LR-WROTE", timeout=300):
         return False, why or "首句没回"
     if not os.path.exists(os.path.join(WORK, name, "inside.txt")):
@@ -640,6 +641,32 @@ def case_steer_codex(dm: str) -> tuple:
     return True, f"插进同一轮，跑了 {lines} 次后改做新指令"
 
 
+def case_trusted_script(dm: str) -> tuple:
+    """1.9.1：全授权 Claude 会话里 `python3 -c` 读 JSON、`$R/$f` 接口路径不弹审批卡；有删除动作的脚本照旧出卡。"""
+    name = "lr-tscript-" + time.strftime("%H%M%S")
+    chat, why = _new_session(dm, "claude", name, "回归测试，只回复 LR-TS-READY")
+    if not chat:
+        return False, why
+    if not wait_bot(chat, "LR-TS-READY"):
+        return False, "第一轮没等到 LR-TS-READY"
+    path = os.path.join(WORK, name)
+    with open(os.path.join(path, "a.json"), "w", encoding="utf-8") as fh:
+        json.dump({"n": 37}, fh)
+    ask = ("请严格按顺序用 Bash 工具执行这两条命令，不要改写："
+           f"第一条 cd {path} && python3 -c \"import json;print('LR-TS-'+str(json.load(open('a.json'))['n']))\" ；"
+           f"第二条 cd {path} && R=x/y; for f in a b; do echo \"$R/$f\" > out_$f.txt; done && cat out_a.txt 。"
+           "然后只回复第一条命令的输出。")
+    if not send(chat, ask):
+        return False, "发命令失败"
+    got = wait_bot(chat, "LR-TS-37", timeout=180)
+    texts = bot_texts(chat, 30)
+    if any("批准" in t or "等你在飞书里确认" in t for t in texts):
+        return False, "全授权下仍然弹了审批卡"
+    if not got:
+        return False, "没等到 LR-TS-37"
+    return True, f"{group_name(chat)} 无审批卡，回了 LR-TS-37"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -662,6 +689,7 @@ CASES = {
     "ns_card": case_ns_card,
     "session_perm": case_session_perm,
     "menu_m": case_menu_m,
+    "trusted_script": case_trusted_script,
 }
 
 
