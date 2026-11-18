@@ -51,7 +51,7 @@ class StreamArgvTest(unittest.TestCase):
     def test_caps(self):
         self.assertTrue(can("claude", "steer"))
         self.assertFalse(can("cursor", "steer"))
-        self.assertFalse(can("codex", "steer"))
+        self.assertTrue(can("codex", "steer"))
 
 
 class ClaudeSteerTest(unittest.TestCase):
@@ -172,11 +172,20 @@ class BridgeSteerTest(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(said, ["上一条还在发，等它回来再说。"])
 
-    def test_codex_not_steered_yet(self):
-        sess = SimpleNamespace(tool="codex", id="t1", owner="none", title="x", cwd="/tmp")
+    def test_codex_busy_is_steered(self):
+        sess = SimpleNamespace(tool="codex", id="t1", owner="bridge", title="x", cwd="/tmp")
         bridge, said = bridge_with(sess)
         bridge.fleet.set_pending("group:oc_g", "codex", "t1")
         bridge._fleet_inflight = {"group:oc_g": ("codex", "t1")}
+        asyncio.run(bridge._maybe_send_to_fleet("group:oc_g", "oc_g", "x"))
+        self.assertEqual(bridge.fleet.steered, [("codex", "t1", "x")])
+        self.assertEqual(said, [STEER_OK])
+
+    def test_cursor_not_steered(self):
+        sess = SimpleNamespace(tool="cursor", id="c1", owner="none", title="x", cwd="/tmp")
+        bridge, said = bridge_with(sess)
+        bridge.fleet.set_pending("group:oc_g", "cursor", "c1")
+        bridge._fleet_inflight = {"group:oc_g": ("cursor", "c1")}
         asyncio.run(bridge._maybe_send_to_fleet("group:oc_g", "oc_g", "x"))
         self.assertEqual(bridge.fleet.steered, [])
         self.assertEqual(said, ["上一条还在发，等它回来再说。"])

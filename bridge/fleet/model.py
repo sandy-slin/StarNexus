@@ -38,7 +38,7 @@ CAPS = {
     "claude": frozenset({"start", "send", "stop", "fork", "model", "effort", "approval", "progress", "choices",
                          "steer"}),
     "codex": frozenset({"start", "send", "stop", "fork", "archive", "model", "effort", "approval", "progress",
-                        "choices"}),
+                        "choices", "steer"}),
     "opencode": frozenset({"start", "send", "stop", "fork", "model", "choices", "steer"}),
     "cursor": frozenset({"send"}),
 }

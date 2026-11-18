@@ -113,8 +113,11 @@ def case_ns_codex(dm: str) -> tuple:
         return False, f"群名不对：{gname}"
     if not wait_bot(chat, "LR-OK", timeout=240):
         return False, "群里没等到 LR-OK"
-    if not any("工具默认" in t for t in bot_texts(chat)):
-        return False, "状态卡没写工具默认模型"
+    if not any(f"Codex「{name}」" in t and "会话状态卡" in t for t in bot_texts(chat)):
+        return False, "状态卡标题没用名字"
+    # 状态卡正文是卡片实体，接口只回占位图 ⇒ 缺省模型看私聊的新建回执（那里是明文）
+    if not any("模型：默认（" in t for t in bot_texts(dm, 20)):
+        return False, "新建回执没写缺省模型"
     return True, gname
 
 
@@ -609,6 +612,34 @@ def case_steer_opencode(dm: str) -> tuple:
     return True, f"插进同一轮，跑了 {lines} 次后改做新指令"
 
 
+def case_steer_codex(dm: str) -> tuple:
+    """FC-40（1.9.0）：Codex 会话群里一轮在跑时再说一句 ⇒ 插进这一轮（app-server turn/steer）。"""
+    tag = time.strftime("%H%M%S")
+    name = "lr-cxsteer-" + tag
+    chat, why = _new_session(dm, "codex", name, "回归测试，只回复 LR-START")
+    if not chat or not wait_bot(chat, "LR-START", timeout=240):
+        return False, why or "首句没回"
+    send(chat, f"用 shell 依次执行 10 次 `sleep 4 && date >> steer.txt`，每次单独执行一条命令，全部做完后回复 LR-CXORIG-{tag}")
+    time.sleep(22)
+    send(chat, f"改主意了：立即停止剩下的 sleep，不要再执行任何命令，只回复 LR-CXSTEER-{tag}")
+    if not wait_bot(chat, "已插进正在跑的这一轮", timeout=40):
+        return False, "没看到「已插进正在跑的这一轮」回执"
+    if not wait_bot(chat, f"LR-CXSTEER-{tag}", timeout=180):
+        return False, "插话后没回 LR-CXSTEER"
+    why = _steer_texts_ok(bot_texts(chat, 30), f"LR-CXORIG-{tag}")
+    if why:
+        return False, why
+    lines = 0
+    try:
+        with open(os.path.join(WORK, name, "steer.txt"), encoding="utf-8") as fh:
+            lines = sum(1 for _ in fh)
+    except OSError:
+        pass
+    if lines >= 10:
+        return False, f"10 次都跑完了（{lines}）"
+    return True, f"插进同一轮，跑了 {lines} 次后改做新指令"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -622,6 +653,7 @@ CASES = {
     "steer_dm": case_steer_dm,
     "steer_first_turn": case_steer_first_turn,
     "steer_opencode": case_steer_opencode,
+    "steer_codex": case_steer_codex,
     "choices": case_choices,
     "codex_trusted": case_codex_trusted,
     "term_stop": case_term_stop,
