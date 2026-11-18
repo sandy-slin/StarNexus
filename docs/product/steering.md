@@ -1,9 +1,10 @@
 # 中途插话（steering）：调研结论与实现方案
 
-> 状态：**1.7.0 已实现 Claude 会话群的中途插话**；opencode（1.8.0）、Codex（1.9.0）未实现。验收用例 FC-38~FC-43 见 [`full-control.md`](full-control.md) §8。
+> 状态：**1.8.0 已实现 Claude（会话群、私聊、新建会话第一轮）和 opencode（接着聊）的中途插话**；Codex（1.9.0）未实现。验收用例 FC-38~FC-43 见 [`full-control.md`](full-control.md) §8。
 >
 > 1.7.0 范围：会话群 / 对话模式里，**桥自己起的** Claude 那一轮（`ClaudeAdapter._run_streaming`，stream-json 输入开着）。
-> 不在范围：私聊里桥自己的 claude（`_run_locally`，仍排队）、新建会话的第一轮（`INFLIGHT_ID` 占位，仍提示“还在发”）、终端 / App 里开着的会话。
+> 1.8.0 补上：私聊里桥自己跑的 Claude（`ClaudeRunner`，`_run_locally`）、Claude 新建会话的第一轮、opencode 接着聊的那一轮。
+> 不在范围：终端 / App 里开着的会话、Cursor、opencode 新建会话的第一轮（仍是 `--standalone` 私有服务，插不进，照旧提示）。
 
 ## 1. 要解决的问题
 
@@ -93,3 +94,12 @@
 - 桥：`_maybe_send_to_fleet` 发现同一个会话在飞 ⇒ `_try_steer`（先过暂停和审查）⇒ 回「↪️ 已插进正在跑的这一轮」；插不进照旧回「上一条还在发」。
 - 顺带修掉一条多余提示：桥自己起的那一轮在扫描里是 `owner=bridge`，原来被当成「电脑上又打开了那个会话」，每次发话都冒「提示：…和刚才不一样。这条照常发过去了」。现在 `owner=bridge` 和 `none` 同一条路；这类提示不需要人处理，改为只记日志。
 - 测试：`tests/test_steering.py`（假 stream-json 进程覆盖插进同一轮、撞上收尾不丢、结束后拒收、桥的插话 / 回退 / 暂停 / 去提示）；真机探针（10 次 sleep，20 秒插话）跑 3 次后停、回 STEER-OK；插话后 `/stop` 立即结束。
+
+## 7. 1.8.0 实现记录
+
+- **私聊里桥自己跑的 Claude**：`bridge/runner.py` 的 `ClaudeRunner.run_turn` 带上 `steer_key`（私聊 scope）后改用 stream-json 进程，和 `_run_streaming` 同一套规则：第一句写 stdin，回显数 ≥ 写入数且收到 `result` 才关 stdin，多个 `result` 合并；`try/finally` 保证结束必关 stdin、撤销登记。`_run_locally` 在锁被占时先 `_try_steer_local`，插进就回「↪️ 已插进正在跑的这一轮」，插不进照旧排队。
+- **新建会话第一轮（Claude）**：桥先生成 uuid 写进 `_fleet_inflight`，作为 `session_id` 传给 `control.start` → `claude --session-id`，第一轮一开始就有真实会话号，后面的话可以插进去。第一轮正好收尾时回「新会话第一轮正好在收尾，这句没插进去。等它回来再说一次。」
+- **opencode**：接着聊时先 `opencode service status` 判断本机常驻服务在不在；在的话不加 `--standalone`，这一轮跑在常驻服务里。插话先查 `GET /api/session/active` 确认这个会话在跑，再 `POST /api/session/{id}/prompt {delivery: "steer"}`，响应里 `delivery` 是 `steer` 才算插进。常驻服务按会话自己的目录干活（实测写对目录）。
+- **opencode 停下**：走常驻服务时 `/stop` 先调 `/interrupt`。实测只杀掉 `opencode run` 客户端，服务里那一轮还会继续跑。
+- **opencode 新建会话**仍走 `--standalone`（第一轮没有会话号，连不到同一个服务），所以第一轮不能插话，照旧提示。
+- 测试：`tests/test_steering_dm.py`（假 stream-json 进程）、`tests/test_steering_opencode.py`（假 HTTP 服务）；真机回归 `steer_dm`、`steer_first_turn`、`steer_opencode`、`steer_claude` 全过。
