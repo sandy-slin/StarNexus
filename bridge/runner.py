@@ -24,6 +24,7 @@ import contextlib
 import logging
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -111,11 +112,101 @@ class Progress:
     last_tool: str = ""
 
 
+class LiveTurn:
+    """一轮在跑的 `claude -p --input-format stream-json`：往 stdin 写 user 消息，写和关都在锁里。
+
+    和 `bridge/fleet/claude.py` 的同名类同一个思路：进程在一轮期间开着 stdin，
+    飞书里再发的一句话直接写进去，模型在当前工具调用结束后读到，同一轮里改方向。
+    """
+
+    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+        self.proc = proc
+        self.lock = threading.Lock()
+        self.written = 0
+        self.replayed = 0
+        self.closed = False
+
+    def open(self) -> bool:
+        return not self.closed and self.proc.returncode is None
+
+    def payload(self, text: str) -> dict:
+        return {"type": "user", "message": {"role": "user", "content": text}}
+
+    def write_sync(self, text: str) -> bool:
+        """spawn 之后立刻写第一句：必须同步、不能 await（见文件头第 1 条）。"""
+        assert self.proc.stdin is not None
+        with self.lock:
+            if self.closed or self.proc.returncode is not None:
+                return False
+            try:
+                self.proc.stdin.write((json.dumps(self.payload(text), ensure_ascii=False) + "\n").encode())
+            except (OSError, ValueError):
+                self.closed = True
+                return False
+            self.written += 1
+            return True
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                if self.proc.stdin is not None:
+                    self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+
+def _stream_argv(argv: list) -> list:
+    """一次性形状（`-p <prompt>` + `--output-format stream-json`）→ stdin 喂话的流式形状。"""
+    out = list(argv)
+    at = out.index("-p")
+    del out[at + 1]
+    at = out.index("--output-format")
+    out[at:at + 2] = ["--input-format", "stream-json", "--output-format", "stream-json",
+                      "--replay-user-messages"]
+    return out
+
+
 class ClaudeRunner:
     def __init__(self, policy: Policy, config_dir: str | None = None) -> None:
         self.policy = policy
         # 用独立的 CLAUDE_CONFIG_DIR，免得桥接的会话和你自己手敲的 claude 互相串。
         self.config_dir = config_dir or os.path.expanduser("~/.claude-feishu-bridge")
+        # 正在跑的那几轮（按 scope）：私聊里桥自己跑的 claude 也要能插话
+        self._live: dict[str, LiveTurn] = {}
+        self._live_guard = threading.Lock()
+
+    # ---------- 插话：一轮在跑时中途改方向 ----------
+
+    def steerable(self, key: str) -> bool:
+        with self._live_guard:
+            live = self._live.get(key)
+        return live is not None and live.open()
+
+    def steer(self, key: str, text: str) -> bool:
+        """把一句话写进正在跑的这一轮。写不进去（刚收尾）返回 False，调用方退回排队。"""
+        text = str(text or "").strip()
+        if not text:
+            return False
+        with self._live_guard:
+            live = self._live.get(key)
+        if live is None or not live.open():
+            return False
+        assert live.proc.stdin is not None
+        with live.lock:
+            if live.closed or live.proc.returncode is not None:
+                return False
+            try:
+                live.proc.stdin.write((json.dumps(live.payload(text), ensure_ascii=False) + "\n").encode())
+                # 这一句在事件循环里被调用 ⇒ 下面这个 await 不能放在 live.lock 里
+                live.written += 1
+            except (OSError, ValueError):
+                live.closed = True
+                return False
+        logger.info("私聊插话 写入 scope=%s 字数=%d 第%d条", str(key)[:16], len(text), live.written - 1)
+        return True
 
     def _build_argv(
         self,
@@ -173,6 +264,7 @@ class ClaudeRunner:
         policy: Policy | None = None,
         on_text=None,
         on_session=None,
+        steer_key: str = "",
     ) -> TurnResult:
         """跑一轮。
 
@@ -189,7 +281,7 @@ class ClaudeRunner:
         """
         started = time.monotonic()
         effective = policy or self.policy
-        argv = self._build_argv(prompt, resume, workspace, effective)
+        argv = _stream_argv(self._build_argv(prompt, resume, workspace, effective))
 
         env = dict(os.environ)
         env["CLAUDE_CONFIG_DIR"] = self.config_dir
@@ -208,6 +300,8 @@ class ClaudeRunner:
                 limit=_STREAM_LIMIT,
                 *argv,
                 cwd=workspace,
+                # 1.8.0 中途插话：stdin 开着，跑的过程中 `steer()` 能再写一句话进去
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -219,12 +313,16 @@ class ClaudeRunner:
                               error="后台找不到 Claude Code，重新双击一次安装包就能修好（设置都会保留）。")
 
         # ↓↓↓ 这里到 gather 之间不要加任何 await —— 见文件头第 1 条。
+        # 第一句同步写进 stdin（spawn 之后、gather 之前，见文件头第 1 条）
+        live = LiveTurn(proc)
+        live.write_sync(prompt)
         progress = Progress(last_event_at=time.monotonic())
         collected: list[str] = []
         # 流式那条路自己累加（`collected` 走完整 `assistant` 事件，一个字不动）。
         # 两者可能有极小差异（delta 丢包）⇒ 终态卡一律用 `result.text` 重写，不信累加值。
         streamed: list[str] = []
         final: dict | None = None
+        finals: list[dict] = []
         stderr_tail: list[str] = []
 
         async def pump_stdout() -> None:
@@ -276,8 +374,16 @@ class ClaudeRunner:
                             progress.last_tool = block.get("name", "")
                             if on_progress:
                                 on_progress(progress)
+                elif kind == "user" and event.get("isReplay"):
+                    # `--replay-user-messages` 回显：写进去的话它读到了
+                    live.replayed += 1
                 elif kind == "result":
+                    finals.append(event)
                     final = event
+                    if live.replayed >= live.written or live.replayed == 0:
+                        # 写进去的话都读过了 ⇒ 关 stdin，进程收尾。
+                        # （`replayed == 0` 兜老版本 / 没回显的情况，不然每轮都要等到超时）
+                        live.close()
 
         async def pump_stderr() -> None:
             assert proc.stderr is not None
@@ -290,85 +396,125 @@ class ClaudeRunner:
                     stderr_tail.append(line)
                     del stderr_tail[:-20]
 
-        work = asyncio.gather(pump_stdout(), pump_stderr(), proc.wait())
-        waiters = [asyncio.ensure_future(work)]
-        cancel_task = None
-        if cancel is not None:
-            cancel_task = asyncio.ensure_future(cancel.wait())
-            waiters.append(cancel_task)
+        if steer_key:
+            with self._live_guard:
+                self._live[steer_key] = live
+        try:
+            work = asyncio.gather(pump_stdout(), pump_stderr(), proc.wait())
+            waiters = [asyncio.ensure_future(work)]
+            cancel_task = None
+            if cancel is not None:
+                cancel_task = asyncio.ensure_future(cancel.wait())
+                waiters.append(cancel_task)
 
-        done, _ = await asyncio.wait(
-            waiters,
-            timeout=effective.turn_timeout_sec,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        def _stop_child() -> None:
-            if proc.returncode is None:
-                proc.kill()
-
-        if not done:
-            # 超时
-            logger.info("一轮超时 resume=%s 工具=%d 上一个工具=%s 限时=%ss", bool(resume),
-                        progress.tool_calls, progress.last_tool or "-", effective.turn_timeout_sec)
-            _stop_child()
-            await proc.wait()
-            for w in waiters:
-                w.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await waiters[0]
-            return TurnResult(
-                ok=False,
-                text="",
-                duration_sec=time.monotonic() - started,
-                timed_out=True,
-                error=(
-                    f"跑了 {effective.turn_timeout_sec // 60} 分钟还没完，先停下了。"
-                    "可以把问题拆小一点再问，或者说得更具体些。"
-                ),
+            done, _ = await asyncio.wait(
+                waiters,
+                timeout=effective.turn_timeout_sec,
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
-        if cancel_task is not None and cancel_task in done:
-            # 用户发了 /stop
-            logger.info("一轮被停下 resume=%s 工具=%d 耗时=%.1fs", bool(resume),
-                        progress.tool_calls, time.monotonic() - started)
-            _stop_child()
-            await proc.wait()
-            # 取消那三个 pump，并**等它们收尾**：不等的话 CancelledError 会在
-            # 事件循环里裸抛出来，把日志刷脏（实测见过）。
-            waiters[0].cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await waiters[0]
-            partial = _BLOCK_SEP.join(collected).strip()
-            return TurnResult(
-                ok=False,
-                text=partial,
-                session_id=(final or {}).get("session_id") or resume,
-                duration_sec=time.monotonic() - started,
-                cancelled=True,
-                error="已按你的要求停下",
+            def _stop_child() -> None:
+                if proc.returncode is None:
+                    proc.kill()
+
+            if not done:
+                # 超时
+                logger.info("一轮超时 resume=%s 工具=%d 上一个工具=%s 限时=%ss", bool(resume),
+                            progress.tool_calls, progress.last_tool or "-", effective.turn_timeout_sec)
+                _stop_child()
+                await proc.wait()
+                for w in waiters:
+                    w.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiters[0]
+                return TurnResult(
+                    ok=False,
+                    text="",
+                    duration_sec=time.monotonic() - started,
+                    timed_out=True,
+                    error=(
+                        f"跑了 {effective.turn_timeout_sec // 60} 分钟还没完，先停下了。"
+                        "可以把问题拆小一点再问，或者说得更具体些。"
+                    ),
+                )
+
+            if cancel_task is not None and cancel_task in done:
+                # 用户发了 /stop
+                logger.info("一轮被停下 resume=%s 工具=%d 耗时=%.1fs", bool(resume),
+                            progress.tool_calls, time.monotonic() - started)
+                _stop_child()
+                await proc.wait()
+                # 取消那三个 pump，并**等它们收尾**：不等的话 CancelledError 会在
+                # 事件循环里裸抛出来，把日志刷脏（实测见过）。
+                waiters[0].cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiters[0]
+                partial = _BLOCK_SEP.join(collected).strip()
+                return TurnResult(
+                    ok=False,
+                    text=partial,
+                    session_id=(final or {}).get("session_id") or resume,
+                    duration_sec=time.monotonic() - started,
+                    cancelled=True,
+                    error="已按你的要求停下",
+                )
+
+            if cancel_task is not None:
+                cancel_task.cancel()
+
+            duration = time.monotonic() - started
+            if len(finals) > 1:
+                # 插话和收尾撞上：它会再跑一轮，这几轮的文字合成一次回复（和 fleet 那边的口径一致）
+                merged = [str(ev.get("result") or "").strip() for ev in finals]
+                collected = ["\n\n".join(t for t in merged if t)]
+            text = _BLOCK_SEP.join(collected).strip()
+            denials = (final or {}).get("permission_denials") or []
+            session_id = (final or {}).get("session_id") or resume
+            cost = float((final or {}).get("total_cost_usd") or 0.0)
+            # 一轮一行：怎么结束的、调了几次工具、有没有丢结果。不记 prompt / 回复正文。
+            logger.info(
+                "一轮结束 会话=%s resume=%s stop=%s subtype=%s 工具=%d 拒绝=%d 回复字数=%d "
+                "耗时=%.1fs 退出码=%s",
+                str(session_id or "")[:8] or "-", bool(resume), (final or {}).get("stop_reason") or "-",
+                (final or {}).get("subtype") or "-", progress.tool_calls,
+                len(denials), len(text), duration, proc.returncode,
             )
 
-        if cancel_task is not None:
-            cancel_task.cancel()
+            # 审批钩子挡下来了 ⇒ 正常停顿，不是故障。必须在下面"零输出=失败"之前判，
+            # 因为 defer 时 text 往往是空的。
+            if (final or {}).get("stop_reason") == "tool_deferred":
+                return TurnResult(
+                    ok=True,
+                    text=text,
+                    session_id=session_id,
+                    cost_usd=cost,
+                    duration_sec=duration,
+                    denials=denials,
+                    deferred=True,
+                )
 
-        duration = time.monotonic() - started
-        text = _BLOCK_SEP.join(collected).strip()
-        denials = (final or {}).get("permission_denials") or []
-        session_id = (final or {}).get("session_id") or resume
-        cost = float((final or {}).get("total_cost_usd") or 0.0)
-        # 一轮一行：怎么结束的、调了几次工具、有没有丢结果。不记 prompt / 回复正文。
-        logger.info(
-            "一轮结束 会话=%s resume=%s stop=%s subtype=%s 工具=%d 拒绝=%d 回复字数=%d "
-            "耗时=%.1fs 退出码=%s",
-            str(session_id or "")[:8] or "-", bool(resume), (final or {}).get("stop_reason") or "-",
-            (final or {}).get("subtype") or "-", progress.tool_calls,
-            len(denials), len(text), duration, proc.returncode,
-        )
+            # 见文件头第 2 条：人发了消息，零回复 = 故障，不能静默成功。
+            if not text:
+                # 技术细节只进日志 —— 用户看 stderr 原文没有任何帮助，
+                # 而且那里面可能带着路径、token 之类不该外发的东西。
+                hint = "; ".join(stderr_tail[-3:]) if stderr_tail else ""
+                subtype = (final or {}).get("subtype") or ""
+                logger.error(
+                    "零输出：subtype=%s returncode=%s stderr=%s",
+                    subtype, proc.returncode, hint[:400],
+                )
+                # 给用户的话要能操作。最常见的真实原因是上一轮被中断导致
+                # 这一轮 resume 到一个不完整的轮次（实测 2.7 秒就退出、根本没调模型）。
+                return TurnResult(
+                    ok=False,
+                    text="",
+                    session_id=session_id,
+                    cost_usd=cost,
+                    duration_sec=duration,
+                    denials=denials,
+                    error="这一轮没出结果。点下面「🆕 新话题」再问一次，通常就好了。",
+                )
 
-        # 审批钩子挡下来了 ⇒ 正常停顿，不是故障。必须在下面"零输出=失败"之前判，
-        # 因为 defer 时 text 往往是空的。
-        if (final or {}).get("stop_reason") == "tool_deferred":
             return TurnResult(
                 ok=True,
                 text=text,
@@ -376,36 +522,12 @@ class ClaudeRunner:
                 cost_usd=cost,
                 duration_sec=duration,
                 denials=denials,
-                deferred=True,
             )
-
-        # 见文件头第 2 条：人发了消息，零回复 = 故障，不能静默成功。
-        if not text:
-            # 技术细节只进日志 —— 用户看 stderr 原文没有任何帮助，
-            # 而且那里面可能带着路径、token 之类不该外发的东西。
-            hint = "; ".join(stderr_tail[-3:]) if stderr_tail else ""
-            subtype = (final or {}).get("subtype") or ""
-            logger.error(
-                "零输出：subtype=%s returncode=%s stderr=%s",
-                subtype, proc.returncode, hint[:400],
-            )
-            # 给用户的话要能操作。最常见的真实原因是上一轮被中断导致
-            # 这一轮 resume 到一个不完整的轮次（实测 2.7 秒就退出、根本没调模型）。
-            return TurnResult(
-                ok=False,
-                text="",
-                session_id=session_id,
-                cost_usd=cost,
-                duration_sec=duration,
-                denials=denials,
-                error="这一轮没出结果。点下面「🆕 新话题」再问一次，通常就好了。",
-            )
-
-        return TurnResult(
-            ok=True,
-            text=text,
-            session_id=session_id,
-            cost_usd=cost,
-            duration_sec=duration,
-            denials=denials,
-        )
+        finally:
+            # 这一轮无论怎么结束（正常 / 超时 / /stop / 异常）都把 stdin 关掉、把登记撤掉：
+            # 不关的话子进程会一直等下一条输入；不撤的话 steer() 会写进一个已经结束的轮次。
+            live.close()
+            if steer_key:
+                with self._live_guard:
+                    if self._live.get(steer_key) is live:
+                        del self._live[steer_key]

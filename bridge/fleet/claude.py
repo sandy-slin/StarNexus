@@ -1292,7 +1292,7 @@ class ClaudeAdapter(Adapter):
     def start(self, cwd: str, text: str, timeout: float = DEFAULT_SEND_TIMEOUT, policy: Any = None,
               approval_dir: str = "", model: str = "",
               on_pid: Optional[Callable[[int], None]] = None, effort: str = "",
-              fork_from: str = "") -> ActionResult:
+              fork_from: str = "", session_id: str = "") -> ActionResult:
         """在 `cwd` 新开一个会话，第一句是 `text`。`fork_from`：复制这个会话的上下文再开（`--resume X --fork-session`）。参数和 `send()` 同一套（档位、白名单、红线、审批钩子），
         只是把 `--resume <id>` 换成 `--session-id <新 uuid>`：id 由我们先定好，起进程前就能登记，
         这样「停下」和占用判断从第一秒起就认得它。
@@ -1319,7 +1319,9 @@ class ClaudeAdapter(Adapter):
         bad = _model_problem(model, effort)
         if bad:
             return ActionResult(False, bad, "")
-        sid = str(uuid.uuid4())
+        # `session_id`：调用方先定好会话号，这样这一轮还在跑时桥上就能按这个号插话
+        # （新建会话第一轮用得上）。不传就自己生成。
+        sid = str(session_id or uuid.uuid4())
         if fork_from:
             if not self._jsonl_path(fork_from):
                 return ActionResult(False, "找不到要复制的那个会话的记录。", "")
@@ -1343,8 +1345,13 @@ class ClaudeAdapter(Adapter):
                     pass
 
         try:
-            result = self.runner.run(argv, timeout=float(timeout or DEFAULT_SEND_TIMEOUT), cwd=inside,
-                                     env=env, on_spawn=on_spawn)
+            if callable(getattr(self.runner, "popen", None)):
+                # 1.8.0：第一轮也走流式 —— 还在跑时就能按 `sid` 插话
+                result = self._run_streaming(sid, argv, text, float(timeout or DEFAULT_SEND_TIMEOUT),
+                                             inside, env, on_spawn)
+            else:
+                result = self.runner.run(argv, timeout=float(timeout or DEFAULT_SEND_TIMEOUT), cwd=inside,
+                                         env=env, on_spawn=on_spawn)
         except Exception as exc:
             return ActionResult(False, friendly_error(exc, "没能启动 claude"), "")
         finally:

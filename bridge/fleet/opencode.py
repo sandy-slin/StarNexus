@@ -11,6 +11,11 @@
   readonly 不加，需要批准的操作直接失败。
 - 停：只停桥自己起的进程（`FleetJobs`）。终端里开着的 opencode 不发信号。
 - 进度：opencode 没有 Claude / Codex 那样的会话记录文件，进展卡只显示「在跑」，不列工具调用。
+- 中途插话（1.8.0，2026-11-18 实测）：接着聊时如果本机常驻服务在（`opencode service status` 给出地址），
+  就不加 `--standalone`，走常驻服务（它按会话自己的 directory 干活，实测写对了目录）。这样一轮在跑时
+  `opencode api POST /api/session/<id>/prompt {delivery: steer}` 能插进**同一个服务**里的这一轮。
+  🔴 走常驻服务时只杀 `opencode run` 客户端**停不下**那一轮（实测杀掉后服务里照样在跑），
+  所以 stop 先调 `/interrupt` 再收进程。新建会话仍走 `--standalone`（第一轮不能插话）。
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,95}$")
 SQLITE_TIMEOUT_SEC = 1.0
 DEFAULT_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
 STOPPED_BY_OWNER = "这一轮已按你的要求停下。会话还在，直接说下一句就能接着聊。"
+STEER_OK = "↪️ 已插进正在跑的这一轮，它做完手上这一步就会看到。"
+WHY_STEER_NOT_RUNNING = "这一轮已经结束或不是从飞书起的，插不进去。"
 # 2026-11-17 实测：opencode 自己的默认模型（本机是 grok-4.6）走一次工具调用要 4~8 分钟，
 # 甚至一个「建个文件」都超时；`cpa-gui/gpt-5.6-luna` 同样的事 5 秒做完。
 # 默认用它，想换就设 CARHER_OPENCODE_MODEL。
@@ -80,6 +87,8 @@ class OpencodeAdapter(Adapter):
         self.binary = binary
         self._send_guard = threading.Lock()
         self._sending: set = set()
+        # 这几轮走的是常驻服务（能插话、停要调 /interrupt）
+        self._via_service: set = set()
 
     # ---------- 读 ----------
 
@@ -197,10 +206,34 @@ class OpencodeAdapter(Adapter):
                     len(cands))
         return self._bin_pick
 
-    def _argv(self, text: str, mode: Optional[str], model: str, sid: str = "", fork: bool = False) -> list:
+    def _service_up(self) -> bool:
+        """本机常驻服务在不在。读不出来一律当不在（退回 `--standalone`，只是不能插话）。"""
+        try:
+            res = self.runner.run([self._bin(), "service", "status"], timeout=10)
+        except Exception:  # noqa: BLE001
+            return False
+        out = str(getattr(res, "stdout", "") or "").strip()
+        return getattr(res, "returncode", 1) == 0 and out.startswith("http")
+
+    def _api(self, method: str, path: str, data: Optional[dict] = None, timeout: float = 30) -> dict:
+        argv = [self._bin(), "api", method, path]
+        if data is not None:
+            argv += ["-d", json.dumps(data, ensure_ascii=False)]
+        res = self.runner.run(argv, timeout=timeout)
+        if getattr(res, "returncode", 1) != 0:
+            return {}
+        try:
+            got = json.loads(getattr(res, "stdout", "") or "{}")
+        except ValueError:
+            return {}
+        return got if isinstance(got, dict) else {}
+
+    def _argv(self, text: str, mode: Optional[str], model: str, sid: str = "", fork: bool = False,
+              standalone: bool = True) -> list:
         # `--standalone`：用它自己的私有服务，**按我们给的 cwd** 干活。不加的话它连本机常驻服务，
-        # 实测文件写到了那个服务当前开的项目里（我的实测把 oc.txt 写进了 remote_control）。
-        argv = [self._bin(), "run", "--standalone", "--format", "json"]
+        # 实测**新会话**的文件写到了那个服务当前开的项目里（我的实测把 oc.txt 写进了 remote_control）。
+        # 接着聊一个已有会话时，常驻服务按会话自己的 directory 干活（1.8.0 实测），可以不加。
+        argv = [self._bin(), "run"] + (["--standalone"] if standalone else []) + ["--format", "json"]
         if (mode or "readonly") in ("trusted", "write"):
             argv.append("--auto")
         argv += ["-m", model or DEFAULT_MODEL]
@@ -295,16 +328,58 @@ class OpencodeAdapter(Adapter):
             if id in self._sending:
                 return ActionResult(False, "手机上发的上一句还在跑，等它回来。", id)
             self._sending.add(id)
+        via_service = self._service_up()
+        if via_service:
+            with self._send_guard:
+                self._via_service.add(id)
         try:
-            res, spawned = self._run(self._argv(text, mode or "readonly", model, sid=id), sess.cwd, timeout, id)
+            argv = self._argv(text, mode or "readonly", model, sid=id, standalone=not via_service)
+            res, spawned = self._run(argv, sess.cwd, timeout, id)
         except Exception as exc:
             return ActionResult(False, friendly_error(exc, "没发出去"), id)
         finally:
             with self._send_guard:
                 self._sending.discard(id)
+                self._via_service.discard(id)
         return self._result(res, spawned, id)
 
+    # ---------- steer：一轮在跑时中途插话 ----------
+
+    def steerable(self, id: str) -> bool:
+        with self._send_guard:
+            return id in self._sending and id in self._via_service
+
+    def steer(self, id: str, text: str) -> ActionResult:
+        """把一句话插进常驻服务里正在跑的这一轮（`delivery: steer`）。
+
+        只认桥自己发起、走常驻服务、还没回来的那一轮；服务里这一轮已经不在跑 ⇒ 不发
+        （发了会在没人等的情况下另起一轮，回复就丢了）。
+        """
+        sid = str(id or "")
+        text = str(text or "").strip()
+        if not text:
+            return ActionResult(False, "要发的话是空的。", sid)
+        if not is_session_id(sid) or not self.steerable(sid):
+            return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+        active = self._api("GET", "/api/session/active", timeout=10)
+        if sid not in (active.get("data") or {}):
+            return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+        got = self._api("POST", f"/api/session/{sid}/prompt", {"text": text, "delivery": "steer"})
+        data = got.get("data") if isinstance(got.get("data"), dict) else {}
+        if data.get("delivery") != "steer":
+            logger.info("opencode 插话 没插进 会话=%s", sid[:12])
+            return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+        logger.info("opencode 插话 写入 会话=%s 字数=%d", sid[:12], len(text))
+        return ActionResult(True, STEER_OK, sid, delivered=True)
+
     def stop(self, id: str) -> ActionResult:
-        if self.jobs.jobs(tool=TOOL, session_id=str(id or "")):
-            return self.stop_own(id)
-        return ActionResult(False, "它现在没有在跑从手机上发的任务，没有可停的。", str(id or ""))
+        sid = str(id or "")
+        if self.jobs.jobs(tool=TOOL, session_id=sid):
+            with self._send_guard:
+                via_service = sid in self._via_service
+            if via_service and is_session_id(sid):
+                # 🔴 只杀客户端停不下常驻服务里的那一轮（实测），先让服务中断它
+                got = self._api("POST", f"/api/session/{sid}/interrupt", timeout=15)
+                logger.info("opencode 停下 走常驻服务 interrupted=%s 会话=%s", got.get("interrupted"), sid[:12])
+            return self.stop_own(sid)
+        return ActionResult(False, "它现在没有在跑从手机上发的任务，没有可停的。", sid)

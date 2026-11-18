@@ -529,6 +529,86 @@ def case_menu_m(dm: str) -> tuple:
     return False, "会话群 60 秒内没看到挪到最下面的状态卡"
 
 
+def _steer_texts_ok(texts: list, orig: str) -> str:
+    if any(orig in t for t in texts):
+        return "原任务照样做完了，插话没生效"
+    if any("上一条还在发" in t or "这条排上了" in t for t in texts):
+        return "仍回了排队提示"
+    if any(t.find("提示：") >= 0 and "照常发过去" in t for t in texts):
+        return "仍冒出无需处理的「提示」"
+    return ""
+
+
+def case_steer_dm(dm: str) -> tuple:
+    """FC-39（1.8.0）：私聊里桥自己跑的 Claude 一轮在跑时再说一句 ⇒ 插进这一轮，不再回「这条排上了」。"""
+    tag = time.strftime("%H%M%S")
+    send(dm, "/cancel")
+    time.sleep(4)
+    send(dm, f"用 Bash 工具依次执行 10 次 `sleep 4`，每次单独调用一次工具，全部做完后只回复 LR-DMORIG-{tag}")
+    time.sleep(25)
+    send(dm, f"改主意了：立即停止剩下的 sleep，不要再调用任何工具，只回复 LR-DMSTEER-{tag}")
+    if not wait_bot(dm, "已插进正在跑的这一轮", timeout=30):
+        return False, "私聊没看到「已插进正在跑的这一轮」回执"
+    if not wait_bot(dm, f"LR-DMSTEER-{tag}", timeout=180):
+        return False, "插话后没回 LR-DMSTEER"
+    why = _steer_texts_ok([t for t in bot_texts(dm, 15)], f"LR-DMORIG-{tag}")
+    return (False, why) if why else (True, "私聊同一轮改做新指令")
+
+
+def case_steer_first_turn(dm: str) -> tuple:
+    """FC-40（1.8.0）：新建 Claude 会话的第一轮还在跑、群还没建好时私聊再说一句 ⇒ 插进第一轮，回复进新群。"""
+    tag = time.strftime("%H%M%S")
+    name = "lr-fsteer-" + tag
+    path = os.path.join(WORK, name)
+    os.makedirs(path, exist_ok=True)
+    before = set(binds())
+    send(dm, "/cancel")
+    time.sleep(4)
+    if not send(dm, f"/ns claude {name} {path}"):
+        return False, "发 /ns 失败"
+    time.sleep(6)
+    send(dm, f"用 Bash 工具依次执行 10 次 `sleep 4`，每次单独调用一次工具，全部做完后只回复 LR-FORIG-{tag}")
+    time.sleep(30)
+    send(dm, f"改主意了：立即停止剩下的 sleep，不要再调用任何工具，只回复 LR-FSTEER-{tag}")
+    if not wait_bot(dm, "已插进正在跑的这一轮", timeout=30):
+        return False, "私聊没看到「已插进正在跑的这一轮」回执"
+    chat = wait_new_group(before, timeout=240)
+    if not chat:
+        return False, "没建群"
+    if not wait_bot(chat, f"LR-FSTEER-{tag}", timeout=120):
+        return False, "新群里没看到插话后的回复"
+    why = _steer_texts_ok(bot_texts(chat, 20) + bot_texts(dm, 10), f"LR-FORIG-{tag}")
+    return (False, why) if why else (True, f"第一轮被插话改向，回复进了 {group_name(chat)}")
+
+
+def case_steer_opencode(dm: str) -> tuple:
+    """FC-41（1.8.0）：opencode 会话群里一轮在跑时再说一句 ⇒ 插进这一轮（常驻服务 delivery=steer）。"""
+    tag = time.strftime("%H%M%S")
+    name = "lr-ocsteer-" + tag
+    chat, why = _new_session(dm, "opencode", name, "回归测试，只回复 LR-START")
+    if not chat or not wait_bot(chat, "LR-START", timeout=240):
+        return False, why or "首句没回"
+    send(chat, f"用 bash 依次执行 10 次 `sleep 4 && date >> steer.txt`，每次单独调用一次工具，全部做完后回复 LR-OCORIG-{tag}")
+    time.sleep(22)
+    send(chat, f"改主意了：立即停止剩下的 sleep，不要再调用任何工具，只回复 LR-OCSTEER-{tag}")
+    if not wait_bot(chat, "已插进正在跑的这一轮", timeout=40):
+        return False, "没看到「已插进正在跑的这一轮」回执"
+    if not wait_bot(chat, f"LR-OCSTEER-{tag}", timeout=180):
+        return False, "插话后没回 LR-OCSTEER"
+    why = _steer_texts_ok(bot_texts(chat, 30), f"LR-OCORIG-{tag}")
+    if why:
+        return False, why
+    lines = 0
+    try:
+        with open(os.path.join(WORK, name, "steer.txt"), encoding="utf-8") as fh:
+            lines = sum(1 for _ in fh)
+    except OSError:
+        pass
+    if lines >= 10:
+        return False, f"10 次都跑完了（{lines}）"
+    return True, f"插进同一轮，跑了 {lines} 次后改做新指令"
+
+
 CASES = {
     "ns_claude": case_ns_claude,
     "ns_codex": case_ns_codex,
@@ -539,6 +619,9 @@ CASES = {
     "image": case_image,
     "stop": case_stop,
     "steer_claude": case_steer_claude,
+    "steer_dm": case_steer_dm,
+    "steer_first_turn": case_steer_first_turn,
+    "steer_opencode": case_steer_opencode,
     "choices": case_choices,
     "codex_trusted": case_codex_trusted,
     "term_stop": case_term_stop,
