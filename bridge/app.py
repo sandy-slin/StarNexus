@@ -161,7 +161,7 @@ from .menu import HELP  # noqa: E402
 
 # 会话总控（bridge/fleet）。不带斜杠的说法只认**整条消息就是这个词**，
 # 免得「会话为什么断了」这种正常问题被当成命令吃掉。
-FLEET_COMMANDS = frozenset({"/sessions", "/session", "/会话", "/总控"})
+FLEET_COMMANDS = frozenset({"/sessions"})
 FLEET_WORDS = frozenset({"会话", "总控"})
 CANCEL_COMMANDS = frozenset({"/cancel"})
 # 🔴 2026-11-06 第 9 轮复审 #3：原来只认精确的「取消」两个字 ⇒ 手机输入法自动补的「取消。」、
@@ -173,7 +173,7 @@ CANCEL_WORDS = frozenset({"取消", "退出", "退出对话", "算了", "停止�
 _CANCEL_WORD_ALWAYS = "取消"
 # 诊断卡：同事"坏了"的时候，能转给你和 IT 的那张脱敏卡（bridge/status.py 文件头）。
 # 不带斜杠的「诊断」也要认 —— 同事在手机上打的就是这两个字。
-DIAG_COMMANDS = frozenset({"/诊断", "/diag", "/diagnose"})
+DIAG_COMMANDS = frozenset({"/诊断"})
 DIAG_WORDS = frozenset({"诊断"})
 # 「更新」=「现在就去看有没有新版，有就装」（第 14 轮）。他不用等那 10 分钟一次的检查。
 UPDATE_WORDS = frozenset({"更新", "升级", "更新一下", "检查更新"})
@@ -2649,10 +2649,10 @@ class Bridge:
                     gate.clear(scope)
             self._say(chat_id, changed.reply)
             return True
-        if command in {"/history", "/历史", "/最近"}:
+        if command == "/history":
             self._send_history_card(scope, chat_id)
             return True
-        if command in {"/help", "/h"}:
+        if command == "/help":
             self._say_with_buttons(chat_id, HELP, self._help_buttons())
             return True
         if command in {"/mode", "/权限", "/p"}:
@@ -2667,7 +2667,7 @@ class Bridge:
             # 和点了确认按钮等价，所以不必再拦一次。
             self._handle_mode(chat_id, text, confirmed=True)
             return True
-        if command in {"/model", "/模型"}:
+        if command == "/model":
             self._handle_model(chat_id, text)
             return True
         if command == "/status":
@@ -2736,7 +2736,7 @@ class Bridge:
                 or "读不出状态。过一分钟再发一次「诊断」。",
             )
             return True
-        if command in {"/update", "/upgrade"} or stripped in UPDATE_WORDS:
+        if command == "/update" or stripped in UPDATE_WORDS:
             # 第 14 轮：他不用等那 10 分钟一次的检查。阻塞的活（查网、下包、跑安装包）丢线程里，
             # 这里先回一句 —— 不然他看着没反应，而安装包最长要跑几分钟。
             self._say(chat_id, "好，去看看有没有新版…")
@@ -2755,15 +2755,15 @@ class Bridge:
             self._say(chat_id, "好，新话题。前面聊的不带了。")
             self._send_menu(chat_id, scope)
             return True
-        if command in {"/find", "/搜会话", "/找会话"} or text.startswith(("找会话 ", "搜会话 ")):
+        if command == "/find" or text.startswith(("找会话 ", "搜会话 ")):
             query = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
             await self._fleet_search(scope, chat_id, query)
             return True
-        if command in {"/fork", "/复制会话", "/archive", "/归档", "/rename", "/重命名"} \
+        if command in {"/fork", "/archive", "/rename"} \
                 or text.strip() in ("复制会话", "归档会话"):
             await self._session_manage(scope, chat_id, command, text)
             return True
-        if command in {"/stop", "/s"}:
+        if command == "/stop":
             event = self._cancels.get(scope)
             # 🔴 「停」要停全部 —— 包括**停在等审批**的那一步。
             # 原来只置位取消事件，待批准的卡片还留着：用户说了停，
@@ -3298,12 +3298,12 @@ class Bridge:
         from .fleet.model import can as _can
 
         if bound is None or not _can(bound.tool, "start"):
-            self._say(chat_id, "这个命令要在会话群里用：复制会话 /fork、归档 /archive、重命名 /rename 新名字。")
+            self._say(chat_id, "这个要在会话群里用：在会话群里发 /m，状态卡上就有。")
             return
         word = text.strip()
-        if command in ("/fork", "/复制会话") or word == "复制会话":
+        if command == "/fork" or word == "复制会话":
             await self._session_fork(scope, chat_id, bound)
-        elif command in ("/archive", "/归档") or word == "归档会话":
+        elif command == "/archive" or word == "归档会话":
             await self._session_archive(chat_id, bound)
         else:
             name = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
@@ -6497,14 +6497,14 @@ class Bridge:
             if value.get("src") == "sc" and chat_id:
                 # 状态卡是置顶的那条：在原地换成模型卡，选完模型状态卡一刷新就把模型卡盖掉
                 # ⇒ 推理强度没法接着选。模型卡另发一条，状态卡留在原位。
-                self._in_background(self._send_card_or_text, chat_id, card, "🧠 发「/model」查看和切换模型")
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /m 再试一次")
                 return reply("info", "模型卡已发到群里")
             return reply("info", "模型总览", card)
         if op == "open":
             card = list_card(mp, to, tool, sid, label)
             if value.get("src") == "m" and chat_id:
                 # 1.4.0 /m 卡上点的：/m 卡留在原位，选模型那张另发一条（下拉选完就生效）
-                self._in_background(self._send_card_or_text, chat_id, card, "🧠 发「/model」查看和切换模型")
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /m 再试一次")
                 return reply("info", f"选 {LABELS.get(tool, tool)} 的默认模型")
             return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", card)
         if op == "m":

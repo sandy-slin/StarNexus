@@ -101,7 +101,7 @@ _PINNED_CONTROLS = ("/sessions", "/newsession")
 # 1.4.0：/m 卡上「更多」里的顺序（权限、模型在卡上有自己的一排，不再放按钮）
 _MORE_CONTROLS = ("/dirs", "/history", "/status", "/诊断", "/update", "/help", "/new", "/stop")
 # 卡底那行快捷命令（熟手照着打；新手只记 /m）
-SHORTCUTS = "`/ns` 新建会话 · `/p r|w|f` 权限 · `/stop` 停下 · `/sessions` 会话总览"
+SHORTCUTS = "`/ns` 新建会话 · `/p r|w|f` 权限 · `/stop` 停下"
 ASK_M = "不知道怎么做就发 /m"
 _PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
 
@@ -151,7 +151,7 @@ HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话
 
 电脑睡着时收不到消息，醒了也不会补发 —— 发了没回先看看电脑是不是睡了。
 
-快捷命令（熟了再用）：/ns 新建会话 · /p r|w|f 权限 · /stop 停下 · /sessions 会话总览。
+快捷命令（熟了再用）：/ns 新建会话 · /p r|w|f 权限 · /stop 停下。
 """
 
 
@@ -167,19 +167,19 @@ HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话
 # `_APP_LITERALS` 里重抄一遍，并由 `tests/test_menu.py::test_known_commands_cover_app_branches`
 # 扫 app.py 源码盯着 —— 那条测试红了就是有人加了命令没登记，而不是等用户踩到。
 _APP_LITERALS = frozenset({
-    "/help", "/h",
+    "/help",
     "/mode", "/权限", "/p", "/mode!",
-    "/model", "/模型",
+    "/model",
     "/status",
     "/new",
-    "/stop", "/s",
+    "/stop",
     "/resume",
     "/talk!",
-    "/session", "/sessions", "/会话", "/总控",
+    "/sessions",
     "/cancel",
-    "/诊断", "/diag", "/diagnose",
-    "/update", "/upgrade",   # 第 14 轮：自动更新（「更新」两个字也认，见 app.UPDATE_WORDS）
-    "/history", "/历史", "/最近",   # 「↑ 最近问过」（bridge/history.py）
+    "/诊断",
+    "/update",   # 第 14 轮：自动更新（「更新」两个字也认，见 app.UPDATE_WORDS）
+    "/history",   # 「↑ 最近问过」（bridge/history.py）
 })
 
 # 一个 token 像不像"命令"：`/` 后面跟字母或汉字，中间不能再有 `/`。

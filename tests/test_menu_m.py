@@ -331,5 +331,27 @@ class CompatCopyTest(unittest.TestCase):
         self.assertEqual(buttons[-1]["text"]["content"], "📋 菜单")
 
 
+    def test_m21_redundant_aliases_removed(self):
+        known = {c.lower() for c in menu.known_commands()}
+        for cmd in ("/h", "/s", "/session", "/会话", "/总控", "/历史", "/最近", "/模型", "/diag", "/diagnose",
+                    "/upgrade", "/ls", "/pwd", "/where", "/新建会话", "/搜会话", "/找会话", "/复制会话", "/归档",
+                    "/重命名"):
+            self.assertNotIn(cmd, known)
+            line, _ = menu.unknown_command_reply(cmd)
+            self.assertIn(menu.ASK_M, line)
+        from bridge.fleet import newsession
+        from bridge import workspace
+
+        for cmd in ("/p", "/stop", "/cd", "/fork", "/archive"):
+            self.assertIn(cmd, known)
+        self.assertEqual(newsession.COMMANDS, {"/newsession", "/ns"})
+        self.assertEqual(workspace.COMMANDS, {"/cd", "/dirs"})
+
+    def test_m22_user_text_advertises_only_core_commands(self):
+        for text in (menu.HELP, menu.SHORTCUTS):
+            for gone in ("/sessions", "/dirs", "/model", "/mode!"):
+                self.assertNotIn(gone, text)
+
+
 if __name__ == "__main__":
     unittest.main()

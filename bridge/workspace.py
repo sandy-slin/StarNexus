@@ -102,7 +102,7 @@ class CdResult:
 
 
 # 这个模块认领的命令。放在模块里而不是 app.py 里，是为了加命令时只动一个文件。
-COMMANDS = frozenset({"/cd", "/dirs", "/ls", "/pwd", "/where"})
+COMMANDS = frozenset({"/cd", "/dirs"})
 
 # 原来这里有一份 `HELP_LINES`（叫人打 `/dirs`、`/cd carher-admin`），零调用方，
 # 而且例句写死了我们自己的仓库名 —— 第 11 轮删掉。帮助全文只有一份：`menu.HELP`。
@@ -359,7 +359,7 @@ def resolve_request(policy: Policy, current: str, raw: str) -> CdResult:
             Outcome.EMPTY,
             # 他已经在打 `/cd` 了（只是没带名字）⇒ 告诉他怎么补全；不知道有哪些就去点按钮。
             "要去哪个项目？在 /cd 后面空一格打项目名就行。"
-            f"不知道有哪些，点菜单里的{DIRS_BUTTON}（或者发 /dirs）。",
+            f"不知道有哪些，点菜单里的{DIRS_BUTTON}。",
         )
 
     if _looks_like_path(raw):
@@ -629,15 +629,8 @@ def handle(
     if command not in COMMANDS:
         return None
 
-    if command in {"/dirs", "/ls"}:
+    if command == "/dirs":
         return CdResult(Outcome.SAME, list_dirs(policy, current), workspace=current)
-
-    if command in {"/pwd", "/where"}:
-        return CdResult(
-            Outcome.SAME,
-            f"现在在：{_short(current, policy)}\n想换就点菜单里的{DIRS_BUTTON}。",
-            workspace=current,
-        )
 
     # /cd
     raw = parts[1] if len(parts) > 1 else ""
