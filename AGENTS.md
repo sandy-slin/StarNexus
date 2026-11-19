@@ -29,6 +29,8 @@
 | 群进展通知 | [`bridge/fleet/grouppush.py`](bridge/fleet/grouppush.py) | 需要人介入必须推送；普通过程更新不刷屏 |
 | CEO 编排 | [`bridge/fleet/ceo.py`](bridge/fleet/ceo.py) | CEO 负责拆分、派发、汇总、仲裁和向人请求决策 |
 | 产品定义：完全控制 Claude / Codex | [`docs/product/full-control.md`](docs/product/full-control.md) | 新功能先对照能力矩阵和验收用例 FC-01~FC-20 |
+| 用户操作梳理（1.9.4） | [`docs/product/ux-review-1.9.4.md`](docs/product/ux-review-1.9.4.md) | 改菜单 / 卡片前先对照，入口要收敛不堆砌 |
+| 阶段二：董事长 / CEO | [`docs/product/ceo-design.md`](docs/product/ceo-design.md) | 只复用阶段一能力；按 2.0.0~2.3.0 拆版，验收 CEO-01~12 |
 | 中途插话（一轮在跑时插一句） | [`docs/product/steering.md`](docs/product/steering.md) | 按 `can(tool, "steer")` 判断；不支持就退回排队并明说；codex 升级后先跑 `docs/research/steering-probes/` 探针 |
 
 ## 代码变更后的最低门禁
