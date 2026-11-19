@@ -25,9 +25,34 @@ set -uo pipefail   # 故意不用 -e：自检要把所有项都跑完，不能�
 BLUE=$'\033[1;34m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[1;31m'; NC=$'\033[0m'
 say()  { printf '%s%s%s\n' "$BLUE" "$1" "$NC"; }
 ok()   { printf '%s  ✓ %s%s\n' "$GREEN" "$1" "$NC"; }
-bad()  { printf '%s  ✗ %s%s\n' "$RED" "$1" "$NC"; FAILED=$((FAILED+1)); }
-warn() { printf '%s  ⚠ %s%s\n' "$YELLOW" "$1" "$NC"; }
-hint() { printf '      → %s\n' "$1"; }
+bad()  { printf '%s  ✗ %s%s\n' "$RED" "$1" "$NC"; FAILED=$((FAILED+1)); SCREEN="${SCREEN:-}✗ $1"$'\n'; }
+warn() { printf '%s  ⚠ %s%s\n' "$YELLOW" "$1" "$NC"; SCREEN="${SCREEN:-}⚠ $1"$'\n'; }
+hint() { printf '      → %s\n' "$1"; SCREEN="${SCREEN:-}  → $1"$'\n'; }
+# 明细行（每一类报错各多少次这种）：屏幕上照旧，同时记进上报那一份。ok/say 不记 —— 绿的那些对定位没用
+note() { printf '        %s\n' "$1"; SCREEN="${SCREEN:-}    $1"$'\n'; }
+# 第 38 轮（主人：不许让用户截图）：有红项 / 说了「我们这边会跟进」的项（NEED_REPORT=1）⇒ 结论那一屏后
+# 把这一屏的结论行（上面 bad/warn/hint 记的，本来就不含日志原文和 Secret）+ 几项诊断发回 198。
+#   🔴 屏幕上不提「已上报」（11-16 用户要求）。不发电脑名 / 登录名，家目录换成 ~；机器号用 install_id（同 fleet-report）。
+#   只读纪律不变：只多一个 POST，不改本机任何东西。8 秒发不出去就算了。CARHER_NO_REPORT=1 关掉。
+SCREEN=""
+NEED_REPORT=0
+doctor_report() {
+  ( set +eu
+    [ "${CARHER_NO_REPORT:-}" = 1 ] && exit 0; [ -n "${PYTEST_CURRENT_TEST:-}" ] && exit 0
+    command -v curl >/dev/null 2>&1 || exit 0
+    js() { LC_ALL=C tr '\t' ' ' | LC_ALL=C tr -d '\000-\010\013-\037\177' | sed "s#$HOME#~#g" | LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+             | LC_ALL=C awk 'BEGIN{ORS=""} {if (NR>1) print "\\n"; print}'; }
+    iid="$(head -c 64 "$APP_HOME/install_id" 2>/dev/null | tr -cd '0-9a-f')"
+    diag="$(printf 'install_id=%s\nbuild=%s latest=%s\napp=%s\nsw_vers=%s arch=%s\nfailed=%s\nproxy=%s\nlaunchctl=%s\n' \
+      "$iid" "${MY_BUILD:-}" "${LATEST_BUILD:-}" "${APP_ID_HEAD:0:12}" "$(sw_vers -productVersion 2>/dev/null)" "$(uname -m)" "$FAILED" \
+      "$(env | grep -iE '^(https?|all)_proxy=' | sed -E 's#(://[^/:@]+:)[^@/]+@#\1***@#' | tr '\n' ' ')" \
+      "$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -E '^\s*(state|runs|last exit code|pid) =' | tr -s ' ' | tr '\n' ';')")"
+    first="$(printf '%s' "$SCREEN" | grep -m1 '^✗' || printf '%s' "$SCREEN" | grep -m1 '^⚠')"
+    body="{\"tool\":\"her-remote-doctor\",\"os\":\"mac\",\"osver\":\"$(sw_vers -productVersion 2>/dev/null | js)\",\"arch\":\"$(uname -m | js)\",\"build\":\"$(printf %s "${MY_BUILD:-}" | js)\",\"step\":\"doctor\",\"msg\":\"$(printf '自检 %s 项红：%s' "$FAILED" "$first" | js)\",\"logs\":{\"screen.txt\":\"$(printf %s "$SCREEN" | tail -c 60000 | js)\",\"diag.txt\":\"$(printf %s "$diag" | js)\"}}"
+    printf %s "$body" | curl -fsS -m 8 -o /dev/null -X POST -H 'Content-Type: application/json' --data-binary @- \
+      "${CARHER_REPORT_URL:-https://chat.auto-link.com.cn/ai/api/install-report}" >/dev/null 2>&1 ) || true
+  return 0
+}
 
 APP_HOME="$HOME/.carher-feishu-agent"
 CONFIG="$APP_HOME/config.toml"
@@ -207,7 +232,7 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   if [ -n "$RESTARTS" ] && [ "$RESTARTS" -gt 20 ] 2>/dev/null; then
     warn "已重启 $RESTARTS 次 —— 大概是起来就崩、崩了又被拉起"
     hint "先看下面 [5] 那项：凭据不对是最常见的一种"
-    hint "[5] 是绿的就重新双击 feishu-agent-mac.command；还这样就把这个窗口截图发给管理员"
+    hint "[5] 是绿的就重新双击 feishu-agent-mac.command；还这样也不用截图，我们这边会跟进"; NEED_REPORT=1
   fi
 else
   bad "服务没注册 ⇒ 关机或重启之后它不会自己起来"
@@ -265,7 +290,7 @@ if [ -f "$CONFIG" ]; then
         hint "去 open.feishu.cn 右上角「创建版本」→「申请发布」，等管理员审批" ;;
       *)  bad "凭据校验失败（code ${CODE:-没拿到回应}）"
         hint "上面 [4] 那项红的话先解决网络，这一项会跟着好"
-        hint "[4] 是绿的就把这个窗口截图发给给你装的同事" ;;
+        hint "[4] 是绿的就隔几分钟再跑一次本自检；不用截图，我们这边会跟进"; NEED_REPORT=1 ;;
     esac
   else
     bad "配置里没写机器人凭据 ⇒ 谁发消息它都收不到"
@@ -418,7 +443,7 @@ if [ -f "$CONFIG" ]; then
     fi
   else
     bad "还没绑定主人，也没有配对码 ⇒ 你发的消息它都不会理"
-    hint "重新双击你的安装包；还不行就把这份诊断截图发给给你装的同事"
+    hint "重新双击你的安装包，最后一屏会给一个配对码；还不行也不用截图，我们这边会跟进"; NEED_REPORT=1
   fi
 fi
 echo
@@ -498,17 +523,24 @@ if [ -f "$LOG" ]; then
     # 而这一屏是用户最可能截图外发的一屏（同 bridge/status.py 的 ERROR_CLASSES）。
     # 原来这里 `tail -3 | sed` 把原文整行打出来 —— 那是一条外发凭据的路。
     warn "日志里有 ${ERRS} 条报错。最近这些属于："
-    printf '%s\n' "连不上飞书|connect failed" "长连接断开|receive message loop exit" \
-      "看门狗重启|长连接已静默" "卡片发不出|卡片发送失败" "消息发不出|飞书回消息失败" \
-      "凭据或权限被拒|99991672" "它没回话|零输出" \
-    | while IFS='|' read -r NAME PAT; do
-        N="$(grep -c -- "$PAT" "$LOG" 2>/dev/null || echo 0)"
-        [ "${N:-0}" -gt 0 ] 2>/dev/null && printf '        · %s %s 次\n' "$NAME" "$N"
-      done
+    # 🔴 11-18：这几行原来 `… | while read` ⇒ 循环体在子 shell 里，`note` 攒的 SCREEN 带不出来；
+    #   而且原来直接 printf，根本没进 SCREEN ⇒ 上报里只有「有 N 条报错」这个总数，哪一类各多少次一个都看不到。
+    #   改成 here-doc 喂给 while（循环体留在当前 shell）。只有类别名和次数，没有日志原文。
+    while IFS='|' read -r NAME PAT; do
+      [ -n "$PAT" ] || continue
+      N="$(grep -c -- "$PAT" "$LOG" 2>/dev/null || echo 0)"
+      [ "${N:-0}" -gt 0 ] 2>/dev/null && note "· ${NAME} ${N} 次"
+    done <<'ERRCLASS_EOF'
+连不上飞书|connect failed
+长连接断开|receive message loop exit
+看门狗重启|长连接已静默
+卡片发不出|卡片发送失败
+消息发不出|飞书回消息失败
+凭据或权限被拒|99991672
+它没回话|零输出
+ERRCLASS_EOF
     hint "「连不上飞书 / 长连接断开」⇒ 看最上面 [0] 的第三行，照那里的 → 做"
-    hint "「凭据或权限被拒」⇒ 看上面 [5]；别的类别就把这个窗口截图发给管理员"
-    hint "要给管理员看原文的话，自己打开这个文件看一眼再发：open -e $LOG"
-    hint "里面有你的用户名和文件路径，发出去之前自己确认一下"
+    hint "「凭据或权限被拒」⇒ 看上面 [5]；别的类别重新双击 feishu-agent-mac.command 试一次，不用截图，我们这边会跟进"; NEED_REPORT=1
   else
     ok "没有报错"
   fi
@@ -605,7 +637,7 @@ if [ -f "$LOG" ]; then
   if [ "${SILENT_N:-0}" -gt 3 ] 2>/dev/null; then
     warn "它自己因为「很久没动静」重启过 ${SILENT_N} 次 —— 这条网络上连接不太稳"
     hint "每次重启之间的消息都是丢的。换个网络（比如换成手机热点）再观察一天"
-    hint "换了网络还这样，就把这个窗口截图发给管理员"
+    hint "换了网络还这样也不用截图，我们这边会跟进"; NEED_REPORT=1
   fi
 else
   warn "还没有日志，没法判断上次有动静是什么时候"
@@ -655,14 +687,16 @@ fi
 echo "       这一屏跑的时间：$(date '+%Y-%m-%d %H:%M:%S')"
 if [ "$FAILED" -ne 0 ]; then
   echo
-  echo "   还是不行就把这个窗口整屏截图发给管理员。"
-  echo "   他要日志的话再自己打开看一眼：open -e $LOG"
-  echo "   （里面有你的用户名和文件路径，发出去之前自己确认一下）"
+  echo "   照上面的 → 处理完还是不行：重新双击 feishu-agent-mac.command 试一次。不用截图，我们这边会跟进。"
 fi
+[ "$FAILED" -ne 0 ] || [ "$NEED_REPORT" = 1 ] && doctor_report
 say "=================================================="
 echo
 echo "   要卸载（离职 / 换机 / 不想用了）："
-echo "       双击 feishu-agent-uninstall-mac.command"
+echo "       双击桌面上的「CarHer 助手卸载」"
+# 桌面那个没放上（没桌面目录 / 系统不让写）时的兜底：给程序目录里那份的全路径。
+# 🔴 `feishu-agent-uninstall-mac.command` 这个文件名字符串必须留着 —— 它是兜底入口。
+echo "       桌面上没有的话：在「终端」里粘 bash ~/.carher-feishu-agent/feishu-agent-uninstall-mac.command 回车"
 echo "   它会先列出要删什么再问你，并安全擦除配置里的 App Secret。"
 echo "   飞书那边的自建应用要你自己去 open.feishu.cn 停用 —— 脚本删不掉云端的东西。"
 echo

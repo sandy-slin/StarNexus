@@ -281,6 +281,9 @@ class MenuHeal:
         if missing:
             return self._failed(f"缺权限 {', '.join(missing)}", missing=missing)
         human = bm._human(out, table if table is not None else bm.CONFIG_ERRORS)
+        # 第 38 轮：文案承诺「我们这边会跟进」的码按 ERROR 记一条固定模板 ⇒ errreport 报上来（每天同一指纹只报一次）
+        if getattr(bm, "report_code", None) and bm.report_code(out) is not None:
+            logger.error("常驻菜单写不进去，飞书回了要我们跟进的错误码 %s（%s）", bm.report_code(out), step)
         return self._failed(f"{step}失败 code={out.get('code')}", detail=human)
 
     def _failed(self, short: str, *, detail="", missing=()) -> bool:

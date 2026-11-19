@@ -185,6 +185,10 @@ _APP_LITERALS = frozenset({
     "/cancel",
     "/诊断", "/diag", "/diagnose",
     "/update", "/upgrade",   # 第 14 轮：自动更新（「更新」两个字也认，见 app.UPDATE_WORDS）
+    # 第 39 轮：「卸载」只回指引（见 app.UNINSTALL_WORDS）。登记在这里是为了和 `/update`
+    # 一致 —— 打 `/uninstall` 的人要拿到那段指引，而不是被兜底回「没有这个用法」。
+    # **不加菜单节点**：常驻菜单已经 10/10 满了（botmenu.MAX_NODES），而卸载是一辈子按一次的事。
+    "/uninstall", "/卸载",
     "/history", "/历史", "/最近",   # 「↑ 最近问过」（bridge/history.py）
 })
 

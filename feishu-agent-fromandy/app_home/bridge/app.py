@@ -144,7 +144,7 @@ def explain_ws_failure(code: int | None) -> str:
             "飞书拒绝了这条连接（403）。先确认应用的事件订阅方式选的是"
             "「使用长连接接收事件」，而且版本已经发布、管理员已经审批。"
         )
-    return f"认不出这个拒绝原因（code={code}），把这一行连同上一行日志一起发给 IT。"
+    return f"认不出这个拒绝原因（code={code}）—— 不用截图，我们这边会跟进。"
 
 
 # 🔴 例句里**不许写死任何仓库名或文件名**。原来是
@@ -175,6 +175,18 @@ DIAG_COMMANDS = frozenset({"/诊断", "/diag", "/diagnose"})
 DIAG_WORDS = frozenset({"诊断"})
 # 「更新」=「现在就去看有没有新版，有就装」（第 14 轮）。他不用等那 10 分钟一次的检查。
 UPDATE_WORDS = frozenset({"更新", "升级", "更新一下", "检查更新"})
+# 「卸载」= **只回指引，不代执行**（第 39 轮）。有人误装了，在手机上问「怎么卸载」，
+# 原来一点回应都没有 —— 这两个字不在任何词表里 ⇒ 当成普通问题丢给 claude 跑一整轮，
+# 而它既不知道卸载脚本叫什么，也不知道云端那一步。
+#
+# 🔴 **桥不许自己执行卸载**（用户拍板）：卸载不可逆；让桥去删自己的程序目录、注销自己的
+# 常驻任务是自毁 —— 死在半路上就没人收尾，也没法再回一句话说它做到哪儿了。他要卸载本来
+# 就得在电脑前双击那个脚本，这里只告诉他双击哪个、以及云端那一步必须他自己做。
+#
+# 词表只收**精确说法**：「删掉」「不想用了」这类宽词不收 —— 用户在对话里说
+# 「删掉这个文件」「这个库不想用了」不能触发卸载指引。
+UNINSTALL_COMMANDS = frozenset({"/uninstall", "/卸载"})
+UNINSTALL_WORDS = frozenset({"卸载", "怎么卸载", "如何卸载", "卸载助手", "我要卸载", "卸载掉"})
 # 诊断只读日志尾部这么多字节。日志能长到几十 MB，而卡片回调要在 3 秒内返回。
 _DIAG_LOG_TAIL_BYTES = 256 * 1024
 # 我们自己那套时间戳（`2026-11-05 14:55:01,118`）。SDK 的 `[Lark] [...]` 里也是同一形状。
@@ -206,7 +218,42 @@ def _is_cancel_word(text: str) -> bool:
 
 
 def _is_fleet_word(text: str) -> bool:
-    return (text or "").strip() in FLEET_WORDS | DIAG_WORDS | UPDATE_WORDS or _is_cancel_word(text)
+    return ((text or "").strip() in FLEET_WORDS | DIAG_WORDS | UPDATE_WORDS | UNINSTALL_WORDS
+            or _is_cancel_word(text))
+
+
+def uninstall_help(windows: bool | None = None) -> str:
+    """「卸载」这句话的回复：双击哪个、没有那个图标怎么办、云端那一步他自己做。
+
+    **按平台只给他那一条路**（`windows=None` ⇒ 看这台机器，见 osenv.IS_WINDOWS）。
+    两条都给等于让他自己判断自己用的是什么系统，而他问的就是「怎么卸载」。
+
+    下载地址从 `selfupdate.BASE_URL` 拼，不另写一份：那边是写死的白名单域名，
+    这里再抄一遍的话哪天改域名就只改一处，剩下那处把人送到一个 404。
+
+    云端那段的措辞**照 `feishu-agent-oneclick/src/uninstall-mac.sh` 末尾那段**，
+    不另编一套 —— 他在电脑上跑完脚本会再看到同一段话，两处对不上就会以为少做了什么。
+    """
+    from .osenv import IS_WINDOWS
+    from .selfupdate import BASE_URL
+
+    win = IS_WINDOWS if windows is None else bool(windows)
+    script = "feishu-agent-uninstall-windows.bat" if win else "feishu-agent-uninstall-mac.command"
+    desktop = "CarHer 助手卸载.bat" if win else "CarHer 助手卸载.command"
+    return "\n".join([
+        "卸载得在电脑上做，手机这边点不了 —— 我只能告诉你双击哪个。",
+        "",
+        f"1. 双击桌面上的「CarHer 助手卸载」（文件名是「{desktop}」）。"
+        "它会先列出要删哪些东西、问过你再动手：停掉常驻、擦掉凭据、删掉程序目录。",
+        f"2. 桌面上没有这个图标 —— 是老版本装的，下次自动更新后就会有。现在就想卸："
+        f"用浏览器打开 {BASE_URL}/{script} 下载，下完双击它。",
+        "3. 还有一件事脚本删不掉，要你自己做：去 open.feishu.cn 把你自己那个自建应用"
+        "**停用或删除**。打开 https://open.feishu.cn/app → 找到你的「Her remote」→ "
+        "右上角「停用应用」，或者「设置」里直接删除。",
+        "",
+        "第 3 步为什么必须做：本机删掉只是这台电脑不再干活了。那个应用和它的 App Secret "
+        "在飞书那边**仍然有效** —— 谁拿到凭据都能在别的机器上装一次，然后以你的名义收你的消息。",
+    ])
 
 
 def _redact_text(text: str) -> str:
@@ -2337,6 +2384,11 @@ class Bridge:
             self._say(chat_id, "好，去看看有没有新版…")
             threading.Thread(target=self._update_on_demand, args=(chat_id,),
                              daemon=True, name="update-now").start()
+            return True
+        if command in UNINSTALL_COMMANDS or stripped in UNINSTALL_WORDS:
+            # 第 39 轮：**只回指引，不代执行**（理由写在 UNINSTALL_WORDS 那里）。
+            # 没有线程、没有按钮：这里每一步都得他在电脑前自己做，给个按钮反而像点了就卸。
+            self._say(chat_id, uninstall_help())
             return True
         if command == "/new":
             self.sessions.reset(scope)

@@ -417,9 +417,8 @@ _CHAIN_MARKS = ("During handling of the above exception",
                 "The above exception was the direct cause")
 
 
-def _tb_blocks(text: str) -> list[list[str]]:
-    """把文本切成一段段 Traceback（一段 = 一个最终异常的完整栈，含 chain）。"""
-    lines = text.splitlines()
+def _tb_starts(lines: list[str]) -> list[int]:
+    """每段 Traceback 在 `lines` 里的起始行号（升序）。"""
     heads = [i for i, line in enumerate(lines) if line.strip() == _TB_HEAD]
     if not heads:
         return []
@@ -441,7 +440,13 @@ def _tb_blocks(text: str) -> list[list[str]]:
                 continue
             break
         starts.append(start)
-    starts = sorted(set(starts))
+    return sorted(set(starts))
+
+
+def _tb_blocks(text: str) -> list[list[str]]:
+    """把文本切成一段段 Traceback（一段 = 一个最终异常的完整栈，含 chain）。"""
+    lines = text.splitlines()
+    starts = _tb_starts(lines)
     blocks = []
     for pos, start in enumerate(starts):
         end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
@@ -517,41 +522,96 @@ def _read_log_tail(path: str, max_bytes: int = 256 * 1024) -> str:
     return raw.decode("utf-8", "replace")
 
 
-def crash_item_from_log(log_path: str) -> Optional[dict]:
+# 启动守卫连续这么多次「活不过 60 秒」才调我们（run-agent.ps1 的 $carherStreak -lt 5）⇒ 真崩的那段栈
+# 一定在最近这几轮里。比这更早的（后面跟了更多「[runner] 进程退出」行）是上一个版本留下的。
+_RECENT_RUNS = 6
+_RUNNER_EXIT = "[runner] 进程退出"
+
+
+def _frames_match_source(frames: list[str], package_dir: str) -> bool:
+    """栈帧 `bridge/x.py:N:func` 在**当前**这份代码里还成立吗（第 N 行落在 func 里）。
+
+    🔴 11-18 103012-e9690e…：上报标的是 aec6d11f，栈是 `bridge/fleet/model.py:277:run` ——
+    aec6d11f 的 277 行在 `_SPAWN_FAIL_LOGS` 字典里，`def run` 在 304 行；只有 52d540a8 的 277 行在 run 里。
+    即 agent.log 里那段是上一个版本留下的，却被贴上了当前版本号 ⇒ 看起来像新版回归、指纹也跟着漂。
+    读不到源码 / 解析不了 ⇒ 当成不成立（宁可少报，别报错版本）。
+    """
+    import ast as _ast
+
+    trees: dict[str, Optional[_ast.AST]] = {}
+    for frame in frames:
+        try:
+            rel, line_s, func = frame.rsplit(":", 2)
+            line_no = int(line_s)
+        except ValueError:
+            return False
+        if not rel.startswith("bridge/"):
+            return False
+        path = os.path.join(package_dir, *rel.split("/")[1:])
+        if path not in trees:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    trees[path] = _ast.parse(handle.read())
+            except (OSError, SyntaxError, ValueError):
+                trees[path] = None
+        tree = trees[path]
+        if tree is None:
+            return False
+        if func == "<module>":
+            last = max((getattr(n, "end_lineno", 0) or 0) for n in tree.body) if tree.body else 0
+            if not 1 <= line_no <= last:
+                return False
+            continue
+        ok = False
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and node.name == func:
+                if node.lineno <= line_no <= (getattr(node, "end_lineno", node.lineno) or node.lineno):
+                    ok = True
+                    break
+        if not ok:
+            return False
+    return True
+
+
+def crash_item_from_log(log_path: str, package_dir: Optional[str] = None) -> Optional[dict]:
     """`agent.log` 尾部最后一段 Traceback ⇒ 上报条目。读不到 / 没有哪段像样的 ⇒ None。
 
     🔴 判据：Traceback **后面没有新的时间戳行** ⇒ 它是进程最后吐出来的东西（真崩了）。
     后面还有日志的，是 `logger.exception` 抓过的（那种进程内那一路已经报过了）。
+    🔴 11-18：而且必须是**这一版**崩的（见 `_frames_match_source`）：
+      - 只看最近 `_RECENT_RUNS` 轮重启里的（后面跟了更多 `[runner] 进程退出` 的是更早的）；
+      - 给了 `package_dir` ⇒ 栈帧还要和当前代码对得上；
+      - 原来「所有段后面都跟了日志 ⇒ 还是发最后一段」的兜底删掉：那一段恰恰最可能是旧版本留下的。
+    宁可这一次不报（进程内的钩子、u=crashloop 那一路还在），也不报一条版本号是错的。
     """
     text = _read_log_tail(log_path)
     if not text:
         return None
-    blocks = _tb_blocks(text)
-    if not blocks:
-        return None
     lines = text.splitlines()
+    starts = _tb_starts(lines)
+    if not starts:
+        return None
     stamp_re = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
-    last_start = None
-    # 从后往前：第一个「后面没有时间戳行」的块
-    for block in reversed(blocks):
-        # 定位这一块在全文里的位置：用它的最后一行做锚
-        anchor = block[-1] if block else ""
-        pos = len(lines) - 1
-        if anchor:
-            for idx in range(len(lines) - 1, -1, -1):
-                if lines[idx].rstrip() == anchor.rstrip():
-                    pos = idx
-                    break
-        last_start = pos
-        if not any(stamp_re.match(line) for line in lines[pos + 1:]):
-            parsed = parse_traceback_block(block)
-            if parsed["type"] and (parsed["frames"] or parsed["emsg"]):
-                return item_from_traceback(parsed)
-    # 全都后面跟了日志：还是把最后一段发出去（比什么都不发强），但**不发时间戳行本身**
-    if last_start is not None and blocks:
-        parsed = parse_traceback_block(blocks[-1])
-        if parsed["type"]:
-            return item_from_traceback(parsed)
+    # 从后往前：第一个「后面没有时间戳行」的块。块只到它自己的最后一行为止：
+    # 遇到时间戳行 / `[runner] 进程退出` 就算这段栈结束了（之后是别的日志）。
+    for pos, begin in reversed(list(enumerate(starts))):
+        end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
+        cut = end
+        for idx in range(begin + 1, end):
+            if stamp_re.match(lines[idx]) or _RUNNER_EXIT in lines[idx]:
+                cut = idx
+                break
+        after = lines[cut:]
+        if sum(1 for line in after if _RUNNER_EXIT in line) > _RECENT_RUNS:
+            return None  # 再往前的只会更旧
+        if any(stamp_re.match(line) for line in after):
+            continue
+        parsed = parse_traceback_block(lines[begin:cut])
+        if not (parsed["type"] and (parsed["frames"] or parsed["emsg"])):
+            continue
+        if package_dir and parsed["frames"] and not _frames_match_source(parsed["frames"], package_dir):
+            return None  # 栈对不上当前代码 ⇒ 上一个版本留下的
+        return item_from_traceback(parsed)
     return None
 
 
@@ -1055,7 +1115,7 @@ def _crash_log_main(argv: list[str]) -> int:
         reporter._load()
         item = reproduce_import_crash(home)
         if item is None and log_path:
-            item = crash_item_from_log(log_path)
+            item = crash_item_from_log(log_path, package_dir=os.path.join(home, "bridge"))
         if item is not None:
             reporter.add(item)
         reporter.flush()

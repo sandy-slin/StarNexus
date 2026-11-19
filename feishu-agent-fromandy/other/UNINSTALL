@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# CarHer 飞书助手 卸载 (macOS)
+# 用法：双击本文件。或者 IT 批量：bash feishu-agent-uninstall-mac.command --yes
+# 由 build.sh 生成，别直接改；源在 feishu-agent-oneclick/src/
+#
+# 为什么要有卸载：离职 / 换机的时候，launchd job 还在、`chmod 600` 的配置里还有
+# app_secret、还指着公司仓库。装了没法卸 = 推广到上百人时每台机器都是一笔遗留。
+#
+# 三条纪律：
+#   1. **先列清单再动手。** 默认不是无条件删 —— 要用户看一眼删的是哪几个路径。
+#      `--yes` 跳过确认，给 IT 批量用。
+#   2. **凭据安全擦除。** config.toml 里有 app_secret，直接 unlink 只是摘掉目录项，
+#      盘上的字节还在。先覆写再删。
+#   3. **绝不能因为变量为空而删到家目录。** `rm -rf "$APP_HOME"` 在 APP_HOME 为空时
+#      是 `rm -rf ""`，而拼过路径的 `rm -rf "$APP_HOME/"*` 会变成 `rm -rf /*`。
+#      所以每个删除动作都过 safe_rm，它自己校验路径，不信任调用方。
+set -uo pipefail   # 故意不用 -e：卸载要尽量删干净，一步失败不该把剩下的留在机器上
+
+BLUE=$'\033[1;34m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[1;31m'; NC=$'\033[0m'
+say()  { printf '%s%s%s\n' "$BLUE" "$1" "$NC"; }
+ok()   { printf '%s  ✓ %s%s\n' "$GREEN" "$1" "$NC"; }
+bad()  { printf '%s  ✗ %s%s\n' "$RED" "$1" "$NC"; }
+warn() { printf '%s  ⚠ %s%s\n' "$YELLOW" "$1" "$NC"; }
+
+# ── 要删的东西（只有这几个；safe_rm 会拿这份清单当白名单）────────────
+APP_HOME="$HOME/.carher-feishu-agent"
+BRIDGE_CC="$HOME/.claude-feishu-bridge"
+LOCK="$HOME/.feishu-agent-bridge.lock"
+PLIST="$HOME/Library/LaunchAgents/com.carher.feishu-agent.plist"
+CONFIG="$APP_HOME/config.toml"
+LABEL="com.carher.feishu-agent"
+# 桌面上那两个快捷方式（安装器放的一行转发器）。不删的话卸完桌面还留着两个
+# 双击就报错的东西 —— 用户会以为「没卸干净」。
+# 🔴 它们在 ~/Desktop 下，**不在** APP_HOME 里 ⇒ 必须按 safe_rm 的规矩进白名单
+# （见下面第 5 道），不是绕过防护。
+# 🔴 HOME 为空时这两个会变成 /Desktop/… （别人的路径），所以置空让白名单直接跳过它们。
+DESKTOP_DOCTOR=""
+DESKTOP_UNINSTALL=""
+if [ -n "${HOME:-}" ]; then
+  DESKTOP_DOCTOR="$HOME/Desktop/CarHer 助手诊断.command"
+  DESKTOP_UNINSTALL="$HOME/Desktop/CarHer 助手卸载.command"
+fi
+
+ASSUME_YES=false
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) ASSUME_YES=true ;;
+    --help|-h)
+      echo "用法：$0 [--yes]"
+      echo "  --yes   不问直接删（给 IT 批量用）"
+      exit 0 ;;
+    *) echo "不认识的参数：${arg}（只支持 --yes）" >&2; exit 2 ;;
+  esac
+done
+
+# ── 删除防护 ─────────────────────────────────────────────────────────
+# 🔴 这个函数是整个脚本唯一允许删东西的地方，它**不信任调用方**：
+# 空变量、根目录、家目录本身、不在白名单里的路径，一律拒绝并以非零退出。
+# 为什么写得这么硬：`rm -rf "$APP_HOME"` 这一行在 APP_HOME 因为任何原因为空时
+# （改名、拼错、sed 替换没命中），后果是不可逆的。这里宁可卸载失败也不误删。
+safe_rm() {
+  local target="${1:-}"
+  # 1) 空 / 只有空白 ⇒ 立刻拒绝。这是本函数存在的首要原因。
+  if [ -z "$target" ] || [ -z "${target// /}" ]; then
+    bad "内部错误：要删的路径是空的，已拒绝（这正是防护要挡的情况）"
+    return 1
+  fi
+  # 2) 必须是绝对路径 ⇒ 相对路径会受 cwd 影响
+  case "$target" in
+    /*) : ;;
+    *) bad "内部错误：不是绝对路径，已拒绝：${target}"; return 1 ;;
+  esac
+  # 3) 明确的高危路径 ⇒ 拒绝。$HOME 本身在列（删它等于清空家目录）
+  if [ "$target" = "/" ] || [ "$target" = "$HOME" ] || [ "$target" = "$HOME/" ]; then
+    bad "内部错误：拒绝删除根目录或家目录：${target}"
+    return 1
+  fi
+  # 4) 不许带通配符或 .. ⇒ 展开后范围会超出预期
+  case "$target" in
+    *'*'*|*'?'*|*'..'*)
+      bad "内部错误：路径里有通配符或 ..，已拒绝：${target}"
+      return 1 ;;
+  esac
+  # 5) 白名单：只能是本脚本顶部声明的那几个路径之一（或它们下面的东西）。
+  #    就算前面四道都被绕过，这一道把范围锁死在我们自己装的目录里。
+  local allowed=false item
+  # 🔴 桌面那两个写 `${VAR:-}`：safe_rm 是整个脚本唯一允许删东西的地方，它**不能因为
+  # 某个白名单变量没定义就在 set -u 下整函数炸掉** —— 那样会从「拒绝删」变成「卸载中断」。
+  for item in "$APP_HOME" "$BRIDGE_CC" "$LOCK" "$PLIST" "${DESKTOP_DOCTOR:-}" "${DESKTOP_UNINSTALL:-}"; do
+    [ -n "$item" ] || continue
+    if [ "$target" = "$item" ] || case "$target" in "$item"/*) true ;; *) false ;; esac; then
+      allowed=true; break
+    fi
+  done
+  if [ "$allowed" != true ]; then
+    bad "内部错误：不在卸载白名单里，已拒绝：${target}"
+    return 1
+  fi
+
+  [ -e "$target" ] || return 0   # 本来就没有 = 已经达到目的
+  rm -rf -- "$target"
+}
+
+# 凭据安全擦除：先覆写再删。
+# 只 unlink 的话目录项没了但盘上的字节还在，app_secret 仍可能被恢复出来。
+# APFS 有写时复制、SSD 有 wear leveling ⇒ 覆写不是密码学意义上的彻底销毁，
+# 但它把「随手 undelete 就能拿到 secret」这条最现实的路堵掉了。
+shred_file() {
+  local path="${1:-}"
+  [ -n "$path" ] || return 1
+  [ -f "$path" ] || return 0
+  local size
+  size="$(/usr/bin/stat -f %z "$path" 2>/dev/null)"
+  [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null || size=4096
+  # 三遍：随机、零、随机。用 dd 原地写（conv=notrunc），保持 inode 不变。
+  for _ in 1 2 3; do
+    dd if=/dev/urandom of="$path" bs="$size" count=1 conv=notrunc 2>/dev/null || break
+  done
+  : > "$path" 2>/dev/null || true
+  return 0
+}
+
+echo
+say "=================================================="
+say "   CarHer 飞书助手 卸载"
+say "=================================================="
+echo
+
+# 桌面那两个快捷方式也算「装过」：程序目录被手删过、只剩桌面上两个双击就报错的
+# 文件时，这里要是直接说「本机没装」就退，那两个会一直留在他桌面上。
+if [ ! -d "$APP_HOME" ] && [ ! -f "$PLIST" ] && [ ! -d "$BRIDGE_CC" ] \
+   && { [ -z "$DESKTOP_DOCTOR" ] || [ ! -e "$DESKTOP_DOCTOR" ]; } \
+   && { [ -z "$DESKTOP_UNINSTALL" ] || [ ! -e "$DESKTOP_UNINSTALL" ]; }; then
+  ok "本机没装（没找到任何要删的东西）"
+  echo
+  if [ "$ASSUME_YES" != true ]; then
+    printf '按回车关闭… '
+    read -r _ </dev/tty 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# ── 1. 先列清单 ──────────────────────────────────────────────────────
+say "[1/4] 将要删除这些东西"
+echo
+PRESENT=0
+list_item() {  # list_item <路径> <说明>
+  if [ -e "$1" ]; then
+    printf '    ✗ 删除  %s\n           %s\n' "$1" "$2"
+    PRESENT=$((PRESENT+1))
+  else
+    printf '    · 跳过  %s（不存在）\n' "$1"
+  fi
+}
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  printf '    ✗ 停掉并注销后台服务  %s\n' "$LABEL"
+  PRESENT=$((PRESENT+1))
+else
+  printf '    · 后台服务没注册，跳过\n'
+fi
+list_item "$PLIST"     "开机自启配置（launchd）"
+list_item "$CONFIG"    "配置文件 —— 里面有 App Secret，会先覆写再删"
+list_item "$APP_HOME"  "程序目录：venv、日志、审批记录、会话"
+list_item "$BRIDGE_CC" "桥专用的 claude 配置目录（会话历史在这里）"
+list_item "$LOCK"      "单实例锁文件"
+[ -n "$DESKTOP_DOCTOR" ]    && list_item "$DESKTOP_DOCTOR"    "桌面上的「CarHer 助手诊断」快捷方式"
+[ -n "$DESKTOP_UNINSTALL" ] && list_item "$DESKTOP_UNINSTALL" "桌面上的「CarHer 助手卸载」快捷方式（就是你刚双击的这个）"
+echo
+warn "删掉之后飞书里给机器人发消息就不会有任何回应了。"
+echo
+
+if [ "$ASSUME_YES" != true ]; then
+  printf '  确认删除？输入 y 继续，别的任何键取消: '
+  read -r ANSWER </dev/tty 2>/dev/null || ANSWER=""
+  case "$ANSWER" in
+    y|Y|yes|YES) : ;;
+    *) echo; warn "已取消，什么都没动。"; echo; exit 0 ;;
+  esac
+  echo
+else
+  echo "  （--yes：跳过确认）"
+  echo
+fi
+
+FAILED=0
+
+# ── 2. 停服务 ────────────────────────────────────────────────────────
+# 顺序要紧：先把服务注销掉再删文件。反过来的话 KeepAlive 会在我们删东西的
+# 中途不停把进程拉起来，它又会重新写日志/锁文件，删了也会回来。
+say "[2/4] 停掉后台服务"
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null \
+    || launchctl unload "$PLIST" 2>/dev/null \
+    || true
+  sleep 1
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    bad "服务还在注册状态"
+    printf '      手动跑：launchctl bootout gui/$(id -u)/%s\n' "$LABEL"
+    FAILED=$((FAILED+1))
+  else
+    ok "服务已注销"
+  fi
+else
+  ok "服务本来就没注册"
+fi
+# 残留进程（比如用户手动起过一个）：注销 launchd 管不到它们。
+#
+# 🔴 **不用 `pkill -f bridge.app`。** 按名字杀会打到命令行里**提到**这个词的任何进程 ——
+# 包括正在看日志、在编辑器里搜这个词、或者另一个会话里跑着相关命令的进程
+# （实测：一条只是 grep 这个词的命令，自己就出现在 ps 里）。
+# 这里逐个核对：必须是**这台机器上这个助手自己的** venv 跑的 bridge.app，才杀。
+STRAY_PIDS=""
+while IFS= read -r line; do
+  [ -z "${line}" ] && continue
+  pid="${line%% *}"
+  cmd="${line#* }"
+  case "${cmd}" in
+    "${APP_HOME}/venv/bin/python"*" -m bridge.app"*|"${APP_HOME}/venv/bin/python"*"bridge.app") ;;
+    *) continue ;;
+  esac
+  STRAY_PIDS="${STRAY_PIDS} ${pid}"
+done <<EOF
+$(ps -axww -o pid=,args= 2>/dev/null)
+EOF
+if [ -n "${STRAY_PIDS}" ]; then
+  # shellcheck disable=SC2086
+  kill ${STRAY_PIDS} 2>/dev/null || true
+  sleep 1
+  LEFT=""
+  for pid in ${STRAY_PIDS}; do
+    kill -0 "${pid}" 2>/dev/null && LEFT="${LEFT} ${pid}"
+  done
+  if [ -n "${LEFT}" ]; then
+    warn "还有进程没退（${LEFT}），手动：kill${LEFT}"
+  else
+    ok "残留进程已停"
+  fi
+fi
+echo
+
+# ── 3. 擦除凭据 ──────────────────────────────────────────────────────
+say "[3/4] 安全擦除凭据"
+if [ -f "$CONFIG" ]; then
+  if shred_file "$CONFIG"; then
+    ok "config.toml 已覆写（App Secret 不是只摘目录项）"
+  else
+    warn "覆写 config.toml 失败，下一步仍会把它删掉"
+  fi
+else
+  ok "没有配置文件要擦"
+fi
+# .claude.json 里可能有网关 token，一并覆写
+if [ -f "$BRIDGE_CC/.claude.json" ]; then
+  shred_file "$BRIDGE_CC/.claude.json" && ok "桥的 claude 配置已覆写"
+fi
+echo
+
+# ── 4. 删文件 ────────────────────────────────────────────────────────
+say "[4/4] 删除文件"
+remove() {  # remove <路径> <人话>
+  local path="${1:-}" label="${2:-}"
+  if [ ! -e "$path" ]; then
+    ok "${label}：本来就没有"
+    return 0
+  fi
+  if safe_rm "$path" && [ ! -e "$path" ]; then
+    ok "${label}：已删除"
+  else
+    bad "${label}：删不掉 —— ${path}"
+    FAILED=$((FAILED+1))
+  fi
+}
+remove "$PLIST"     "开机自启配置"
+remove "$APP_HOME"  "程序目录（含配置、日志、venv）"
+remove "$BRIDGE_CC" "桥的 claude 配置目录"
+remove "$LOCK"      "单实例锁"
+[ -n "$DESKTOP_DOCTOR" ] && remove "$DESKTOP_DOCTOR" "桌面上的「CarHer 助手诊断」"
+# 🔴 桌面那个「CarHer 助手卸载」放**最后**删：它很可能就是用户刚双击的那个入口。
+# 为什么现在删它是安全的：它只有一行 `exec /bin/bash "$APP_HOME/…uninstall…"` ——
+# exec 之后这个进程跑的已经是程序目录里那一份，桌面那个文件早就不再被读了
+# （而且程序目录那份也在上面刚被删掉，照样跑完 —— 内核读的是已打开的 inode）。
+[ -n "$DESKTOP_UNINSTALL" ] && remove "$DESKTOP_UNINSTALL" "桌面上的「CarHer 助手卸载」"
+echo
+
+# ── 结论 ─────────────────────────────────────────────────────────────
+say "=================================================="
+if [ "$FAILED" -eq 0 ]; then
+  printf '%s   本机已清干净。%s\n' "$GREEN" "$NC"
+else
+  printf '%s   有 %d 项没删掉，照上面的提示手动处理。%s\n' "$RED" "$FAILED" "$NC"
+fi
+say "=================================================="
+echo
+# 🔴 云端的东西脚本删不掉，必须明说，不能让用户以为「卸载完了就都没了」。
+# 自建应用还在、还能被重新装一次用起来，app_secret 也还是有效的。
+warn "还有一件事要你自己做（脚本删不掉云端的东西）："
+echo
+echo "    去 open.feishu.cn 把你自己的那个自建应用**停用或删除**。"
+echo
+echo "    打开 https://open.feishu.cn/app → 找到你的「Her remote」"
+echo "    → 右上角「停用应用」，或者「设置」里直接删除。"
+echo
+echo "  为什么必须做：本机删掉只是这台电脑不再干活了。那个应用和它的"
+echo "  App Secret 在飞书那边**仍然有效** —— 谁拿到凭据都能在别的机器上"
+echo "  装一次，然后以你的名义收你的消息。"
+echo
+if [ "$ASSUME_YES" != true ]; then
+  printf '按回车关闭… '
+  read -r _ </dev/tty 2>/dev/null || true
+fi

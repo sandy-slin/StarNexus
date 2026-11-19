@@ -16,6 +16,7 @@ autobind）。两条路都不需要用户手抄。
 from __future__ import annotations
 
 import json
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -58,6 +59,14 @@ def main(argv: list[str]) -> int:
             {"app_id": app_id, "app_secret": app_secret},
         )
     except urllib.error.URLError as exc:
+        # 11-18 上报 183843-herremote-29a3f2:公司安全软件/代理做 HTTPS 检查 ⇒ 证书链里有自签证书,
+        #   原来只甩一句 [SSL: CERTIFICATE_VERIFY_FAILED] 英文。⇒ 单独一句人话;仍以「连不上飞书」开头(安装器按它走网络分支)
+        if isinstance(exc.reason, ssl.SSLCertVerificationError) \
+                or "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+            print("FATAL=连不上飞书：证书对不上。这台电脑的网络在中间换了证书"
+                  "（公司安全软件 / 代理在做 HTTPS 检查，或者开着抓包工具），Python 不认。"
+                  "关掉 VPN / 代理 / 抓包工具再试；如果是公司网络强制的，我们这边已经收到，会跟进。")
+            return 1
         print(f"FATAL=连不上飞书（{exc.reason}）。检查网络后重试。")
         return 1
     except Exception as exc:  # noqa: BLE001

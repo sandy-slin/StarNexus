@@ -485,7 +485,7 @@ VERSION_NOT_SUBMITTED = 4
 PUBLISH_ERRORS = {
     210302: "上一个版本还在等管理员审批，新版本提交不上去 —— 等管理员批完上一个，重新双击安装就会接着发",
     210303: "版本号被拒（要 X.X.X 且比上一个大）—— 隔一分钟重新双击安装即可（版本号按时间生成）",
-    210304: "发布请求缺字段 —— 这是程序的问题，把这句发给 IT",
+    210304: "发布请求缺字段 —— 这是程序的问题，不用截图，我们这边会跟进",
     210001: "这个应用不是在开发者后台建的，不能用接口发布 —— 去开发者后台「版本管理与发布」手动点一下",
     210036: "凭据和应用对不上（只能发布自己）—— 检查配置里的 app_id",
     210003: "飞书那边内部错误 —— 过几分钟重新双击安装",
@@ -494,13 +494,26 @@ CONFIG_ERRORS = {
     # 写菜单（ability PATCH）那个接口的码。2026-11-06 第 12 轮排查角色 D 查官方错误码表发现原来没收 ⇒
     # 撞上时屏幕上是原始「code=210021」——而这两个码恰好就是「装完没有悬浮菜单」最难分清的那两条原因。
     210020: "应用正在审核中，这时候写不进菜单 —— 等管理员批完手上那个版本，菜单会自己补上（或重新双击安装）",
-    210021: "这个应用不是在开发者后台建的，接口写不了它的菜单 —— 把这句截图发给给你装的同事",
+    210021: "这个应用不是在开发者后台建的，接口写不了它的菜单 —— 不用截图，我们这边会跟进；聊天里发「菜单」照样有按钮",
     210040: "应用正在审核中，这时候改不了配置 —— 等管理员批完，重新双击安装",
     210041: "应用还没开机器人能力 —— 去开发者后台「添加应用能力」加上「机器人」",
     210043: "这个应用不是在开发者后台建的，接口改不了它的配置",
     210035: "这个应用不是在开发者后台建的，接口改不了它的配置",
     210037: "你不是这个应用的所有者或管理员，改不了它的配置",
 }
+# 第 38 轮（主人：不许让用户截图，报错我们这边自动上报）：上面文案说「我们这边会跟进」的码 ⇒ 必须真报上来。
+#   桥里（menu_heal）按 ERROR 记一条固定模板 ⇒ bridge/errreport.py 收走；
+#   安装器里（setup() 的输出）多打一行 `REPORT=…` ⇒ install-mac.sh / install-windows.ps1 调各自的失败上报。
+REPORT_CODES = frozenset({210021})
+
+
+def report_code(out: dict) -> int | None:
+    """这次失败要不要报给我们：码在 REPORT_CODES 里就返回码，否则 None。"""
+    try:
+        code = int(out.get("code"))
+    except (TypeError, ValueError):
+        return None
+    return code if code in REPORT_CODES else None
 
 
 def _human(out: dict, table: dict) -> str:
@@ -591,6 +604,8 @@ def setup(app_id: str, app_secret: str, version: str, *, http=None) -> list[str]
             )
         else:
             lines.append(f"WARN=常驻菜单没配上：{_human(out, CONFIG_ERRORS)}")
+            if report_code(out) is not None:
+                lines.append(f"REPORT=常驻菜单没配上 code={report_code(out)} {str(out.get('msg') or '')[:200]}")
     else:
         lines.append("OK=常驻菜单已写入")
 
