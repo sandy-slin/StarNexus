@@ -1261,6 +1261,39 @@ class CodexAdapter(Adapter):
             # 没人占着 ⇒ 直接 exec resume，同步拿回复（比排队等轮询快）
             return self._send_locked(tid, text, timeout, mode, spawned, model=model, effort=effort,
                                      approval_dir=approval_dir)
+        return self._queue_locked(tid, text, row, owner, timeout, poll, min_timeout)
+
+    def relay_queued(self, id: str, text: str, timeout: float = RELAY_TIMEOUT_SEC,
+                     poll: float = RELAY_POLL_SEC, min_timeout: float = RELAY_MIN_TIMEOUT_SEC) -> ActionResult:
+        """上一句还在等回复时，再来一句：Codex App / 终端开着它 ⇒ 排进它的队列，等这一句自己的回复。
+
+        11-20 实测：App 正跑着一轮时 `codex queue` 排进去的那句，要等这一轮做完才被取走，
+        插不进当前这一轮（官方没有别的插话口子，`ipc.sock` 那条路故意不碰，见文件头）。
+        所以这里不是插话，是「排在这一轮后面」—— 至少不再拒收，也不用他等回来再说一遍。
+
+        不适用（没人开着 / 桥自己在跑 / 找不到会话）⇒ `ok=False` 且 `text` 为空，调用方照原来的提示。
+        不占 `_sending`：第一句的 relay 还占着它，这句是额外排在后面的。
+        """
+        if not is_thread_id(id):
+            return ActionResult(False, "", str(id or ""))
+        tid = id.lower()
+        text = str(text or "").strip()
+        if not text:
+            return ActionResult(False, "", tid)
+        try:
+            row = self._row(tid)
+            if row is None or row.get("archived"):
+                return ActionResult(False, "", tid)
+            state = self._state([tid]).get(tid)
+            owner = state[0] if state else "none"
+            if owner not in ("app", "terminal"):
+                return ActionResult(False, "", tid)
+            return self._queue_locked(tid, text, row, owner, timeout, poll, min_timeout)
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, log_as=f"codex 排队失败 tid={tid}"), tid)
+
+    def _queue_locked(self, tid: str, text: str, row: dict, owner: str, timeout: float,
+                      poll: float, min_timeout: float) -> ActionResult:
         segs = self._segments(tid, row)
         if not segs:
             # 实测：没有 rollout 的线程 `codex queue` 直接报 -32603，先说清楚别白跑

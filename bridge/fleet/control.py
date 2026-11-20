@@ -295,6 +295,17 @@ class FleetControl:
             # 不带前缀：app.py 那边已经套了「❌ 没发进去：」，再加一层就是「没发进去：没发出去：」
             return ActionResult(False, friendly_error(exc, log_as=f"会话总控发送失败 tool={tool}"), sid)
 
+    def relay_queued(self, tool: str, sid: str, text: str, timeout: float = 600) -> ActionResult:
+        """上一句还在等时再来一句：排到电脑上开着的那个会话的队列里，等这句的回复。不适用 ⇒ ok=False 且 text 为空。"""
+        adapter = self.fleet.adapter(tool)
+        method = getattr(adapter, "relay_queued", None) if adapter is not None else None
+        if method is None:
+            return ActionResult(False, "", sid)
+        try:
+            return method(sid, text, timeout=timeout)
+        except Exception as exc:
+            return ActionResult(False, friendly_error(exc, log_as=f"排队失败 tool={tool}"), sid)
+
     def steer(self, tool: str, sid: str, text: str) -> ActionResult:
         """一轮在跑时中途插话（docs/product/steering.md）。不支持 / 插不进 ⇒ ok=False，调用方照旧处理。"""
         from .model import can

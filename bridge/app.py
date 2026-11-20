@@ -283,6 +283,8 @@ def _group_how_to_talk(report=None, here: bool = False, proven: bool = False) ->
 
 # 群里确认前说的话先记着，点确认后发过去（见 `Bridge._hold_for_consent`）。
 # 隔太久就不自动发了：那句话是他十几分钟前的想法，现在未必还要（照实说没发）。
+# 一轮在跑时最多再排几句在它后面（再多就照原来的提示，免得一口气排一串）
+QUEUE_AFTER_MAX = 3
 HELD_TTL_SEC = 10 * 60
 # 确认前最多先记这么多句。再多说明他在群里聊别的，不是在等这张卡。
 HELD_MAX = 5
@@ -3630,6 +3632,65 @@ class Bridge:
         self._say(chat_id, got.text or "↪️ 已插进正在跑的这一轮。")
         return True
 
+    async def _try_queue_after(self, scope: str, chat_id: str, target, text: str) -> bool:
+        """插不进当前这一轮、但电脑上开着这个会话（Codex App / 终端）⇒ 排在这一轮后面，不拒收。
+
+        11-20 用户反馈：「steering 貌似不工作，上条还在发，等他回来再说」。根因：群绑的是 Codex App 里开着的会话，
+        那一轮不是桥起的，`turn/steer` 插不进；`codex queue` 是官方唯一的口子，只能排到这一轮之后。
+        所以照实说「排上了，这一轮做完就处理」，回复回来照常贴群里。排不上 ⇒ False，走原来的提示。
+        """
+        control = getattr(self, "fleet", None)
+        if control is None or not hasattr(control, "relay_queued") or target.tool != "codex":
+            return False
+        if scope in getattr(self, "_paused", {}):
+            return False
+        try:
+            if hasattr(control, "refresh"):
+                await asyncio.to_thread(control.refresh, target.tool, target.id)
+            sess = control.cached(target.tool, target.id)
+        except Exception:  # noqa: BLE001
+            sess = None
+        if getattr(sess, "owner", "") not in ("app", "terminal"):
+            return False
+        policy = self._session_policy(target.tool, target.id)
+        reviewer = getattr(self, "reviewer", None)
+        if reviewer is not None:
+            decision = reviewer.review_request(ReviewContext(text=text, source="human", mode=policy.mode))
+            if decision.verdict is Verdict.DENY:
+                self._say(chat_id, f"⛔️ {decision.reason}")
+                return True
+        queued = getattr(self, "_queued_after", None)
+        if queued is None:
+            queued = self._queued_after = {}
+        key = (target.tool, target.id)
+        if queued.get(key, 0) >= QUEUE_AFTER_MAX:
+            return False
+        queued[key] = queued.get(key, 0) + 1
+        self._say(chat_id, "这一轮在电脑上跑着，插不进当前这一步；这句已排在它后面，这一轮做完就处理，不用重发。")
+        logger.info("对话模式 排在后面 tool=%s 会话=%s 字数=%d", target.tool, str(target.id)[:8], len(text))
+
+        async def wait_reply():
+            try:
+                got = await asyncio.to_thread(
+                    control.relay_queued, target.tool, target.id, text,
+                    timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600))
+            except Exception:  # noqa: BLE001
+                logger.exception("排在后面那句等回复失败")
+                return
+            finally:
+                queued[key] = max(0, queued.get(key, 1) - 1)
+            logger.info("对话模式 排在后面 结果=%s tool=%s 会话=%s 回复字数=%d",
+                        "回复" if got.ok else "未回", target.tool, str(target.id)[:8], len(got.text or ""))
+            if got.ok and got.text:
+                from .reply import normalize as _md_normalize
+
+                await self._send_reply_maybe_doc(chat_id, f"🖥 {target.label}", _md_normalize(got.text), "")
+            elif got.text:
+                self._say(chat_id, got.text)
+
+        asyncio.create_task(wait_reply())
+        return True
+
     async def _maybe_send_to_fleet(self, scope: str, chat_id: str, text: str) -> bool:
         """这个聊天有待发目标 ⇒ 把这条发过去，回复贴回来。没有目标返回 False（走正常流程）。"""
         control = getattr(self, "fleet", None)
@@ -3691,6 +3752,8 @@ class Bridge:
             busy_tool, busy_id = self._fleet_inflight[scope]
             same = (busy_tool, busy_id) == (target.tool, target.id)
             if same and await self._try_steer(scope, chat_id, target, text):
+                return True
+            if same and await self._try_queue_after(scope, chat_id, target, text):
                 return True
             logger.info("对话模式 拒收：上一条还在发 tool=%s 会话=%s 同一个=%s 字数=%d",
                         target.tool, str(target.id)[:8], same, len(text))
