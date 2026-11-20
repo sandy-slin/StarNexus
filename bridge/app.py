@@ -4256,7 +4256,8 @@ class Bridge:
 
         bound = result.bound
         group_scope = bound.scope
-        if result.how != CREATED and not bound.on:
+        reopened = result.how != CREATED and not bound.on
+        if reopened:
             self.chat_binds.turn_on(bound.chat_id)
         if quiet_dm:
             # 1.1.0 一张卡：「进群」按钮放在那张卡上（`_ns_card_run` 原地换卡），私聊里不再多发一条
@@ -4295,7 +4296,12 @@ class Bridge:
             # 不摆的话，确认记录存不下来时（`relay_consent` 起不来）群里第一句会落到「还没确认」那支 ——
             # 而这一下点击就是他的确认，内存里那份身份记录（`_talk_idents`）够撑起这一段对话。
             control.set_pending(group_scope, tool, sid)
-        if auto or self._relay_granted(group_scope, tool, sid):
+        # 11-20 用户反馈：总览里点已有会话进群，每点一次群里就多一条一模一样的欢迎语。
+        # 群早就在用、转发也开着 ⇒ 他点进去就能说，不再重发说明（确认照旧悄悄记上）。
+        quiet_reuse = result.how != CREATED and not reopened
+        if quiet_reuse and (auto or self._relay_granted(group_scope, tool, sid)):
+            logger.info("群绑定 复用群不重发欢迎语 tool=%s 会话=%s", tool, sid[:8])
+        elif auto or self._relay_granted(group_scope, tool, sid):
             # 🔴 说法和确认卡同一个判断（要不要 @）；退出给按钮，不叫人打「取消」
             # （11-05 用户原话：「不要让用户输入 "/cancel" 等类似的 尽量用按钮的形式」）。
             # 原来确认卡上那几条安全提示**照样说一遍**（只是不再要他点确认）：
@@ -6161,13 +6167,15 @@ class Bridge:
             sess = None
         from .fleet.sessperm import LABELS as _perm_labels
 
-        if tool == "codex":
-            mode = _perm_labels.get(self._session_policy(tool, sid).mode, "全部授权")
-            return f"· 这个会话的权限：**{mode}**\n"
-        if sess is not None and self._runs_in_background(sess):
-            return "· 电脑上这个会话现在关着，会在后台接着跑，权限按当前档位处理\n"
-        mode = MODE_LABELS.get(getattr(self.policy, "mode", "trusted"), "全授权")
-        return f"· 手机和终端共用当前权限档位（当前：{mode}）\n"
+        from .fleet.sessperm import EXPLAIN as _perm_explain
+
+        key = getattr(self._session_policy(tool, sid), "mode", "trusted")
+        mode = _perm_labels.get(key, "全部授权")
+        why = _perm_explain.get(key, "")
+        tail = f"（{why}）" if why else ""
+        if tool != "codex" and sess is not None and self._runs_in_background(sess):
+            return f"· 电脑上这个会话现在关着，会在后台接着跑，权限：**{mode}**{tail}\n"
+        return f"· 这个会话的权限：**{mode}**{tail}\n"
 
     def _grant_by_open_click(self, scope: str, tool: str, sid: str) -> None:
         """把「主人在单聊点了接着聊 → 建群」这一下当成确认。走**和点「确认」完全一样**的记法。
