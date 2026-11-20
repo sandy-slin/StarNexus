@@ -1,4 +1,4 @@
-"""1.4.0/1.4.1 /m 常用功能卡，M-01 ~ M-20：三种场景出卡、按钮作用范围、旧命令兼容、文案统一。"""
+"""1.4.0/1.4.1 /h 常用功能卡，M-01 ~ M-20：三种场景出卡、按钮作用范围、旧命令兼容、文案统一。"""
 
 import asyncio
 import json
@@ -200,7 +200,7 @@ class RoutingTest(unittest.TestCase):
     def test_m09_m_in_session_group_moves_status_card(self):
         bridge = make_bridge(self.tmp, BOUND)
         bridge._send_menu = lambda chat_id, scope: bridge.menus.append(chat_id)
-        for word in ("/m", "菜单", "?", "/menu"):
+        for word in ("/h", "菜单", "?", "/menu"):
             self.assertTrue(asyncio.run(bridge._handle_command("group:oc_g", "oc_g", word)))
         self.assertEqual(bridge.menus, [])
         self.assertEqual(len(bridge.fs.sent), 4)
@@ -209,8 +209,8 @@ class RoutingTest(unittest.TestCase):
     def test_m10_m_in_dm_and_other_groups_sends_global_card(self):
         bridge = make_bridge(self.tmp, BOUND)
         bridge._send_menu = lambda chat_id, scope: bridge.menus.append(chat_id)
-        asyncio.run(bridge._handle_command("dm:ou_me", "oc_dm", "/m"))
-        asyncio.run(bridge._handle_command("group:oc_ceo", "oc_ceo", "/m"))
+        asyncio.run(bridge._handle_command("dm:ou_me", "oc_dm", "/h"))
+        asyncio.run(bridge._handle_command("group:oc_ceo", "oc_ceo", "/h"))
         self.assertEqual(bridge.menus, ["oc_dm", "oc_ceo"])
         self.assertEqual(bridge.fs.sent, [])
 
@@ -314,18 +314,18 @@ class ModelDropdownWiringTest(unittest.TestCase):
 class CompatCopyTest(unittest.TestCase):
     def test_m13_old_commands_still_known(self):
         known = menu.known_commands()
-        for cmd in ("/m", "/menu", "/mode", "/权限", "/p", "/model", "/sessions", "/newsession", "/stop",
+        for cmd in ("/h", "/menu", "/mode", "/权限", "/p", "/model", "/sessions", "/newsession", "/stop",
                     "/dirs", "/history", "/help", "/update", "/诊断"):
             self.assertIn(cmd, known)
-        for word in ("菜单", "?", "？", "/m"):
+        for word in ("菜单", "?", "？", "/h"):
             self.assertTrue(menu.is_menu_request(word))
 
     def test_m14_help_welcome_and_typo_point_to_m(self):
         from bridge import pairing
 
-        self.assertTrue(menu.HELP.startswith("**不知道怎么做就发 /m**"))
-        self.assertIn("发 /m", pairing.bound_message("trusted"))
-        self.assertIn("发 /m", pairing.greeting_message("readonly"))
+        self.assertTrue(menu.HELP.startswith("**不知道怎么做就发 /h**"))
+        self.assertIn("发 /h", pairing.bound_message("trusted"))
+        self.assertIn("发 /h", pairing.greeting_message("readonly"))
         line, buttons = menu.unknown_command_reply("/sesions")
         self.assertIn(menu.ASK_M, line)
         self.assertEqual(buttons[-1]["text"]["content"], "📋 菜单")
@@ -333,7 +333,7 @@ class CompatCopyTest(unittest.TestCase):
 
     def test_m21_redundant_aliases_removed(self):
         known = {c.lower() for c in menu.known_commands()}
-        for cmd in ("/h", "/s", "/session", "/会话", "/总控", "/历史", "/最近", "/模型", "/diag", "/diagnose",
+        for cmd in ("/m", "/s", "/session", "/会话", "/总控", "/历史", "/最近", "/模型", "/diag", "/diagnose",
                     "/upgrade", "/ls", "/pwd", "/where", "/新建会话", "/搜会话", "/找会话", "/复制会话", "/归档",
                     "/重命名"):
             self.assertNotIn(cmd, known)
@@ -355,3 +355,16 @@ class CompatCopyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlashMFreedTest(unittest.TestCase):
+    """2026-11-20：/h 代替 /m，/m 空出来。"""
+
+    def test_h_opens_menu_and_m_does_not(self):
+        self.assertTrue(menu.is_menu_request("/h"))
+        self.assertTrue(menu.is_menu_request("/H"))
+        self.assertFalse(menu.is_menu_request("/m"))
+
+    def test_m_not_a_known_command(self):
+        self.assertNotIn("/m", menu.known_commands())
+        self.assertIn("/h", menu.known_commands())

@@ -1977,7 +1977,7 @@ class Bridge:
             return f"现在是「{label}」", build_mode_card(self.policy), said
         picked = value.get("pm")
         if isinstance(picked, str) and picked in MODE_RANK:
-            # 1.4.0 /m 卡上的全局权限：点了直接生效（手机和终端同权），/m 卡原地刷新。仍被本机上限压住。
+            # 1.4.0 /h 卡上的全局权限：点了直接生效（手机和终端同权），/h 卡原地刷新。仍被本机上限压住。
             from .fleet.sessperm import EXPLAIN, LABELS as PERM_LABELS
             from .menu import build_menu_card
 
@@ -2002,7 +2002,7 @@ class Bridge:
         return build_menu_card(where, self.policy, self._default_model_texts(), self._menu_model_pick(scope))
 
     def _menu_model_pick(self, scope: str = "", tool: str = "") -> "dict | None":
-        """/m 卡「默认模型」那两行要的东西：工具（默认上次在 /m 选的，没有就上次开新会话用的）、模型、强度。"""
+        """/h 卡「默认模型」那两行要的东西：工具（默认上次在 /h 选的，没有就上次开新会话用的）、模型、强度。"""
         from .fleet.catalog import TOOLS
 
         mp = getattr(self, "model_prefs", None)
@@ -2022,13 +2022,13 @@ class Bridge:
             models = list(mp.catalog.names(tool))
             efforts = list(mp.catalog.efforts(tool, choice.model))
         except Exception:  # noqa: BLE001
-            logger.exception("/m 卡默认模型读不出来")
+            logger.exception("/h 卡默认模型读不出来")
             return None
         return {"tool": tool, "tools": list(TOOLS), "models": models[:30], "model": choice.model,
                 "efforts": efforts, "effort": choice.effort}
 
     def _on_mm_click(self, event, clicker: str, value: dict):
-        """/m 卡上的默认模型下拉：选工具 ⇒ 换成那个工具的模型 / 强度；选模型 / 强度 ⇒ 当场设成默认。卡片原地刷新。"""
+        """/h 卡上的默认模型下拉：选工具 ⇒ 换成那个工具的模型 / 强度；选模型 / 强度 ⇒ 当场设成默认。卡片原地刷新。"""
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
             P2CardActionTriggerResponse,
         )
@@ -2081,7 +2081,7 @@ class Bridge:
         return reply("success", f"{LABELS.get(tool, tool)} 默认：{now.text()}", self._menu_card_json("", scope))
 
     def _default_model_texts(self) -> list:
-        """/m 卡「默认模型」那一行：[(工具名, 现在的默认模型)]。没设过 ⇒ 写工具自己配置的那个。"""
+        """/h 卡「默认模型」那一行：[(工具名, 现在的默认模型)]。没设过 ⇒ 写工具自己配置的那个。"""
         from .fleet.catalog import LABELS, TOOLS
 
         mp = getattr(self, "model_prefs", None)
@@ -2101,16 +2101,16 @@ class Bridge:
         return out
 
     def _send_session_menu(self, chat_id: str) -> None:
-        """会话群里的 /m：状态卡挪到最下面，群里只留这一张带按钮的卡。"""
+        """会话群里的 /h：状态卡挪到最下面，群里只留这一张带按钮的卡。"""
         keeper = getattr(self, "status_cards", None)
         info = self._status_card_info(chat_id)
         if keeper is None or info is None:
             self._say(chat_id, "这个群的状态卡没起来。直接说话就发给这个会话；权限发 /p r|w|f，停下发 /stop。")
             return
         how = keeper.resend(chat_id, info)
-        logger.info("会话群 /m 状态卡 %s chat=%s tool=%s", how, chat_id[:12], info.tool)
+        logger.info("会话群 /h 状态卡 %s chat=%s tool=%s", how, chat_id[:12], info.tool)
         if how == "failed":
-            self._say(chat_id, "状态卡这次没发出去，过一会儿再发 /m 试试。")
+            self._say(chat_id, "状态卡这次没发出去，过一会儿再发 /h 试试。")
 
     def _send_menu(self, chat_id: str, scope: str) -> None:
         from .menu import build_menu_card
@@ -2577,7 +2577,7 @@ class Bridge:
         from .menu import is_menu_request
 
         if is_menu_request(text):
-            # 1.4.0：会话群里 /m = 把这个会话的状态卡挪到最下面（模型、权限、停下都在那张上）；
+            # 1.4.0：会话群里 /h = 把这个会话的状态卡挪到最下面（模型、权限、停下都在那张上）；
             # CEO 群保持原样（CEO 自己的命令那一套）；其余（私聊、普通群）= 全局常用功能卡。
             if str(scope).startswith("group:") and self._session_of_group(chat_id) is not None:
                 self._send_session_menu(chat_id)
@@ -3334,7 +3334,7 @@ class Bridge:
         from .fleet.model import can as _can
 
         if bound is None or not _can(bound.tool, "start"):
-            self._say(chat_id, "这个要在会话群里用：在会话群里发 /m，状态卡上就有。")
+            self._say(chat_id, "这个要在会话群里用：在会话群里发 /h，状态卡上就有。")
             return
         word = text.strip()
         if command == "/fork" or word == "复制会话":
@@ -6627,14 +6627,14 @@ class Bridge:
             if value.get("src") == "sc" and chat_id:
                 # 状态卡是置顶的那条：在原地换成模型卡，选完模型状态卡一刷新就把模型卡盖掉
                 # ⇒ 推理强度没法接着选。模型卡另发一条，状态卡留在原位。
-                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /m 再试一次")
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /h 再试一次")
                 return reply("info", "模型卡已发到群里")
             return reply("info", "模型总览", card)
         if op == "open":
             card = list_card(mp, to, tool, sid, label)
             if value.get("src") == "m" and chat_id:
-                # 1.4.0 /m 卡上点的：/m 卡留在原位，选模型那张另发一条（下拉选完就生效）
-                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /m 再试一次")
+                # 1.4.0 /h 卡上点的：/h 卡留在原位，选模型那张另发一条（下拉选完就生效）
+                self._in_background(self._send_card_or_text, chat_id, card, "🧠 模型卡没发出来，发 /h 再试一次")
                 return reply("info", f"选 {LABELS.get(tool, tool)} 的默认模型")
             return reply("info", f"选 {LABELS.get(tool, tool)} 的模型", card)
         if op == "m":

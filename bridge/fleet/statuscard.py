@@ -126,7 +126,7 @@ def build_card(info: CardInfo) -> str:
     if info.progress:
         lines.append(f"**最近进展**：{info.progress}")
     lines.append("")
-    lines.append("💬 继续：直接在群里说话，就发给这个会话。不知道怎么做就发 /m，这张卡会挪到最下面。")
+    lines.append("💬 继续：直接在群里说话，就发给这个会话。不知道怎么做就发 /h，这张卡会挪到最下面。")
     buttons = [
         _button("🧠 模型", {"act": "mdl", "op": "home", "to": "s", "src": "sc"}),
         _button("⏹ 停下", {"act": "do", "op": "stop"}),
@@ -229,7 +229,7 @@ class StatusCardKeeper:
         self._lock = threading.Lock()
 
     def resend(self, chat_id: str, info: CardInfo) -> str:
-        """群里发 /m：把状态卡挪到最下面 —— 新发一张并置顶，旧的那张原地改成一句「已挪到最下面」。
+        """群里发 /h：把状态卡挪到最下面 —— 新发一张并置顶，旧的那张原地改成一句「已挪到最下面」。
 
         这样群里始终只有一张带按钮的状态卡（旧卡上的按钮不会和新卡重复）。新卡发不出去 ⇒ 旧卡不动。
         """

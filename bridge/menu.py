@@ -98,11 +98,11 @@ CONTROLS = (
 # 「换项目」点得不多也露着：别的卡、帮助都叫他「点📂 换项目」，而它不在悬浮栏里 ——
 # 再收进面板就从 3 下变 4 下（tests/test_r17_taps.py 的那套算法）。
 _PINNED_CONTROLS = ("/sessions", "/newsession")
-# 1.4.0：/m 卡上「更多」里的顺序（权限、模型在卡上有自己的一排，不再放按钮）
+# 1.4.0：/h 卡上「更多」里的顺序（权限、模型在卡上有自己的一排，不再放按钮）
 _MORE_CONTROLS = ("/dirs", "/history", "/status", "/诊断", "/update", "/help", "/new", "/stop")
-# 卡底那行快捷命令（熟手照着打；新手只记 /m）
+# 卡底那行快捷命令（熟手照着打；新手只记 /h）
 SHORTCUTS = "`/ns` 新建会话 · `/p r|w|f` 权限 · `/stop` 停下"
-ASK_M = "不知道怎么做就发 /m"
+ASK_M = "不知道怎么做就发 /h"
 _PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
 
 # 折叠面板标题右边的小箭头。和 `fleet.cards.PANEL_ICON` 同一个（主会话 2026-11-08 真发过、
@@ -111,7 +111,8 @@ _PINNED_QUESTIONS = ("q:changes", "q:projects", "q:todo")
 _PANEL_ICON = {"tag": "standard_icon", "token": "down-small-ccm_outlined", "size": "16px 16px"}
 
 # 触发菜单的说法。除了 /menu，用户在手机上会直接打这几个字。
-TRIGGERS = frozenset({"/menu", "/m", "菜单", "menu", "帮助菜单", "?", "？"})
+# 2026-11-20 林森：用 /h 代替原来的 /m；/m 空出来留给以后用（不再触发这张卡）。
+TRIGGERS = frozenset({"/menu", "/h", "菜单", "menu", "帮助菜单", "?", "？"})
 
 
 def is_menu_request(text: str) -> bool:
@@ -131,7 +132,7 @@ def is_menu_request(text: str) -> bool:
 #
 # 例句里**不许写死任何仓库名或文件名**（同 `pairing.BOUND_MESSAGE` 的红字）。
 # 这段帮助会被 `/help`、「❓ 帮助」按钮、菜单卡发不出去时三个地方发出去（都在 app.py）。
-HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话总览、新建会话、默认模型、权限，其余在「更多」里。
+HELP = """**不知道怎么做就发 /h**，常用的都在那张卡上：会话总览、新建会话、默认模型、权限，其余在「更多」里。
 
 也可以直接说要干什么，不用记命令：
 · 这个文件夹里都有什么？
@@ -140,7 +141,7 @@ HELP = """**不知道怎么做就发 /m**，常用的都在那张卡上：会话
 
 **会话群**
 · 每个电脑上的会话一个群，群里说的话直接发给那个会话，回复也发回群里
-· 群里发 /m，会把这个会话的状态卡挪到最下面：模型、权限（只读 / 可写 / 全部授权）、停下、完成都在卡上
+· 群里发 /h，会把这个会话的状态卡挪到最下面：模型、权限（只读 / 可写 / 全部授权）、停下、完成都在卡上
 · 从飞书新开的会话默认全部授权；电脑上原有的会话可以在群里单独设权限
 · 它手里那一轮**停不了**时（终端里开着的 Claude），点「⏹ 停下」会照实告诉你
 
@@ -312,12 +313,12 @@ def _label_row(label: str, node: dict) -> dict:
     ]}
 
 
-MM_ACT = "mm"          # /m 卡上的下拉（工具 / 模型 / 强度）。值里只带 op，选中项在回调的 option 里。
+MM_ACT = "mm"          # /h 卡上的下拉（工具 / 模型 / 强度）。值里只带 op，选中项在回调的 option 里。
 MM_OPS = ("tool", "model", "effort")
 
 
 def build_menu_card(workspace_label: str = "", policy=None, defaults=None, model_pick=None) -> str:
-    """私聊里的 /m 卡（1.4.1）：常用的都在这一张上，一步做完。
+    """私聊里的 /h 卡（1.4.1）：常用的都在这一张上，一步做完。
 
     设置项（有当前值的）一律下拉：全局权限、默认模型的工具 / 模型 / 强度 —— 收起时只显示当前值，手机上不截断。
     操作（点了就执行的）仍是按钮，每行两个。
@@ -398,7 +399,7 @@ def build_menu_card(workspace_label: str = "", policy=None, defaults=None, model
             "schema": "2.0",
             "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "📋 /m 常用功能"},
+                "title": {"tag": "plain_text", "content": "📋 /h 常用功能"},
                 "template": "blue",
             },
             "body": {"elements": elements},
@@ -408,7 +409,7 @@ def build_menu_card(workspace_label: str = "", policy=None, defaults=None, model
 
 
 def resolve_mm_click(raw, option=None):
-    """/m 卡下拉回调 → {"op", "tool", "pick"}；形状不对 ⇒ None。`pick`：工具名 / "d" / "m序号" / 档名。"""
+    """/h 卡下拉回调 → {"op", "tool", "pick"}；形状不对 ⇒ None。`pick`：工具名 / "d" / "m序号" / 档名。"""
     from .fleet.catalog import TOOLS
 
     if not isinstance(raw, dict) or raw.get("act") != MM_ACT:
@@ -644,7 +645,7 @@ def resolve_click(value: dict) -> str:
     # 主人自己打 `/mode! x` 也会生效 —— 这是**有意的**文字确认通道（确认卡发不出去时
     # 回话里就教他这么打，见 app._handle_mode）。打出带 `!` 的命令本身就是明确意图；
     # 非主人发的消息在鉴权那层就被丢了。超过本机上限照样压回去。
-    # 1.4.0 /m 卡上的全局权限按钮：一步生效（产品定义：手机和终端同权；仍被本机上限压住）
+    # 1.4.0 /h 卡上的全局权限按钮：一步生效（产品定义：手机和终端同权；仍被本机上限压住）
     picked = value.get("pm")
     if isinstance(picked, str):
         # 1.4.1 起是下拉：值里固定 "?"，选中项由回调的 option 填进来（app._on_menu_click 先换好）
