@@ -38,3 +38,8 @@
 ## 结果记录
 
 项目记录写根因、决策、提交、测试、同步、重启、飞书版本和客户端证据。需要林森事后关注的事项用红色字体标注。项目记录不替代 Git 交付。
+
+## 手工改 chat_binds.json（清理测试群绑定）
+
+- 服务是 `KeepAlive`：`launchctl stop` 之后会马上被拉起来，改完的文件会被正在运行的服务写回去（2026-11-19 清理的 11 个测试群绑定就是这样又回来了）。
+- 正确做法：`launchctl bootout gui/$(id -u)/com.carher.feishu-agent` 卸载 → 备份并改 `chat_binds.json` → `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.carher.feishu-agent.plist` 重新加载 → 重启后再读一次文件，确认条数没变。
