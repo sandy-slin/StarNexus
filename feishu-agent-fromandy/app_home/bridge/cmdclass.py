@@ -1317,16 +1317,42 @@ _HOME_OR_ROOT = (
     r"(?![^\s;&|]*/[^\s;&|])"                    # 后面不许再有路径段
 )
 
+# 🔴 第 39 轮（11-19）：这里原来还有 7 条，**全部撤掉**。判据从「看着危险」改成
+# **「不可逆 + 日常用不到」**，两个条件都满足才留。
+#
+# 撤掉的和为什么（实测 18 条日常命令里 11 条被拒，7 条是正常开发命令）：
+#   `python3 -c` / `node -e` / heredoc / `| python3` —— 拦它从来没拦住什么:
+#       全授权下 agent 可以 `Write` 一个脚本再 `python3 a.py`，一样是任意代码（代码里早写着这一点）。
+#       所以这四条只换来「主人问一句 JSON 里有什么都做不了」，没有换来任何安全。
+#   `eval`/`exec` —— **这条还误伤**：`find . -name '*.py' -exec grep -l TODO {} +` 被判成
+#       「eval/exec 等于绕过所有限制」直接拒（实测，而它本身是只读命令）。
+#   `curl … | sh` —— 装 bun / rustup / homebrew 的标准写法。和上面同理：
+#       `curl -o a.sh && sh a.sh` 本来就放行，拦管道只是把人逼去绕路。
+#   `git reset --hard` / `git clean -f` —— 日常开发命令，丢的是本机未提交改动，
+#       不是不可逆的灾难（`git reflog` 还能找回提交）。
+#   `defaults write` —— 改 mac 偏好设置，调一下 Dock / Finder 很常见，也改得回来。
+# 撤掉**不等于放任**：只读 / 可改档下它们照旧弹卡等主人点头（实测 classify 全部 readonly=False）。
+#
+# 留下的都是「真做下去就回不来，且正常用不到」：删家目录/根、推代码、提权、裸写磁盘、
+# 格式化、fork 炸弹、删线上资源、递归 777、卸载系统服务。
+#
+# 🔴 放开内联代码时**不许把「删家目录」一起放开**：`python3 -c "shutil.rmtree(expanduser('~'))"`
+# 原来被「内联代码」那条顺带拦住，撤掉之后它就通了（本轮实测，是我自己引入的回归）。
+# 「写脚本再跑」那条路改前改后都通（实测 Write + `python3 a.py` 都 allow），所以拦内联
+# 不是在挡能力；但「一句话就把家目录删了」和「要分两步」差别是真的，所以单独认代码里的删家目录。
+# 两头都认（删函数在前 / 家目录在前），中间可以隔分号 —— `-c` 里一行就是一条命令，
+# 分号只是语句分隔（`h=os.environ['HOME']; shutil.rmtree(h)` 实测漏过，就是这么漏的）。
+# 误伤的代价：同一句里既提家目录又删别的东西 ⇒ 全授权下被拒、只读档弹卡。实测常见写法没被误伤。
+_DESTROY_HOME_IN_CODE = re.compile(
+    r"(?:rmtree|rm_rf|rmSync|unlinkSync|removeAll)"
+    r"[^\n]{0,120}(?:expanduser|homedir|\bHOME\b|USERPROFILE|~)"
+    r"|(?:expanduser|homedir|\bHOME\b|USERPROFILE)"
+    r"[^\n]{0,120}(?:rmtree|rm_rf|rmSync|unlinkSync|removeAll)",
+    re.I,
+)
+
 _NEVER_APPROVABLE = (
-    # 任意代码执行：绕开所有命令级判据
-    (re.compile(r"\b(python3?|node|ruby|perl|php|osascript|deno|bun)\b\s+(-c|-e|-r|--eval)"),
-     "用解释器跑内联代码等于绕过所有限制"),
-    (re.compile(r"\b(python3?|node|ruby|perl|sh|bash|zsh)\b[^|;&\n]*<<"),
-     "用 heredoc 喂脚本等于绕过所有限制"),
-    (re.compile(r"\|\s*(sh|bash|zsh|python3?|node)\b"),
-     "把输出管进解释器等于绕过所有限制"),
-    (re.compile(r"\beval\b|\bexec\b"),
-     "eval/exec 等于绕过所有限制"),
+    (_DESTROY_HOME_IN_CODE, "代码里在删家目录"),
     # 不可逆且范围大
     # 🔴 只匹配**目标就是根或家目录本身**（`/`、`~`、`$HOME`、`/*`、`~/*`）。
     # 原来是 `.*(/|~|\$HOME)` —— 任何带 `/` 的 rm -rf 都中（`rm -rf build/`、`rm -rf /tmp/x`）。
@@ -1362,8 +1388,6 @@ _NEVER_APPROVABLE = (
      "把根目录或家目录整个删掉"),
     (re.compile(r"\bgit\s+push\b"),
      "把代码推到远端"),
-    (re.compile(r"\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[a-z]*f"),
-     "丢弃本地改动"),
     (re.compile(r"\bsudo\b|\bdoas\b"),
      "提权"),
     (re.compile(r"\bdd\b.*\bof=/dev/"),
@@ -1372,16 +1396,12 @@ _NEVER_APPROVABLE = (
      "fork 炸弹"),
     (re.compile(r"\bkubectl\s+delete\b|\bhelm\s+(delete|uninstall)\b"),
      "删线上资源"),
-    (re.compile(r"\b(curl|wget)\b.*\|\s*(sh|bash)"),
-     "下载直接执行"),
     (re.compile(r"\bchmod\s+-R\s+777\b|\bchown\s+-R\b.*\s/\s*$"),
      "递归改权限"),
     (re.compile(r"\bdiskutil\s+(erase|reformat)|\bmkfs\b"),
      "格式化磁盘"),
     (re.compile(r"\blaunchctl\s+(bootout|unload)\b.*\bcom\.apple\b"),
      "卸载系统服务"),
-    (re.compile(r"\bdefaults\s+(write|delete)\b"),
-     "改系统设置"),
 )
 
 
@@ -1446,6 +1466,11 @@ _CRED_PATHS = re.compile(
     r"|/etc/(shadow|master\.passwd|sudoers)"
     # 钥匙串本体（`login.keychain-db`）和「在配置目录里搜密码」这两种实测漏过，补上
     r"|\.keychain(-db)?\b"
+    # 🔴 第 39 轮：助手自己的凭据。改前改后都实测漏过 —— 全授权下 `cat ~/.carher-feishu-agent/config.toml`
+    #   直接 allow，而里面就是 app_secret，读出来会跟着回复发进飞书。approval.secret 能伪造批准；
+    #   ~/.claude-feishu-bridge 里有桥的 claude 网关令牌（卸载脚本也是先覆写它再删）。
+    r"|\.carher-feishu-agent/(config\.toml|approval\.secret)"
+    r"|\.claude-feishu-bridge/"
     r"|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\s(~|\$HOME|/Users/|/home/)"
     r"|\s-r[a-zA-Z]*\s+[^;&|]*(~|\$HOME)/\.(config|aws|ssh|gnupg)\b"
     # 🔴 第 17 轮：**凭据目录本身**（没有尾斜杠）。上面那几条目录项写成 `ssh/|aws/`，

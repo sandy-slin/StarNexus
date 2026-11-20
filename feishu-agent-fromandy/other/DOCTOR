@@ -30,7 +30,7 @@ warn() { printf '%s  ⚠ %s%s\n' "$YELLOW" "$1" "$NC"; SCREEN="${SCREEN:-}⚠ $1
 hint() { printf '      → %s\n' "$1"; SCREEN="${SCREEN:-}  → $1"$'\n'; }
 # 明细行（每一类报错各多少次这种）：屏幕上照旧，同时记进上报那一份。ok/say 不记 —— 绿的那些对定位没用
 note() { printf '        %s\n' "$1"; SCREEN="${SCREEN:-}    $1"$'\n'; }
-# 第 38 轮（主人：不许让用户截图）：有红项 / 说了「我们这边会跟进」的项（NEED_REPORT=1）⇒ 结论那一屏后
+# 第 38 轮（主人：不许让用户截图）：有红项 / 说了「这是程序自身的问题」的项（NEED_REPORT=1）⇒ 结论那一屏后
 # 把这一屏的结论行（上面 bad/warn/hint 记的，本来就不含日志原文和 Secret）+ 几项诊断发回 198。
 #   🔴 屏幕上不提「已上报」（11-16 用户要求）。不发电脑名 / 登录名，家目录换成 ~；机器号用 install_id（同 fleet-report）。
 #   只读纪律不变：只多一个 POST，不改本机任何东西。8 秒发不出去就算了。CARHER_NO_REPORT=1 关掉。
@@ -232,7 +232,7 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   if [ -n "$RESTARTS" ] && [ "$RESTARTS" -gt 20 ] 2>/dev/null; then
     warn "已重启 $RESTARTS 次 —— 大概是起来就崩、崩了又被拉起"
     hint "先看下面 [5] 那项：凭据不对是最常见的一种"
-    hint "[5] 是绿的就重新双击 feishu-agent-mac.command；还这样也不用截图，我们这边会跟进"; NEED_REPORT=1
+    hint "[5] 是绿的就重新双击 feishu-agent-mac.command；还这样就把安装包重跑一次"; NEED_REPORT=1
   fi
 else
   bad "服务没注册 ⇒ 关机或重启之后它不会自己起来"
@@ -290,7 +290,7 @@ if [ -f "$CONFIG" ]; then
         hint "去 open.feishu.cn 右上角「创建版本」→「申请发布」，等管理员审批" ;;
       *)  bad "凭据校验失败（code ${CODE:-没拿到回应}）"
         hint "上面 [4] 那项红的话先解决网络，这一项会跟着好"
-        hint "[4] 是绿的就隔几分钟再跑一次本自检；不用截图，我们这边会跟进"; NEED_REPORT=1 ;;
+        hint "[4] 是绿的就隔几分钟再跑一次本自检；这是程序自身的问题，不是你操作的问题"; NEED_REPORT=1 ;;
     esac
   else
     bad "配置里没写机器人凭据 ⇒ 谁发消息它都收不到"
@@ -443,7 +443,7 @@ if [ -f "$CONFIG" ]; then
     fi
   else
     bad "还没绑定主人，也没有配对码 ⇒ 你发的消息它都不会理"
-    hint "重新双击你的安装包，最后一屏会给一个配对码；还不行也不用截图，我们这边会跟进"; NEED_REPORT=1
+    hint "重新双击你的安装包，最后一屏会给一个配对码；还不行就再重跑一次安装包"; NEED_REPORT=1
   fi
 fi
 echo
@@ -540,7 +540,7 @@ if [ -f "$LOG" ]; then
 它没回话|零输出
 ERRCLASS_EOF
     hint "「连不上飞书 / 长连接断开」⇒ 看最上面 [0] 的第三行，照那里的 → 做"
-    hint "「凭据或权限被拒」⇒ 看上面 [5]；别的类别重新双击 feishu-agent-mac.command 试一次，不用截图，我们这边会跟进"; NEED_REPORT=1
+    hint "「凭据或权限被拒」⇒ 看上面 [5]；别的类别重新双击 feishu-agent-mac.command 试一次，这是程序自身的问题，不是你操作的问题"; NEED_REPORT=1
   else
     ok "没有报错"
   fi
@@ -637,7 +637,7 @@ if [ -f "$LOG" ]; then
   if [ "${SILENT_N:-0}" -gt 3 ] 2>/dev/null; then
     warn "它自己因为「很久没动静」重启过 ${SILENT_N} 次 —— 这条网络上连接不太稳"
     hint "每次重启之间的消息都是丢的。换个网络（比如换成手机热点）再观察一天"
-    hint "换了网络还这样也不用截图，我们这边会跟进"; NEED_REPORT=1
+    hint "换了网络还这样就把安装包重跑一次"; NEED_REPORT=1
   fi
 else
   warn "还没有日志，没法判断上次有动静是什么时候"
@@ -687,7 +687,7 @@ fi
 echo "       这一屏跑的时间：$(date '+%Y-%m-%d %H:%M:%S')"
 if [ "$FAILED" -ne 0 ]; then
   echo
-  echo "   照上面的 → 处理完还是不行：重新双击 feishu-agent-mac.command 试一次。不用截图，我们这边会跟进。"
+  echo "   照上面的 → 处理完还是不行：重新双击 feishu-agent-mac.command 试一次。这是程序自身的问题，不是你操作的问题。"
 fi
 [ "$FAILED" -ne 0 ] || [ "$NEED_REPORT" = 1 ] && doctor_report
 say "=================================================="

@@ -565,7 +565,8 @@ def _classify_readonly(command: str) -> bool:
             return False
     return True
 _HOME_OR_ROOT = '[\\"\']?(?:~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s\\"\';&|]+|/home/[^/\\s\\"\';&|]+|/Users|/home|/)(?:/\\.?|/\\*|\\*)?[\\"\']?(?![^\\s;&|]*/[^\\s;&|])'
-_NEVER_APPROVABLE = ((re.compile('\\b(python3?|node|ruby|perl|php|osascript|deno|bun)\\b\\s+(-c|-e|-r|--eval)'), '用解释器跑内联代码等于绕过所有限制'), (re.compile('\\b(python3?|node|ruby|perl|sh|bash|zsh)\\b[^|;&\\n]*<<'), '用 heredoc 喂脚本等于绕过所有限制'), (re.compile('\\|\\s*(sh|bash|zsh|python3?|node)\\b'), '把输出管进解释器等于绕过所有限制'), (re.compile('\\beval\\b|\\bexec\\b'), 'eval/exec 等于绕过所有限制'), (re.compile('\\brm\\b(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*[rR]|--recursive)))(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*f|--force)))[^;&|]*\\s' + _HOME_OR_ROOT + '(?=\\s|$|;|&|\\|)'), '递归删除根目录或家目录'), (re.compile('\\bfind\\s+' + _HOME_OR_ROOT + '(?=\\s)[^;&|]*\\s-(?:delete\\b|exec(?:dir)?\\s+rm\\b|ok(?:dir)?\\s+rm\\b)'), '把根目录或家目录整个删掉'), (re.compile('\\bgit\\s+push\\b'), '把代码推到远端'), (re.compile('\\bgit\\s+reset\\s+--hard\\b|\\bgit\\s+clean\\s+-[a-z]*f'), '丢弃本地改动'), (re.compile('\\bsudo\\b|\\bdoas\\b'), '提权'), (re.compile('\\bdd\\b.*\\bof=/dev/'), '裸写磁盘'), (re.compile(':\\(\\)\\s*\\{.*\\}\\s*;?\\s*:'), 'fork 炸弹'), (re.compile('\\bkubectl\\s+delete\\b|\\bhelm\\s+(delete|uninstall)\\b'), '删线上资源'), (re.compile('\\b(curl|wget)\\b.*\\|\\s*(sh|bash)'), '下载直接执行'), (re.compile('\\bchmod\\s+-R\\s+777\\b|\\bchown\\s+-R\\b.*\\s/\\s*$'), '递归改权限'), (re.compile('\\bdiskutil\\s+(erase|reformat)|\\bmkfs\\b'), '格式化磁盘'), (re.compile('\\blaunchctl\\s+(bootout|unload)\\b.*\\bcom\\.apple\\b'), '卸载系统服务'), (re.compile('\\bdefaults\\s+(write|delete)\\b'), '改系统设置'))
+_DESTROY_HOME_IN_CODE = re.compile('(?:rmtree|rm_rf|rmSync|unlinkSync|removeAll)[^\\n]{0,120}(?:expanduser|homedir|\\bHOME\\b|USERPROFILE|~)|(?:expanduser|homedir|\\bHOME\\b|USERPROFILE)[^\\n]{0,120}(?:rmtree|rm_rf|rmSync|unlinkSync|removeAll)', re.I)
+_NEVER_APPROVABLE = ((_DESTROY_HOME_IN_CODE, '代码里在删家目录'), (re.compile('\\brm\\b(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*[rR]|--recursive)))(?=(?:[^;&|]*\\s(?:-[a-zA-Z]*f|--force)))[^;&|]*\\s' + _HOME_OR_ROOT + '(?=\\s|$|;|&|\\|)'), '递归删除根目录或家目录'), (re.compile('\\bfind\\s+' + _HOME_OR_ROOT + '(?=\\s)[^;&|]*\\s-(?:delete\\b|exec(?:dir)?\\s+rm\\b|ok(?:dir)?\\s+rm\\b)'), '把根目录或家目录整个删掉'), (re.compile('\\bgit\\s+push\\b'), '把代码推到远端'), (re.compile('\\bsudo\\b|\\bdoas\\b'), '提权'), (re.compile('\\bdd\\b.*\\bof=/dev/'), '裸写磁盘'), (re.compile(':\\(\\)\\s*\\{.*\\}\\s*;?\\s*:'), 'fork 炸弹'), (re.compile('\\bkubectl\\s+delete\\b|\\bhelm\\s+(delete|uninstall)\\b'), '删线上资源'), (re.compile('\\bchmod\\s+-R\\s+777\\b|\\bchown\\s+-R\\b.*\\s/\\s*$'), '递归改权限'), (re.compile('\\bdiskutil\\s+(erase|reformat)|\\bmkfs\\b'), '格式化磁盘'), (re.compile('\\blaunchctl\\s+(bootout|unload)\\b.*\\bcom\\.apple\\b'), '卸载系统服务'))
 
 def _flag_only_ok(tokens: list, start: int, spec: dict) -> str:
     """这一段是不是**只有**被认可的只读 token。返回空串 = 是；否则返回要问的原因。
@@ -605,7 +606,7 @@ def _flag_only_ok(tokens: list, start: int, spec: dict) -> str:
     if need is not None and (not need.search(' '.join(_segment(tokens, start)))):
         return '没带限定次数/范围的选项，可能会一直跑或者拉回整份清单'
     return ''
-_CRED_PATHS = re.compile('(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root|/etc)?/?\\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|pgpass|my\\.cnf|git-credentials|keychain|Keychains/)|(^|[\\s=\\"\'(:/])\\.env(\\.[A-Za-z0-9_.-]+)?(\\s|$|[\\"\';)])|\\.(pem|p12|pfx|jks)(\\s|$|[\\"\';)])|\\bid_(rsa|dsa|ecdsa|ed25519)\\b|/etc/(shadow|master\\.passwd|sudoers)|\\.keychain(-db)?\\b|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\\s(~|\\$HOME|/Users/|/home/)|\\s-r[a-zA-Z]*\\s+[^;&|]*(~|\\$HOME)/\\.(config|aws|ssh|gnupg)\\b|(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root)/\\.(ssh|aws|gnupg)(?=\\s|$|[\\"\';)/])|/\\.config/(gh|gcloud|rclone|doctl|flyctl|heroku|npm|composer|gspread)\\b|\\bsecurity\\s+(find-(generic|internet)-password|dump-keychain|export)\\b', re.I)
+_CRED_PATHS = re.compile('(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root|/etc)?/?\\.?(ssh/|aws/|gnupg/|docker/config|kube/config|netrc|npmrc|pypirc|pgpass|my\\.cnf|git-credentials|keychain|Keychains/)|(^|[\\s=\\"\'(:/])\\.env(\\.[A-Za-z0-9_.-]+)?(\\s|$|[\\"\';)])|\\.(pem|p12|pfx|jks)(\\s|$|[\\"\';)])|\\bid_(rsa|dsa|ecdsa|ed25519)\\b|/etc/(shadow|master\\.passwd|sudoers)|\\.keychain(-db)?\\b|\\.carher-feishu-agent/(config\\.toml|approval\\.secret)|\\.claude-feishu-bridge/|(?i:password|passwd|secret|token|credential|api[_-]?key)[^;&|]*\\s(~|\\$HOME|/Users/|/home/)|\\s-r[a-zA-Z]*\\s+[^;&|]*(~|\\$HOME)/\\.(config|aws|ssh|gnupg)\\b|(^|[\\s=\\"\'(:])(~|\\$HOME|\\$\\{HOME\\}|/Users/[^/\\s]+|/home/[^/\\s]+|/root)/\\.(ssh|aws|gnupg)(?=\\s|$|[\\"\';)/])|/\\.config/(gh|gcloud|rclone|doctl|flyctl|heroku|npm|composer|gspread)\\b|\\bsecurity\\s+(find-(generic|internet)-password|dump-keychain|export)\\b', re.I)
 
 def _touches_credentials(command: str) -> str:
     """这条命令碰到了凭据文件吗。返回原因，空串 = 没碰到。
@@ -923,6 +924,31 @@ def decide(decision: str, reason: str) -> None:
     sys.exit(0)
 
 
+# 桥自己的家（主人名单、令牌密钥、审批标记）和 ~/.ssh **任何档位都不让写** ——
+# 哪怕有人把 `~` 配成了工作目录、哪怕是全授权。写进去 = 换主人 / 伪造批准 / 远程登录。
+_PROTECTED_DIRS = (".carher-feishu-agent", ".claude-feishu-bridge", ".ssh")
+
+
+def _is_protected(resolved: str) -> bool:
+    home = os.path.realpath(os.path.expanduser("~"))
+    for name in _PROTECTED_DIRS:
+        root = os.path.join(home, name)
+        if resolved == root or resolved.startswith(root + os.sep):
+            return True
+    return False
+
+
+def _resolve_target(target: str, workspaces, cwd: str) -> str:
+    path = os.path.expanduser(target)
+    if not os.path.isabs(path):
+        base = cwd or (os.path.expanduser(workspaces[0]) if workspaces else os.getcwd())
+        path = os.path.join(base, path)
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return path
+
+
 def _write_inside(target: str, workspaces, cwd: str) -> bool:
     """写文件的目标是否在工作目录内。**比读严**：没有系统目录豁免。
 
@@ -940,13 +966,8 @@ def _write_inside(target: str, workspaces, cwd: str) -> bool:
         resolved = os.path.realpath(path)
     except OSError:
         return False
-    # 桥自己的家（主人名单、令牌密钥、审批标记）和 ~/.ssh 永远不让写 ——
-    # 哪怕有人把 `~` 配成了工作目录。写进去 = 换主人 / 伪造批准 / 远程登录。
-    home = os.path.realpath(os.path.expanduser("~"))
-    for forbidden in (".carher-feishu-agent", ".claude-feishu-bridge", ".ssh"):
-        root = os.path.join(home, forbidden)
-        if resolved == root or resolved.startswith(root + os.sep):
-            return False
+    if _is_protected(resolved):
+        return False
     for workspace in workspaces:
         try:
             root = os.path.realpath(os.path.expanduser(workspace))
@@ -1004,9 +1025,13 @@ def main() -> None:
     # 2026-11-04 review 实测：trusted 下 Write 到 ~/.carher-feishu-agent/config.toml
     # 原来直接 allow —— 被注入的 agent 能把自己加进 owner_open_ids、或写 ~/.ssh/authorized_keys，
     # 一张卡片都不弹。读边界一直有，写边界之前漏了。
+    trusted = os.path.exists(os.path.join(directory, "TRUSTED"))
     if tool_name in ("Write", "Edit", "NotebookEdit", "MultiEdit"):
         target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-        if target and not _write_inside(target, workspaces, cwd):
+        if target and _is_protected(_resolve_target(target, workspaces, cwd)):
+            decide("deny", f"{target} 是助手自己的配置或登录密钥，任何模式下都不许改")
+        # 🔴 第 39 轮（用户 11-19 拍板：「都改成 bypass」，红线保留）：全授权下项目外也不问就写
+        if target and not trusted and not _write_inside(target, workspaces, cwd):
             decide("deny", f"只能改工作目录里的文件，{target} 在范围外")
 
     # 路径越界：命令碰到 workspace 之外的用户数据 ⇒ 要审批。
@@ -1023,9 +1048,16 @@ def main() -> None:
         # **连点同意都不许**的红线（上面 never_approvable 那一段），所以
         # `cat ~/.ssh/id_rsa` 走不到这里就被 deny 了。
         # 🔴 只放「读」：会写的命令照旧要卡（写只许在工作目录里），只读档也照旧弹卡。
-        if (outside and _classify_readonly(command)
-                and os.path.exists(os.path.join(directory, "TRUSTED"))):
-            decide("allow", "全授权模式下看一眼工作目录外的东西")
+        if outside and trusted:
+            # 🔴 第 39 轮（用户 11-19 拍板「都改成 bypass」，四样红线保留）：
+            # 全授权下**项目外也不问就做**，读写都放。上面的红线（删家目录、git push、
+            # 读凭据、sudo …）已经先判过了，走不到这里。
+            # 只剩一样照旧挡：**会写的命令**碰到桥自己的家 / ~/.ssh（换主人、伪造批准、远程登录）。
+            # 按子串查而不是按解析出的路径：`$HOME/.carher-feishu-agent` 这种展开后才知道的也要拦。
+            if not _classify_readonly(command) and any(n in command for n in _PROTECTED_DIRS):
+                decide("deny", "这是安全规则拦的，不是用户拒的：不能改助手自己的配置或登录密钥。"
+                               "不许拆开、写成脚本或换工具绕过；做不了就跳过这一步，告诉用户你本来要做什么。")
+            decide("allow", "全授权模式：项目外也不问就做")
         if outside and _only_granted_scripts(command, workspaces, cwd, directory, session_id):
             # 这条命令伸出工作目录的**只有**本会话批准过的生图/生视频脚本 ⇒ 不再按越界拦，
             # 但也**不直接放行**：往下照常按档位判（只读/可改档照样要问，全授权才放）。
@@ -1065,7 +1097,7 @@ def main() -> None:
     # 所以全授权的语义就是「不问就做，只有红线拦」。红线是：删家目录/根、`git push`、
     # 提权、`git reset --hard`、删线上资源、读凭据（含整个 `~/.ssh` 打包走）、
     # 往终端里敲命令、内联解释器。这几样点「同意」也不许。
-    if os.path.exists(os.path.join(directory, "TRUSTED")):
+    if trusted:
         decide("allow", "全授权模式")
 
     # 只读操作直接放行，不弹卡片。

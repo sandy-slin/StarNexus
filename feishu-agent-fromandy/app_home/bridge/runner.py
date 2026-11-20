@@ -53,6 +53,17 @@ def _context_for(workspace: str, policy) -> str:
     """
     allowed = "、".join(policy.workspaces) if policy.workspaces else workspace
     lines = [_BRIDGE_CONTEXT]
+    if policy.mode == "trusted":
+        # 🔴 第 39 轮（用户 11-19 拍板「都改成 bypass」，四样红线保留）：全授权下项目外读写都放开了。
+        # 只改闸门不改这句 ⇒ 真 claude 实测 4/4 一个工具都不调，直接回「不在我的范围内、请换项目」——
+        # 闸门放行了，模型自己被这段提示拦住。说的和做的要一致。
+        lines.append(
+            f"你现在在 {workspace}。当前是全授权档：整台电脑都可以读写，项目外也不用先问。"
+            "只有这几样系统会直接拒、换写法也不行：删整个家目录、git push、读私钥和密码、sudo、"
+            "改这个助手自己的配置。被拒了就跳过那一步，告诉用户你本来要做什么。"
+            "不要让用户输入任何以 / 开头的命令。"
+        )
+        return " ".join(lines)
     lines.append(
         f"你现在在 {workspace}。你只能读写这些目录里的东西：{allowed}。"
         "这是刻意的限制，不是配置错误 —— 范围外的路径不要去试，"

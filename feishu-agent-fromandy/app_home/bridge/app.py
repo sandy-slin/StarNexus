@@ -144,7 +144,7 @@ def explain_ws_failure(code: int | None) -> str:
             "飞书拒绝了这条连接（403）。先确认应用的事件订阅方式选的是"
             "「使用长连接接收事件」，而且版本已经发布、管理员已经审批。"
         )
-    return f"认不出这个拒绝原因（code={code}）—— 不用截图，我们这边会跟进。"
+    return f"认不出这个拒绝原因（code={code}）—— 这是程序自身的问题，不是你操作的问题。"
 
 
 # 🔴 例句里**不许写死任何仓库名或文件名**。原来是
@@ -944,6 +944,20 @@ class Bridge:
         }
         if message_id and message_id in self._seen_messages:
             return
+        # 🔴 第 39 轮（用户 11-19）：群里什么时候回。
+        #   ① 只有主人 + 本机器人的群 ⇒ 主人说什么都回（不用 @）
+        #   ② 别的群（多人群、拉了别的机器人的群）⇒ 只有 **@ 了本机器人** 才回
+        # 放在最前面：多人群里没 @ 的图片 / 表情包也不该回「我只看得懂文字」。
+        # 非主人照旧在上面那道就静默丢了 —— 多人群里同事 @ 它也不回（回了等于让他指挥主人的电脑）。
+        if (getattr(message, "chat_type", "") or "p2p") == "group":
+            group_chat = getattr(message, "chat_id", "") or ""
+            if not self._group_should_answer(message, group_chat):
+                if not (getattr(message, "mentions", None) or []):
+                    self._mark_group_msg_proven()   # 收到了没 @ 的群消息 ⇒ 权限是真开着的（照原样记）
+                if message_id:
+                    self._seen_messages[message_id] = now
+                logger.info("多人群里没 @ 我，不回 chat=%s", group_chat[-6:])
+                return
         # 「在办」表情（第 18 轮，用户原话「比如 get 符号」）不在这里贴了 ——
         # 🔴 第 19 轮 S3：原来在这里贴，下面图片 / 表情包 / 读不出正文 / 循环没起来
         # 这几条直接 return 的路**永远不撤**。现在挪进 `_handle_then_unack`：
@@ -4319,6 +4333,93 @@ class Bridge:
             logger.info("建群即进对话：点接着聊记成确认 tool=%s 会话=%s", tool, str(sid)[:8])
         except Exception:  # noqa: BLE001
             logger.exception("建群后自动确认没存下来，这个群第一句会再问一次")
+
+    # ---------- 第 39 轮：群里该不该回 ----------
+
+    GROUP_PRIVATE_TTL = 60.0   # 群成员会变（有人被拉进来）⇒ 人数最多缓存 1 分钟
+
+    def _group_should_answer(self, message, chat_id: str) -> bool:
+        """群里这条（已确认是主人发的）要不要回。@ 了本机器人 ⇒ 回；没 @ ⇒ 只在「只有主人 + 本机器人」的群里回。"""
+        if self._mentions_me(getattr(message, "mentions", None) or []):
+            return True
+        return self._group_is_private(chat_id)
+
+    def _bot_open_id(self) -> str:
+        """本机器人自己的 open_id（`/bot/v3/info`）。拿到一次就记住；拿不到返回空串、下次再试。"""
+        got = getattr(self, "_bot_open_id_cache", "")
+        if got:
+            return got
+        client = getattr(self, "group_client", None)
+        if client is None:
+            return ""
+        try:
+            out = client._authed("GET", "/bot/v3/info")
+            got = str(((out or {}).get("bot") or {}).get("open_id") or "")
+        except Exception:  # noqa: BLE001
+            got = ""
+        if got:
+            self._bot_open_id_cache = got
+        return got
+
+    def _mentions_me(self, mentions) -> bool:
+        """@ 名单里有没有本机器人。
+
+        认不出自己是谁（`/bot/v3/info` 拿不到）⇒ **有 @ 就当是 @ 我**：宁可多回一句，
+        也别让主人 @ 了它却石沉大海（那时他不知道是规则拦的，只会以为坏了）。
+        `@所有人` 不算 @ 我（它的 key 是 `@_all`，没有 open_id）。
+        """
+        if not mentions:
+            return False
+        me = self._bot_open_id()
+        for item in mentions:
+            ident = getattr(item, "id", None)
+            open_id = str(getattr(ident, "open_id", "") or "") if ident is not None else ""
+            if not open_id:
+                continue                       # @所有人 之类
+            if not me or open_id == me:
+                return True
+        return False
+
+    def _group_is_private(self, chat_id: str) -> bool:
+        """这个群是不是**只有主人 + 本机器人**：真人 1 个（发这句的就是主人，所以那 1 个就是他）、机器人 ≤ 1 个。
+
+        人数从飞书现问（`GET /im/v1/chats/:id` 的 `user_count` / `bot_count`，11-19 测试群实测
+        只有主人时返回 `'1'` / `'1'`），缓存 `GROUP_PRIVATE_TTL` 秒。
+        问不出来（没开「查看群信息」、断网）⇒ **按多人群算**（要 @），只有一个例外：
+        桥自己建的会话群（chat_binds 里有、建的时候只拉了主人）——那种群里「每一句都直达」是
+        答应过主人的，不能因为查不出人数就突然要 @。
+        """
+        cid = str(chat_id or "")
+        if not cid:
+            return False
+        cache = getattr(self, "_group_private_cache", None)
+        if cache is None:
+            cache = self._group_private_cache = {}
+        hit = cache.get(cid)
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < self.GROUP_PRIVATE_TTL:
+            return hit[1]
+        verdict = None
+        client = getattr(self, "group_client", None)
+        if client is not None:
+            try:
+                out = client._authed("GET", f"/im/v1/chats/{cid}") or {}
+                if not out.get("code"):
+                    data = out.get("data") or {}
+                    users = int(str(data.get("user_count") or "-1"))
+                    bots = int(str(data.get("bot_count") or "0"))
+                    verdict = users == 1 and bots <= 1
+            except Exception:  # noqa: BLE001
+                verdict = None
+        if verdict is None:
+            binds = getattr(self, "chat_binds", None)
+            try:
+                verdict = bool(binds is not None and binds.of_chat(cid) is not None)
+            except Exception:  # noqa: BLE001
+                verdict = False
+            logger.info("查不出群人数，按%s算 chat=%s", "会话群" if verdict else "多人群", cid[-6:])
+        cache[cid] = (now, verdict)
+        return verdict
 
     def _group_msg_proof_path(self) -> str:
         # 和审批目录 / paused.json 同一套取法（`__init__` 里 `home = …`）：config_path 是相对的

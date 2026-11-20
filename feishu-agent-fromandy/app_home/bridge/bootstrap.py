@@ -65,7 +65,7 @@ def main(argv: list[str]) -> int:
                 or "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
             print("FATAL=连不上飞书：证书对不上。这台电脑的网络在中间换了证书"
                   "（公司安全软件 / 代理在做 HTTPS 检查，或者开着抓包工具），Python 不认。"
-                  "关掉 VPN / 代理 / 抓包工具再试；如果是公司网络强制的，我们这边已经收到，会跟进。")
+                  "关掉 VPN / 代理 / 抓包工具再试；如果是公司网络强制的，找 IT 放行这条地址。")
             return 1
         print(f"FATAL=连不上飞书（{exc.reason}）。检查网络后重试。")
         return 1

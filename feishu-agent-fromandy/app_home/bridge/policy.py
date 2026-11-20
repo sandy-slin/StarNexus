@@ -86,12 +86,12 @@ WRITE_EXTRA_TOOLS = ("Edit", "Write", "NotebookEdit")
 #               仍然要审批**（只读档弹卡）：`curl -d @文件 外网`、`nc`、`scp`、
 #               `rsync -e ssh`、`curl … | bash` 都被判「会写/要问」，用例在
 #               `test_r16_deny_narrow.py::test_exfiltration_shapes_still_need_approval`。
-# sudo / git push / git clean / kubectl delete：**不动**，照旧硬拒。
+# sudo / git push / kubectl delete：**不动**，照旧硬拒。
+# 🔴 第 39 轮：`git reset --hard` / `git clean` 从这里撤掉 —— 日常开发命令，丢的是本机未提交改动，
+#    不是不可逆的灾难。非全授权档仍要弹卡（钩子那边 readonly=False）。
 ALWAYS_DENY = (
     "Bash(sudo:*)",
     "Bash(git push:*)",
-    "Bash(git reset --hard:*)",
-    "Bash(git clean:*)",
     "Bash(kubectl delete:*)",
     # 凭据：读不到就不会被回传进飞书。飞书是外部系统，发出去就等于发布了。
     "Read(**/.env*)",
@@ -115,6 +115,10 @@ ALWAYS_DENY = (
     "Read(//**/.aws/**)",
     "Read(//**/.ssh/**)",
     "Read(//**/credentials*)",
+    # 第 39 轮：助手自己的凭据（同 cmdclass._CRED_PATHS 那三项；Read 工具在全授权下是整台电脑）
+    "Read(//**/.carher-feishu-agent/config.toml)",
+    "Read(//**/.carher-feishu-agent/approval.secret)",
+    "Read(//**/.claude-feishu-bridge/**)",
 )
 
 
@@ -320,9 +324,12 @@ class Policy:
             # 🔴 写类工具**也带作用域**（2026-11-04 review 实测：裸 Write/Edit
             # 能写到 ~/.carher-feishu-agent/config.toml，把攻击者加进主人名单）。
             # 钩子那边还有一道 `_write_inside` 兜底（不依赖这里的作用域格式是否被 CLI 认）。
+            # 🔴 第 39 轮（用户 11-19 拍板「都改成 bypass」，四样红线保留）：写类工具也放开到整台电脑。
+            # 桥自己的家 / ~/.ssh 由钩子的 `_is_protected` 挡（任何档位都 deny，测试
+            # `test_bridge_home_is_never_writable_even_as_workspace`），凭据读由 ALWAYS_DENY 挡。
             return (
                 ("Bash", "TodoWrite", "WebFetch", "WebSearch", "Task")
-                + self._scoped_write_tools()
+                + tuple(f"{tool}(//**)" for tool in WRITE_EXTRA_TOOLS)
                 + self._scoped_read_tools()
             )
         if self.mode == "write":
@@ -371,8 +378,8 @@ class Policy:
                 "删家目录、推代码、读私钥这几样永远不做"
             )
         return (
-            "全授权：项目里的事不问就做。要动项目以外的东西还会先问你；"
-            "删家目录、推代码、读私钥这几样永远不做"
+            "全授权：什么都不问就做，项目里外都一样；"
+            "只有删家目录、推代码、读私钥、sudo 这几样永远不做"
         )
 
 
