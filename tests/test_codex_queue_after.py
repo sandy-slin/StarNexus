@@ -1,4 +1,9 @@
-"""1.9.8：Codex App / 终端里开着的会话，一轮在跑时再说一句 ⇒ 排在这一轮后面，不再回「上一条还在发」。"""
+"""一轮在跑时再说一句 ⇒ 排在这一轮后面，不再回「上一条还在发」。
+
+1.9.8 只对 Codex、且只在 App / 终端占着时排队。2026-11-21 主人口径「整体都走 steering」
+⇒ 凡声明了 `steer` 能力的工具都走这条兜底，owner 不再限制（见 tests/test_steer_fallback_queue.py）。
+没有排队通道的工具（cursor）照旧走原来的提示。
+"""
 import asyncio
 import unittest
 from types import SimpleNamespace
@@ -82,17 +87,24 @@ class TryQueueAfterTest(unittest.TestCase):
         self.assertNotIn("上一条还在发", "".join(bridge.said))
         self.assertEqual(bridge.replies, ["回复B"])
 
-    def test_not_app_owned_falls_back_without_promise(self):
+    def test_any_owner_is_queued(self):
+        """owner 不再限制：桥自己起的那一轮结束后也排得上（11-20 现场就是这一种）。"""
         for owner in ("bridge", "none", "unknown"):
             bridge = make_bridge(ActionResult(True, "r", TID, delivered=True), owner=owner)
-            self.assertEqual(self.run_it(bridge), [False])
-            self.assertEqual(bridge.said, [])
-            bridge.fleet.relay_queued.assert_not_called()
+            self.assertEqual(self.run_it(bridge), [True])
+            bridge.fleet.relay_queued.assert_called()
 
-    def test_claude_not_queued_here(self):
+    def test_claude_queued_here_too(self):
+        """Claude 也声明了 steer ⇒ 同样走这条兜底，不再在这里被挡掉。"""
         bridge = make_bridge(ActionResult(True, "r", TID, delivered=True))
         claude = SimpleNamespace(tool="claude", id=TID, label="Claude")
-        self.assertFalse(asyncio.run(bridge._try_queue_after("group:oc", "oc", claude, "x")))
+        self.assertTrue(asyncio.run(bridge._try_queue_after("group:oc", "oc", claude, "x")))
+
+    def test_cursor_not_queued_here(self):
+        """cursor 没有 steer 能力、也没有排队通道 ⇒ 退回原来的提示。"""
+        bridge = make_bridge(ActionResult(True, "r", TID, delivered=True))
+        cursor = SimpleNamespace(tool="cursor", id="c1", label="Cursor")
+        self.assertFalse(asyncio.run(bridge._try_queue_after("group:oc", "oc", cursor, "x")))
         self.assertEqual(bridge.said, [])
 
     def test_queued_but_no_reply_says_why(self):
