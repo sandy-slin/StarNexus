@@ -1089,6 +1089,22 @@ class Bridge:
         from .fleet.inbox import attachments_of
 
         attachments = attachments_of(mtype, getattr(message, "content", "") or "")
+        if mtype == "merge_forward" and message_id:
+            # 1.9.6：合并转发 ⇒ 展开里面的每一条，当成一条消息交给会话（fleet/mergefwd.py）
+            chat_mf = getattr(message, "chat_id", "") or ""
+            chat_type_mf = getattr(message, "chat_type", "") or "p2p"
+            scope_mf = SessionStore.scope_for(chat_mf, chat_type_mf, open_id)
+            if chat_mf:
+                if not hasattr(self, "_chat_ids"):
+                    self._chat_ids = {}
+                self._chat_ids[scope_mf] = chat_mf
+            if self._loop is None:
+                logger.error("事件循环还没起来，这条合并转发先不处理，等飞书重推")
+                return
+            asyncio.run_coroutine_threadsafe(
+                self._merge_forward_then_handle(scope_mf, chat_mf, message_id, open_id), self._loop)
+            self._seen_messages[message_id] = now
+            return
         if mtype not in ("text", "post", "sticker") and message_id and not attachments:
             self._seen_messages[message_id] = now
             chat_for_reply = getattr(message, "chat_id", "") or ""
@@ -1233,6 +1249,47 @@ class Bridge:
             except Exception:  # noqa: BLE001
                 pass
         return self.settings.policy.default_workspace
+
+    async def _merge_forward_then_handle(self, scope: str, chat_id: str, message_id: str,
+                                         open_id: str = "") -> None:
+        """合并转发：读出里面的每一条 ⇒ 图片 / 文件存进 inbox ⇒ 拼成一段记录当成这条消息处理（1.9.6）。"""
+        from .fleet import inbox, mergefwd
+
+        try:
+            items = await asyncio.to_thread(mergefwd.fetch, self.client, message_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("合并转发 读取失败 原因=%s", _redact_text(str(exc)))
+            self._say(chat_id, "这条合并转发没读出来。稍后再转发一次，或者把要说的直接打成文字。")
+            return
+        if not items:
+            self._say(chat_id, "这条合并转发里没有能读的消息。")
+            return
+        cwd = None
+        saved_n = failed = 0
+        for it in items:
+            found = inbox.attachments_of(str(it.get("msg_type") or ""), str((it.get("body") or {}).get("content") or ""))
+            if not found:
+                continue
+            if cwd is None:
+                cwd = await asyncio.to_thread(self._inbox_cwd, scope)
+            paths = []
+            for kind, key, name in found:
+                try:
+                    data, served, mime = await asyncio.to_thread(
+                        inbox.download, self.client, str(it.get("message_id") or message_id), key, kind)
+                    directory = await asyncio.to_thread(inbox.inbox_dir, cwd)
+                    paths.append(await asyncio.to_thread(
+                        inbox.save, directory, inbox.safe_name(name or served, key, kind, mime), data))
+                    saved_n += 1
+                except Exception as exc:  # noqa: BLE001 —— 一张图下不来不影响别的
+                    failed += 1
+                    logger.warning("合并转发 附件下载失败 kind=%s 原因=%s", kind, _redact_text(str(exc)))
+            it["saved"] = paths
+        transcript = _redact_text(mergefwd.render(items, me=open_id))
+        logger.info("合并转发 展开 条数=%d 附件存好=%d 失败=%d 字数=%d", len(items), saved_n, failed, len(transcript))
+        if failed:
+            self._say(chat_id, f"合并转发里有 {failed} 个图片 / 文件没下载下来，其余内容照常发过去。")
+        await self._handle_then_unack(scope, chat_id, mergefwd.compose(transcript, len(items)), message_id)
 
     async def _attachments_then_handle(self, scope: str, chat_id: str, text: str, message_id: str,
                                        attachments: list, late_note: str = "") -> None:
