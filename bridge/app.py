@@ -3635,9 +3635,9 @@ class Bridge:
     async def _try_queue_after(self, scope: str, chat_id: str, target, text: str) -> bool:
         """插不进当前这一轮、但电脑上开着这个会话（Codex App / 终端）⇒ 排在这一轮后面，不拒收。
 
-        11-20 用户反馈：「steering 貌似不工作，上条还在发，等他回来再说」。根因：群绑的是 Codex App 里开着的会话，
-        那一轮不是桥起的，`turn/steer` 插不进；`codex queue` 是官方唯一的口子，只能排到这一轮之后。
-        所以照实说「排上了，这一轮做完就处理」，回复回来照常贴群里。排不上 ⇒ False，走原来的提示。
+        1.9.9 起这是**兜底**：插话（`_try_steer`）先试，插进去就不走这里。只有 App 那条插话通道也没成
+        （App 刚好切走、这一轮正好结束）才排在后面，照实说「排上了，这一轮做完就处理」，
+        回复回来照常贴群里。排不上 ⇒ False，走原来的提示。
         """
         control = getattr(self, "fleet", None)
         if control is None or not hasattr(control, "relay_queued") or target.tool != "codex":

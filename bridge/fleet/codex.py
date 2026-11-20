@@ -1024,17 +1024,39 @@ class CodexAdapter(Adapter):
         return live is not None and live.open()
 
     def steer(self, id: str, text: str) -> ActionResult:
-        """把一句话插进**桥自己起的、正在跑的**那一轮（`turn/steer`，同一个 turnId）。插不进 ⇒ ok=False。"""
+        """一轮在跑时插一句话进去。两条路：
+
+        - **桥自己起的那一轮** ⇒ `turn/steer`（同一个 turnId），和以前一样。
+        - **Codex App 里开着的那一轮** ⇒ 走 App 的内部通道插进它正在跑的这一轮（`appsteer.py`，
+          1.9.9）。`codex queue` 只能排到下一轮，用户明确不要那种（11-20：任务描述要边跑边修正）。
+        都插不进 ⇒ ok=False，调用方退回排队。
+        """
         tid = str(id or "").lower()
         text = str(text or "").strip()
         if not text:
             return ActionResult(False, "要发的内容是空的。", tid)
         with self._live_guard:
             live = self._live.get(tid)
-        if live is None or not live.steer(text):
-            return ActionResult(False, WHY_STEER_NOT_RUNNING, tid)
-        logger.info("中途插话 写入 Codex 会话=%s 字数=%d 第%d条", tid[:8], len(text), live.steered)
-        return ActionResult(True, STEER_OK, tid, delivered=True)
+        if live is not None and live.steer(text):
+            logger.info("中途插话 写入 Codex 会话=%s 字数=%d 第%d条", tid[:8], len(text), live.steered)
+            return ActionResult(True, STEER_OK, tid, delivered=True)
+        if self._owner_of(tid) == "app":
+            from . import appsteer
+
+            got = appsteer.steer(tid, text, codex_home=self.home)
+            if got.ok:
+                return ActionResult(True, STEER_OK, tid, delivered=True)
+            if got.why:
+                logger.info("中途插话 App 没插进 会话=%s 原因=%s", tid[:8], got.why[:100])
+        return ActionResult(False, WHY_STEER_NOT_RUNNING, tid)
+
+    def _owner_of(self, tid: str) -> str:
+        """这个会话现在是谁占着（app / terminal / bridge / none / unknown）。读不出 ⇒ 空串。"""
+        try:
+            state = self._state([tid]).get(tid)
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(state[0]) if state else "none"
 
     # ---------- start：手机上新建会话 ----------
 

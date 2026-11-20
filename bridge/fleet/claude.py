@@ -1034,10 +1034,13 @@ class ClaudeAdapter(Adapter):
         return live is not None and live.open()
 
     def steer(self, id: str, text: str) -> ActionResult:
-        """把一句话写进**桥自己起的、正在跑的**那一轮。它在当前工具调用结束后读到，同一轮里改方向。
+        """一轮在跑时插一句话进去。两条路：
 
-        只认 `_live` 里登记的那一轮（`send()` 起的）；终端 / App 里开着的会话不碰。
-        写不进去（这一轮刚结束、进程退了）⇒ ok=False，调用方退回原来的处理，不丢话。
+        - **桥自己起的那一轮** ⇒ 写进它的 stdin，它在当前工具调用结束后读到，同一轮里改方向。
+        - **电脑终端里开着的会话** ⇒ 走会话间消息（`relay.py` 的信使）。那条路本来就是
+          「目标正忙也能送、进它的输入队列、不分叉不打断」，正好就是插话（1.9.9）。
+          用户明确不要「等上一轮做完再处理」（11-20：任务描述要边跑边修正）。
+        都插不进 ⇒ ok=False，调用方退回原来的处理，不丢话。
         """
         sid = str(id or "")
         text = str(text or "").strip()
@@ -1045,10 +1048,27 @@ class ClaudeAdapter(Adapter):
             return ActionResult(False, "要发的内容是空的。", sid)
         with self._live_guard:
             live = self._live.get(sid)
-        if live is None or not live.write(text):
+        if live is not None and live.write(text):
+            _mark_steer(getattr(live, "approval_dir", ""), text)
+            logger.info("中途插话 写入 会话=%s 字数=%d 第%d条", sid[:8], len(text), live.written - 1)
+            return ActionResult(True, STEER_OK, sid, delivered=True)
+        return self._steer_via_relay(sid, text)
+
+    def _steer_via_relay(self, sid: str, text: str) -> ActionResult:
+        """终端里开着的会话：把这句送进它的输入队列（不等回复 —— 在跑的那一轮回来时一起看到）。"""
+        try:
+            relay = self._relay()
+            decision = relay.check(sid)
+            if not decision.ok:
+                return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+            got = relay.deliver(sid, text)
+        except Exception:  # noqa: BLE001 —— 插话失败一律退回排队，不丢话
+            logger.exception("中途插话 走信使出错 会话=%s", sid[:8])
             return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
-        _mark_steer(getattr(live, "approval_dir", ""), text)
-        logger.info("中途插话 写入 会话=%s 字数=%d 第%d条", sid[:8], len(text), live.written - 1)
+        if not got.delivered:
+            logger.info("中途插话 信使没送到 会话=%s", sid[:8])
+            return ActionResult(False, WHY_STEER_NOT_RUNNING, sid)
+        logger.info("中途插话 走信使送进 会话=%s 字数=%d", sid[:8], len(text))
         return ActionResult(True, STEER_OK, sid, delivered=True)
 
     def _run_streaming(self, sid: str, argv: list, text: str, timeout: float, cwd: str, env: dict,

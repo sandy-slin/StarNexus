@@ -2,6 +2,7 @@
 import threading
 import time
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 from tests import helpers  # noqa: F401
@@ -121,3 +122,55 @@ class CodexQueuedMessageTest(unittest.TestCase):
         ad, codex_mod = self.adapter()
         res = ad._await_reply("t", "x", {}, 0.01, 0.01, 0.0, owner="")
         self.assertEqual(res.text, codex_mod.RELAY_QUEUED_NOBODY_HOME)
+
+
+class DeliverNoWaitTest(unittest.TestCase):
+    """1.9.9 插话：只等落地，不等回复；上一句正在送时等锁而不是直接判失败。"""
+
+    def make(self):
+        relay = SlowRelay(threading.Event())
+        relay.check = lambda sid: SimpleNamespace(ok=True, why="", target=SimpleNamespace(
+            jsonl="/tmp/sn-none.jsonl", name="t", mode_class="bypass"))
+        return relay
+
+    def test_delivered_without_waiting_for_reply(self):
+        relay = self.make()
+        seen = {}
+
+        def fake_send_locked(sid, text, timeout, delivery_timeout, wait_reply=True):
+            seen.update(timeout=timeout, wait_reply=wait_reply)
+            return ActionResult(True, "已送进", sid, delivered=True)
+
+        relay._send_locked = fake_send_locked
+        got = relay.deliver(SID_A, "改方向")
+        self.assertTrue(got.ok)
+        self.assertTrue(got.delivered)
+        self.assertFalse(seen["wait_reply"])
+        self.assertEqual(seen["timeout"], 0.0)
+
+    def test_bad_id_and_empty_text(self):
+        relay = self.make()
+        self.assertFalse(relay.deliver("nope", "x").ok)
+        self.assertFalse(relay.deliver(SID_A, "   ").ok)
+
+    def test_waits_for_the_session_lock_then_delivers(self):
+        relay = self.make()
+        relay._send_locked = lambda *a, **k: ActionResult(True, "已送进", SID_A, delivered=True)
+        lock = relay._sid_locks.setdefault(SID_A, threading.Lock())
+        lock.acquire()
+        box = []
+        th = threading.Thread(target=lambda: box.append(relay.deliver(SID_A, "改方向")))
+        th.start()
+        time.sleep(0.2)
+        self.assertEqual(box, [])  # 还在等锁，不是直接失败
+        lock.release()
+        th.join(5)
+        self.assertTrue(box[0].ok)
+
+    def test_lock_wait_gives_up_eventually(self):
+        relay = self.make()
+        relay._sid_locks.setdefault(SID_A, threading.Lock()).acquire()
+        with mock.patch.object(relay_mod, "DELIVER_LOCK_WAIT_SEC", 0.2):
+            got = relay.deliver(SID_A, "改方向")
+        self.assertFalse(got.ok)
+        self.assertFalse(got.delivered)

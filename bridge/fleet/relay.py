@@ -140,6 +140,10 @@ WHY_NOT_TERMINAL = "这不是电脑终端里开着的会话，这条路只对终
 WHY_NO_RECORD = "找不到这个会话的记录，可能已经删掉了。"
 WHY_PS_FAILED = "看不出它现在开着没有，先不发。"
 WHY_BUSY_RELAY = "上一句还在送，等它送完再说下一句。"
+# 插话时等那把会话锁最多这么久（上一句正在送 ⇒ 等它写完信使再写我们这句，不直接判失败）
+DELIVER_LOCK_WAIT_SEC = 20.0
+# 插话送到了（不等回复）：回复会跟着在跑的那一轮一起回来
+TEXT_DELIVERED_ONLY = "已送进它正在跑的这一轮。"
 WHY_EMPTY = "要发的内容是空的。"
 WHY_BAD_ID = "会话编号不对。"
 
@@ -867,7 +871,36 @@ class Relay:
         finally:
             lock.release()
 
-    def _send_locked(self, sid: str, text: str, timeout: float, delivery_timeout: float) -> ActionResult:
+    def deliver(self, sid: str, text: str, *,
+                delivery_timeout: float = DEFAULT_DELIVERY_TIMEOUT) -> ActionResult:
+        """只把一句话送进去，**不等回复**（1.9.9 中途插话用）。
+
+        和 `send()` 的区别只有「等不等它回」：目标正在跑的那一轮回来时会一起看到这句，
+        回复由那一轮自己带回来，所以这里等回复只会白等。
+        `delivered=True` = 已经在它的输入队列里了。送不到 ⇒ `delivered=False`，调用方退回排队。
+        同一个会话的发送仍然串行（和 `send()` 共用那把锁），避免两句话抢同一个信使。
+        """
+        sid = str(sid or "")
+        text = str(text or "").strip()
+        if not _is_session_id(sid):
+            return ActionResult(False, WHY_BAD_ID, sid)
+        if not text:
+            return ActionResult(False, WHY_EMPTY, sid)
+        with self._sid_guard:
+            lock = self._sid_locks.setdefault(sid, threading.Lock())
+        if not lock.acquire(timeout=DELIVER_LOCK_WAIT_SEC):
+            return ActionResult(False, WHY_BUSY_RELAY, sid)
+        try:
+            return self._send_locked(sid, text, 0.0,
+                                     float(delivery_timeout or DEFAULT_DELIVERY_TIMEOUT),
+                                     wait_reply=False)
+        except Exception as exc:  # 绝不抛给上层
+            return ActionResult(False, friendly_error(exc, log_as=f"relay 插话失败 sid={sid}"), sid)
+        finally:
+            lock.release()
+
+    def _send_locked(self, sid: str, text: str, timeout: float, delivery_timeout: float,
+                     wait_reply: bool = True) -> ActionResult:
         decision = self.check(sid)
         if not decision.ok or decision.target is None:
             return ActionResult(False, decision.why, sid)
@@ -884,10 +917,12 @@ class Relay:
             if why:
                 return ActionResult(False, why, sid)
             ident = courier.identity()
-        deadline = self._now() + max(timeout, 0)
+        deliver_by = self._now() + max(delivery_timeout, 0)
+        # `wait_reply=False`（插话）：只等落地，整个上限就是落地那段
+        deadline = deliver_by if not wait_reply else self._now() + max(timeout, 0)
         hit, offset = self._wait_delivery(
             target.jsonl, start, wire, ident,
-            deadline=min(self._now() + max(delivery_timeout, 0), deadline),
+            deadline=min(deliver_by, deadline),
         )
         if hit is None:
             if deduped_risk:
@@ -904,6 +939,9 @@ class Relay:
             logger.warning("relay 送达但模式不同类 sid=%s from-mode=%s 目标=%s",
                            sid, got_mode, target.mode_class)
             return ActionResult(False, TEXT_HELD, sid, delivered=True)
+        if not wait_reply:
+            # 插话：这句已经在它的输入队列里，回复由在跑的那一轮带回来，不在这里等
+            return ActionResult(True, TEXT_DELIVERED_ONLY, sid, delivered=True)
         reply = self._wait_reply(target.jsonl, offset, deadline)
         if reply is None:
             return ActionResult(False, TEXT_TIMEOUT, sid, delivered=True)
