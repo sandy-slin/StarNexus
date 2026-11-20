@@ -19,6 +19,8 @@ StarNexus 只从 GitHub 仓库 `sandy-slin/StarNexus` 的 `x.y.z` 标签升级�
 
 1. `git ls-remote --tags` 取最新 `x.y.z`；不比已装的新、或是坏版本 ⇒ 结束。
 2. 服务在干活（`inflight.json` 非空，或最近 3 分钟有会话活动）⇒ 下一次再来。
+   **开发时要部署就用 `--now`：立刻停服部署，不等空闲**（主人 2026-11-21 定的规则）。
+   跳过的只有「让着人用」这一条，测试、备份、哈希核对、起不来回滚全都照跑。
 3. 在 `~/.carher-feishu-agent/upgrade/src` 浅克隆该标签，不碰开发仓库；核对提交与标签一致。
 4. 用服务的 venv 跑全部单元测试；不过 ⇒ 记坏版本、通知、结束，运行目录不动。
 5. 备份 `bridge/` → `rsync --checksum --delete` 同步 → 核对整棵目录哈希 → 重启服务。
@@ -32,7 +34,8 @@ StarNexus 只从 GitHub 仓库 `sandy-slin/StarNexus` 的 `x.y.z` 标签升级�
 ```bash
 P=~/.carher-feishu-agent/venv/bin/python
 $P ~/.carher-feishu-agent/upgrade/selfupgrade.py --dry-run          # 只看有没有新标签
-$P ~/.carher-feishu-agent/upgrade/selfupgrade.py                    # 立即跑一次
+$P ~/.carher-feishu-agent/upgrade/selfupgrade.py                    # 立即跑一次（忙就等下一拍）
+$P ~/.carher-feishu-agent/upgrade/selfupgrade.py --now              # 开发时：立刻停服部署，不等空闲
 $P ~/.carher-feishu-agent/upgrade/selfupgrade.py --tag 1.2.0        # 人工装指定标签（绕过坏版本记录）
 $P ~/.carher-feishu-agent/upgrade/selfupgrade.py --mark-installed 1.2.0   # 人工部署后登记版本
 launchctl kickstart gui/$(id -u)/com.starnexus.selfupgrade          # 触发定时任务
@@ -41,6 +44,7 @@ launchctl kickstart gui/$(id -u)/com.starnexus.selfupgrade          # 触发定�
 ## 和人工部署的关系
 
 - 人工按 [`runtime-delivery.md`](runtime-delivery.md) 部署开发分支做实测，不影响自升级；合回 `main` 打标签后，下一次自升级会把运行目录换成该标签的代码。
+- 打完标签想马上在真机上验证 ⇒ `--now`。它走完整的升级流程（测试 → 备份 → 同步 → 重启 → 90 秒内确认启动并连上飞书 → 3 分钟稳定），不满足就换回备份并重启，所以比手动 rsync 安全。
 - 人工部署了某个标签的代码后，执行 `--mark-installed <标签>` 登记，避免重复安装。
 - 修改了 `tools/selfupgrade.py` ⇒ 同步运行副本：`cp tools/selfupgrade.py ~/.carher-feishu-agent/upgrade/`。
 
@@ -60,3 +64,4 @@ launchctl kickstart gui/$(id -u)/com.starnexus.selfupgrade          # 触发定�
 | UP-18 | 真机：1.1.0 → 1.2.0 端到端自动升级 | 11-18 00:24:52 通过：已装 1.2.0（7e72b07），服务 running，运行目录与 main 一致，备份 `bridge.bak-upgrade-20261118-002143`；当时飞书通知失败（读错配置段 + 机器人不在 dev 群），1.2.1 修复 |
 | UP-19 | 真机：1.2.0 → 1.2.1 自动升级并收到通知（私聊 + dev 群） | 11-18 00:33:54 通过：已装 1.2.1（d29c975），服务 running，运行目录与 main 一致；私聊由机器人发出，dev 群因机器人不在群（230002）改用用户身份发出，两处都收到「✅ StarNexus 已自动升级到 1.2.1」 |
 | UP-20~UP-22 | 单元测试：读 `[feishu]` 段、机器人不在群时改用用户身份发群、私聊失败不影响发群 | 通过 |
+| UP-23~UP-25 | 单元测试：`--now` 忙着也装、`--now` 起不来照样回滚、`--now` 仍然先跑测试 | 通过 |

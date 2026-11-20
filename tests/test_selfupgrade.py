@@ -1,4 +1,4 @@
-"""1.2.0 从 GitHub 自升级（tools/selfupgrade.py），UP-01 ~ UP-22。"""
+"""1.2.0 从 GitHub 自升级（tools/selfupgrade.py），UP-01 ~ UP-25。"""
 
 import importlib.util
 import json
@@ -149,11 +149,41 @@ class UpgradeFlowTest(unittest.TestCase):
         self.assertEqual(self.bridge_code(), "OLD")
 
     def test_up08_busy_waits(self):
+        """定时那一拍：忙就等下一次（默认行为，不变）。"""
         world, up = self.make()
         up.save({"installed": "1.0.1"})
         with open(os.path.join(self.home, "inflight.json"), "w") as fh:
             json.dump({"dm:x": {"tool": "claude"}}, fh)
         self.assertEqual(up.tick(), "busy")
+        self.assertEqual(self.bridge_code(), "OLD")
+
+    def test_up23_now_installs_despite_busy(self):
+        """主人 2026-11-21 定的规则：开发时要部署 ⇒ 立刻停服部署，不等空闲。
+
+        `now=True`（命令行 `--now`）绕过 `busy()`。原来开发完想立刻验证，
+        升级器会一直回「最近 3 分钟有会话活动，下一次再来」—— 正在和它对话就永远不空闲。
+        """
+        world, up = self.make()
+        up.save({"installed": "1.0.1"})
+        with open(os.path.join(self.home, "inflight.json"), "w") as fh:
+            json.dump({"dm:x": {"tool": "claude"}}, fh)
+        self.assertEqual(up.tick(now=True), "installed")
+        self.assertEqual(self.bridge_code(), "NEW")
+
+    def test_up24_now_still_rolls_back_when_not_starting(self):
+        """立刻部署不等于不设防：新版本起不来照样自动换回旧代码。"""
+        world, up = self.make(start_ok=False)
+        up.save({"installed": "1.0.1"})
+        with open(os.path.join(self.home, "inflight.json"), "w") as fh:
+            json.dump({"dm:x": {"tool": "claude"}}, fh)
+        self.assertEqual(up.tick(now=True), "rolled_back")
+        self.assertEqual(self.bridge_code(), "OLD")
+
+    def test_up25_now_still_runs_tests_first(self):
+        """立刻部署仍然先跑测试：不过就不碰运行目录。"""
+        world, up = self.make(tests_ok=False)
+        up.save({"installed": "1.0.1"})
+        self.assertEqual(up.tick(now=True), "failed")
         self.assertEqual(self.bridge_code(), "OLD")
 
     def test_up09_clone_failure_not_marked_bad(self):

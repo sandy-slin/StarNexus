@@ -17,6 +17,8 @@ git worktree add -b codex/<需求名> ../remote_control-wt/<需求名> main   # 
 
 1. 同步：`git fetch origin`，检查 `git merge-base --is-ancestor origin/main HEAD`。
    不是基于最新 `main` ⇒ 先 `git merge origin/main`，在开发分支上解决冲突，不丢弃对方修改。
+   🔴 **这是合并的前提，不是可选步骤**：`main` 的最新变更必须先合入开发分支、并在开发分支上重跑回归，
+   才允许合回 `main`。顺序反了等于拿没验证过的组合去动 `main`。
 2. 回归（任何一步失败 ⇒ 修复后从第 1 步重来，直到全部通过）：
    - 单元测试：`~/.carher-feishu-agent/venv/bin/python -m unittest discover -s tests -t .`，必须全部通过；
    - 部署开发分支代码（见 [`runtime-delivery.md`](runtime-delivery.md)），跑真机回归 `tests/live/live_regression.py`；
@@ -38,6 +40,7 @@ git push origin main && git push origin x.y.z
 - 版本号 `x.y.z`：z = 修 bug；y = 新功能；x = 大版本变化（如加入董事长 / CEO 能力）。只增不减，不复用、不移动已推送的标签。
 - 版本规划：`1.0.0` 阶段一（2848fd9）；`1.1.0` 一张卡开新会话；`1.2.0` 从 GitHub 自升级；`2.0.0` 董事长 / CEO。
 - 打标签后再部署 `main`，记录标签和 SHA；之后清理工作区：`git worktree remove ../remote_control-wt/<需求名>`，分支已合并可删除。
+- 开发中要部署新版本 ⇒ `selfupgrade.py --now`：**立刻停服部署，不等空闲**；起不来自动回滚（见 [`selfupgrade.md`](selfupgrade.md)）。不要为了等空闲窗口而手动 rsync 绕过升级流程 —— 那条路没有回滚。
 - 本机服务每 6 小时按最新标签自升级（`tools/selfupgrade.py`），所以**未通过回归的代码不得打标签**。
 
 ## 4. 例外：feishu-agent 分支
