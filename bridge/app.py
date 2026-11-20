@@ -3571,8 +3571,16 @@ class Bridge:
         """总控这一次发送的批准目录：按目标会话分，和飞书对话自己的那份分开。
 
         每次发之前清空：总控这条路弹不了确认卡，留着的 .ok 不该让下一次直接放行。
-        🔴 FC-13（2026-11-17 实测）：工作区 = 这个会话的项目目录，不是全局 workspaces
-        （那是整个家目录，等于工作区外的写也直接放行）。拿不到项目目录才退回全局清单。
+
+        工作区范围按档位分（2026-11-21 主人口径：**保持红线，范围扩大到整个工作区**）：
+
+        - **全授权档**：工作区 = 全局 `policy.workspaces`，不按项目目录收窄。
+          FC-13（2026-11-17）当时收窄到项目目录，现场代价是全授权档形同没开 ——
+          11-20 23:37~23:49 连着八张审批卡，越界的全是 `~/.carher-feishu-agent`、
+          `work/her/backup/` 这类**家目录内、项目外**的路径，而主人早就拍过
+          「全授权 = 不问就做，只有红线拦」。红线不受影响（`approval.py` 里路径检查
+          之后才是 TRUSTED 放行，红线在更前面）。
+        - **只读 / 可改档**：照旧收窄到项目目录。没明确开全授权就不该拿到整个家目录。
         """
         gate = getattr(self, "gate", None)
         if gate is None:
@@ -3584,8 +3592,9 @@ class Bridge:
             keep.discard(scope)
         else:
             gate.clear(scope)
-        gate.set_trusted(scope, policy.mode == "trusted")
-        project = os.path.realpath(os.path.expanduser(cwd)) if cwd else ""
+        trusted = policy.mode == "trusted"
+        gate.set_trusted(scope, trusted)
+        project = "" if trusted else (os.path.realpath(os.path.expanduser(cwd)) if cwd else "")
         gate.write_workspaces(scope, (project,) if project and os.path.isdir(project) else policy.workspaces)
         return gate.dir_for(scope)
 
@@ -3633,24 +3642,25 @@ class Bridge:
         return True
 
     async def _try_queue_after(self, scope: str, chat_id: str, target, text: str) -> bool:
-        """插不进当前这一轮、但电脑上开着这个会话（Codex App / 终端）⇒ 排在这一轮后面，不拒收。
+        """插不进当前这一轮 ⇒ 排在这一轮后面，不拒收。
 
-        1.9.9 起这是**兜底**：插话（`_try_steer`）先试，插进去就不走这里。只有 App 那条插话通道也没成
-        （App 刚好切走、这一轮正好结束）才排在后面，照实说「排上了，这一轮做完就处理」，
-        回复回来照常贴群里。排不上 ⇒ False，走原来的提示。
+        1.9.9 起这是**兜底**：插话（`_try_steer`）先试，插进去就不走这里。插话通道没成
+        （App 刚好切走、这一轮正好结束、桥起的那一轮 stdin 已经关了）才排在后面，
+        照实说「排上了，这一轮做完就处理」，回复回来照常贴群里。排不上 ⇒ False，走原来的提示。
+
+        🔴 2026-11-21 主人口径「整体都走 steering」：原来这条兜底只对 `codex` 开着，
+        而且要求 `owner in (app, terminal)`。11-20 现场（agent.log 23:00~23:37）同一个
+        Claude 会话连着 5 次「中途插话 结果=没插进」+「拒收：上一条还在发」——
+        桥自己起的那一轮已经结束、终端又没占着它，两条插话路都不通，排队兜底也进不来
+        ⇒ 只能叫人重发。现在**凡是声明了 steer 能力的工具都走这条兜底**，
+        owner 也不再限制（谁在跑都排得上）。没有排队通道的工具（cursor）照旧走原来的提示。
         """
+        from .fleet.model import can
+
         control = getattr(self, "fleet", None)
-        if control is None or not hasattr(control, "relay_queued") or target.tool != "codex":
+        if control is None or not hasattr(control, "relay_queued") or not can(target.tool, "steer"):
             return False
         if scope in getattr(self, "_paused", {}):
-            return False
-        try:
-            if hasattr(control, "refresh"):
-                await asyncio.to_thread(control.refresh, target.tool, target.id)
-            sess = control.cached(target.tool, target.id)
-        except Exception:  # noqa: BLE001
-            sess = None
-        if getattr(sess, "owner", "") not in ("app", "terminal"):
             return False
         policy = self._session_policy(target.tool, target.id)
         reviewer = getattr(self, "reviewer", None)

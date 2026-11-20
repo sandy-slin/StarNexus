@@ -153,5 +153,20 @@
 
 兜底不变：插不进（App 刚好切走、这一轮正好结束）⇒ 退回 1.9.8 的「排在这一轮后面」，再不行才是原来那句提示。话不会丢。
 
+## 2026-11-21：排队兜底对所有能插话的工具开放
+
+主人原话「我们希望整体都是 steering 的方式」。
+
+- 现场：11-20 的 `agent.log` 里，同一个 Claude 会话 22:51 插话成功一次，23:00、23:00、23:01、
+  23:07、23:37 五次都是「中途插话 结果=没插进」紧跟「对话模式 拒收：上一条还在发」（`同一个=True`）。
+  桥自己起的那一轮已经结束（stream-json 的 stdin 关了），终端又没占着它 ⇒ `steer()` 两条路都不通。
+- 为什么兜底也没接住：1.9.8 的 `_try_queue_after` 只对 `codex` 开，并且要求 `owner in (app, terminal)`。
+  Claude、以及「桥自己起的那一轮刚结束」这一种，都被挡在外面 ⇒ 只能叫人重发。
+- 改法：兜底的门槛从「工具名 + owner」换成 `can(tool, "steer")` —— 凡声明了插话能力的工具
+  （claude / codex / opencode）都走这条排队兜底，owner 不再限制。
+  没有排队通道的 cursor 照旧走原来那句提示，不假装排上了。
+- 测试：`tests/test_steer_fallback_queue.py`（Claude 终端占着 / 桥自己起的两种都排得上、回复要贴回来、
+  cursor 仍提示）；`tests/test_codex_queue_after.py` 里 1.9.8 那两条旧约束按新口径改写。
+
 - <span style="color:red">`thread-follower-steer-turn` 是 Codex App 的内部协议，App 升级可能变。失败一律当「这条路不通」并退回排队，不会报错给用户。App 升级后建议跑一次真机回归的 steer 用例。</span>
 - 只发插话这一个请求，不碰启动、打断、改设置和改权限。socket 只认当前用户自己的。

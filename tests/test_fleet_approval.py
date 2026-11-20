@@ -136,7 +136,14 @@ if __name__ == "__main__":
 
 
 class FleetWorkspaceScopeTest(unittest.TestCase):
-    """FC-13（2026-11-17 实测回归）：会话的工作区 = 它的项目目录，不是全局清单（整个家目录）。"""
+    """会话的工作区。
+
+    FC-13（2026-11-17）原来把工作区收窄成项目目录。2026-11-21 主人改口径：
+    **保持红线，范围扩大到整个工作区** —— 全授权档下工作区就是全局清单（`policy.workspaces`），
+    不再按项目目录收窄。现场证据：11-20 23:37~23:49 八张审批卡全是「碰到了工作目录外的 X」，
+    X 是 `~/.carher-feishu-agent` / `backup/` 这类家目录内、项目外的路径 ⇒ 全授权档形同没开。
+    红线（删家目录 / git push / 提权 / 读凭据 / 往终端敲命令 / 内联解释器）不受影响，仍然拦。
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -155,8 +162,15 @@ class FleetWorkspaceScopeTest(unittest.TestCase):
         with open(os.path.join(directory, "workspaces.json"), encoding="utf-8") as handle:
             return json.load(handle)
 
-    def test_project_dir_becomes_workspace(self):
+    def test_trusted_keeps_whole_workspace(self):
+        """全授权档：项目目录给了也不收窄，工作区 = 全局清单。"""
         directory = self.bridge._fleet_approval_dir("codex", "t1", self.policy, self.project)
+        self.assertEqual(self.workspaces(directory), list(self.policy.workspaces))
+
+    def test_non_trusted_still_narrows_to_project(self):
+        """可改档：收窄照旧 —— 放宽只针对主人明确开了全授权的那一档。"""
+        policy = SimpleNamespace(mode="write", workspaces=(os.path.expanduser("~"),))
+        directory = self.bridge._fleet_approval_dir("codex", "t3", policy, self.project)
         self.assertEqual(self.workspaces(directory), [self.project])
 
     def test_missing_project_falls_back_to_policy(self):
@@ -166,7 +180,7 @@ class FleetWorkspaceScopeTest(unittest.TestCase):
         directory = self.bridge._fleet_approval_dir("codex", "t2", self.policy, gone)
         self.assertEqual(self.workspaces(directory), list(self.policy.workspaces))
 
-    def test_hook_defers_write_outside_project(self):
+    def test_hook_allows_write_inside_workspace_outside_project(self):
         import subprocess
         import sys
 
@@ -190,5 +204,11 @@ class FleetWorkspaceScopeTest(unittest.TestCase):
                 return ""
             return json.loads(out.stdout)["hookSpecificOutput"]["permissionDecision"]
 
+        # 项目内、项目外但工作区内：全授权档都不再弹卡
         self.assertEqual(decide("echo hi > inside.txt"), "")
-        self.assertEqual(decide(f"echo hi > {outside}"), "deny")
+        self.assertEqual(decide(f"echo hi > {outside}"), "")
+        # 工作区外仍然拦（钩子 flavor=codex 下 defer 呈现为 deny）。
+        # 不用 /tmp 探测：`_SYSTEM_PREFIXES` 把它当系统路径，本来就不按越界判。
+        self.assertEqual(decide("echo hi > /Users/Shared/sn-unit-outside.txt"), "deny")
+        # 红线：点同意也不许，和放宽无关
+        self.assertEqual(decide("git push origin main"), "deny")
