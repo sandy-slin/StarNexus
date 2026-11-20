@@ -4,6 +4,7 @@
 
 1. `git ls-remote --tags` 取最新 `x.y.z` 标签；不比本机已装的新 / 是坏版本 ⇒ 结束。
 2. 服务正在干活（`inflight.json` 非空，或最近 3 分钟有会话活动）⇒ 下一次再来。
+   `--now` 跳过这一条：开发时要部署就立刻停服部署（起不来仍自动回滚）。
 3. 在独立目录（`~/.carher-feishu-agent/upgrade/src`）浅克隆这个标签，不碰开发仓库。
 4. 用服务的 venv 跑全部单元测试；不过 ⇒ 记坏版本，通知，结束。
 5. 备份运行中的 `bridge/` → 同步新代码 → 核对哈希 → 重启服务。
@@ -262,8 +263,14 @@ class Upgrader:
             raise RuntimeError("连不上 GitHub：" + (res.stderr or "").strip()[:200])
         return newest_tag(res.stdout)
 
-    def tick(self, force_tag: str = "", dry_run: bool = False) -> str:
-        """跑一次。返回一个词：noop / busy / bad / installed / rolled_back / failed / would_install。"""
+    def tick(self, force_tag: str = "", dry_run: bool = False, now: bool = False) -> str:
+        """跑一次。返回一个词：noop / busy / bad / installed / rolled_back / failed / would_install。
+
+        `now=True`（命令行 `--now`）：**立刻停服部署，不等空闲**（主人 2026-11-21 定的规则）。
+        定时那一拍照旧让着人用（`busy()` 返回原因就等下一次）；开发完要马上验证新版本时用 `--now`：
+        正在飞书里和它对话时 `busy()` 永远非空，等不到空闲窗口。
+        跳过的只有「让着人用」这一条 —— 测试、备份、哈希核对、起不来自动回滚全都照跑。
+        """
         state = self.state()
         tag, sha = (force_tag, "") if force_tag else self.check()
         installed = state.get("installed", "")
@@ -279,10 +286,13 @@ class Upgrader:
         if dry_run:
             log(f"发现新版本 {tag}（本机 {installed or '未记录'}）")
             return "would_install"
-        why = self.busy()
+        why = "" if now else self.busy()
         if why:
             log(f"{tag} 待安装，但{why}，下一次再来")
             return "busy"
+        if now:
+            busy_now = self.busy()
+            log(f"{tag} 立刻部署（--now）" + (f"：{busy_now}，照样停服" if busy_now else ""))
         return self.install(state, tag, sha)
 
     def install(self, state: dict, tag: str, sha: str = "") -> str:
@@ -381,6 +391,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只看有没有新标签")
     ap.add_argument("--tag", default="", help="指定装某个标签（人工；绕过坏版本记录）")
     ap.add_argument("--mark-installed", default="", help="把当前运行的版本记为这个标签（首次接管时用）")
+    ap.add_argument("--now", action="store_true",
+                    help="立刻停服部署，不等空闲（开发时用；测试和起不来回滚照跑）")
     args = ap.parse_args()
     up = Upgrader()
     os.makedirs(up.work, exist_ok=True)
@@ -400,7 +412,7 @@ def main() -> int:
             log(f"已登记本机版本 {args.mark_installed}")
             return 0
         try:
-            outcome = up.tick(force_tag=args.tag, dry_run=args.dry_run)
+            outcome = up.tick(force_tag=args.tag, dry_run=args.dry_run, now=args.now)
         except Exception as exc:  # noqa: BLE001
             log(f"这一次没跑成：{exc}")
             return 1
