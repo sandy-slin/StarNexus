@@ -118,7 +118,14 @@ ALWAYS_DENY = (
     # 第 39 轮：助手自己的凭据（同 cmdclass._CRED_PATHS 那三项；Read 工具在全授权下是整台电脑）
     "Read(//**/.carher-feishu-agent/config.toml)",
     "Read(//**/.carher-feishu-agent/approval.secret)",
-    "Read(//**/.claude-feishu-bridge/**)",
+    # 🔴 11-21：原来是 `Read(//**/.claude-feishu-bridge/**)` 整个目录 —— **连坐了 agent
+    # 自己的记忆**。桥给 claude 的是独立配置目录 `~/.claude-feishu-bridge`，
+    # 它的记忆就在 `<那个目录>/projects/<项目>/memory/` 下 ⇒ agent 读自己的记忆被拒。
+    # 现场（卜弋天 11-21 截图）：「记忆目录被权限挡住了，我读不到固定检查表，
+    # 这次没法逐项打勾」。那条规则是 11-20 我加的（07317017），本意只是挡桥的凭据。
+    # ⇒ 精确到真正有凭据的那两个文件。`projects/`（会话 + 记忆）、`session-env/` 不挡。
+    "Read(//**/.claude-feishu-bridge/settings.json)",
+    "Read(//**/.claude-feishu-bridge/.claude.json)",
 )
 
 

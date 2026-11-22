@@ -1279,8 +1279,8 @@ class ClaudeAdapter(Adapter):
             self.claude_bin, "-p", prompt,
             "--resume", sid,
             "--output-format", "json",
-            # manual = 没批准的工具直接拒，不挂在那儿等人（和 runner.py 同一档）
-            "--permission-mode", "manual",
+            # 11-20 改 bypassPermissions（和 runner.py 同一档）：红线靠 --disallowed-tools 守。
+            "--permission-mode", "bypassPermissions",
             # 不加载 user / local：用户的 allow 规则、defaultMode、hooks 都不进来
             # 🔴 **一个来源都不加载**（空串），不是 "project"。
             # 2026-11-04 安全审查：project 级 settings 的 allow 规则也会叠加在 Policy 上，

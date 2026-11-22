@@ -277,6 +277,8 @@ _SPAWN_FAIL_LOGS = {
     "git": "起子进程失败 程序=git",
     "node": "起子进程失败 程序=node",
     "powershell": "起子进程失败 程序=powershell",
+    "cmd": "起子进程失败 程序=cmd",   # 11-20：Windows 开窗口走 `cmd /c start`
+    "conhost": "起子进程失败 程序=conhost",
     "open": "起子进程失败 程序=open",
     "osascript": "起子进程失败 程序=osascript",
 }
@@ -289,6 +291,16 @@ def _spawn_fail_log(name: str) -> str:
         if base.endswith(ext):
             base = base[: -len(ext)]
     return _SPAWN_FAIL_LOGS.get(base, _SPAWN_FAIL_OTHER)
+
+
+# 给 `relay.py` 的信使用同一张表。
+# 🔴 11-20：信使那条腿（`relay._default_spawn`）原来**只走 friendly_error**，日志模板是
+# 通用的「%s（原文 %s: %s）」⇒ 上报里看不出起的是哪个程序，和 11-17 `SubprocessRunner`
+# 修过的那个坑一模一样（当时 9 次 FileNotFoundError 不知道是哪个程序，才有了这张表）。
+# 现场：liudewang 机器 …a355bd 11-20 11:03 报 relay.py:525 FileNotFoundError，
+# 只能看到「没能启动 claude 当信使」这句**我们自己拼的文案**，拿不到 argv[0] 的真实值。
+# 同一个坑在两条腿上各修一次 —— 加新的起子进程出口，一律接这张表。
+spawn_fail_log = _spawn_fail_log
 
 
 

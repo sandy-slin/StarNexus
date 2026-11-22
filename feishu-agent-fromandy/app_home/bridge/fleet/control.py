@@ -204,9 +204,21 @@ class FleetControl:
         if adapter is None:
             return ActionResult(False, WHY_NO_ADAPTER, sid)
         # 🔴 第 36 轮复审 Y1：手机上新建、又在电脑上开了窗口 ⇒ 窗口里的进程起来之前的空窗内不发（防分叉）
+        # 🔴 11-20 改：原来**只看「开窗口多久了」**（90 秒没到就一律拒），不看进程起来没有 ⇒
+        #   窗口 2 秒就起好了也得干等 88 秒，用户在群里连发几句全是
+        #   「❌ 没发进去：电脑上刚给它开了窗口，还在启动」（本轮现场，用户第二次撞上）。
+        #   而「窗口里的 claude 在不在跑」这个真判据下面几行就有（`_claude_relay_ready` → `can_relay`）。
+        #   现在：进程已经起来 ⇒ 立刻放行走 relay（消息进它的输入队列，不分叉，正是我们要的）；
+        #   只有「还没起来」才用那 90 秒窗口兜着。
         from . import newsession as _ns
         if _ns.window_just_opened(sid):
-            return ActionResult(False, _ns.WHY_WINDOW_JUST_OPENED, sid)
+            started = False
+            if tool == "claude" and relay and hasattr(adapter, "relay"):
+                started, _why = self._claude_relay_ready(adapter, sid)
+            if not started:
+                return ActionResult(False, _ns.WHY_WINDOW_JUST_OPENED, sid)
+            # 起来了 ⇒ 这个空窗期的意义已经没了，把标记清掉，后面几句不用再判一次
+            _ns.clear_window_opened(sid)
         try:
             if tool == "claude":
                 # 🔴 **终端里开着的会话只能走 relay**。`send()` 那条路是 `claude -p --resume`，
@@ -294,9 +306,16 @@ def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings:
     from .model import FleetJobs
 
     jobs = jobs if jobs is not None else FleetJobs()
+    # 🔴 11-20：claude 的路径要**解析过**再传，不能留裸名 "claude" 靠 PATH。
+    # 现场 liudewang …a355bd：后台服务那份 PATH 是装机那一刻写死的，claude 后来换了位置
+    # ⇒ 裸名解析不到 ⇒ 每次干活都 FileNotFoundError（他看到「找不到要用的文件或程序」）。
+    # `find_bin` 本来就是为这个写的（"后台服务的 PATH 很短 ⇒ which 找不到再看默认安装位置"），
+    # 只是起 claude 这几条腿一直没用它。解析不到就还是裸名 —— 行为和以前一样，不变差。
+    from .newsession import find_bin
+    claude_bin = find_bin("claude") or "claude"
     adapters = {
         "claude": ClaudeAdapter(bridge_home=bridge_home, jobs=jobs, policy=policy,
-                                hook_settings=hook_settings),
+                                hook_settings=hook_settings, claude_bin=claude_bin),
         "codex": CodexAdapter(jobs=jobs),
         "cursor": CursorAdapter(jobs=jobs, mode=lambda: getattr(policy(), "mode", "readonly")),
     }

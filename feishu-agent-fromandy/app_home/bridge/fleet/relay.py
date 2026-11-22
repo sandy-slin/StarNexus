@@ -95,7 +95,7 @@ from .claude import (
     _read_tail,
     _parse_lines,
 )
-from .model import ActionResult, FleetJobs, friendly_error
+from .model import ActionResult, FleetJobs, friendly_error, spawn_fail_log
 
 logger = logging.getLogger("feishu-bridge.fleet")
 
@@ -385,6 +385,17 @@ class Attempt:
 # ---------- 信使 ----------
 
 
+def _basename_any_os(path: str) -> str:
+    """取文件名，`/` 和 `\\` 都认。
+
+    🔴 不能用 `os.path.basename`：它只认当前系统的分隔符。真机是 Windows，
+    `claude_bin` 常是 `C:\\Users\\x\\.carher-npm-global\\claude.cmd`；
+    而我们在 mac 上跑测试，`os.path.basename` 把整条路径原样返回 ⇒ 查表落到
+    「其他程序」，上报里照样看不出是 claude（11-20 本轮台架实测抓到）。
+    """
+    return str(path).replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _default_spawn(argv: list, cwd: str, env: dict):
     return subprocess.Popen(
         list(argv),
@@ -524,6 +535,18 @@ class Courier:
         try:
             proc = self._spawn(self.argv(), self.cwd, self._env())
         except (OSError, ValueError) as exc:
+            # 🔴 11-20：先打一句**带程序名的源码常量**日志，再出人话。
+            # 上报只发源码常量模板（errreport），光靠 friendly_error 那句通用模板
+            # 查不出 argv[0] 到底是什么（liudewang …a355bd 11-20 11:03 就是这样卡住的）。
+            try:
+                logger.error(spawn_fail_log(_basename_any_os(str(self.claude_bin))), exc_info=exc)
+            except Exception:  # noqa: BLE001 —— 记日志失败不能把报错这一步再炸
+                pass
+            if isinstance(exc, FileNotFoundError):
+                # 和 runner.py 那条同一口径：这个病「刷新一下再试」没用，重装才有用。
+                # 原来走通用 ERR_NOT_FOUND ⇒ 用户照着「刷新再试」点一百次也是同一句。
+                return ("没能启动 claude 当信使：后台找不到 Claude Code，"
+                        "重新双击一次安装包就能修好（设置都会保留）。")
             return friendly_error(exc, "没能启动 claude 当信使")
         self._proc = proc
         self._pid = int(getattr(proc, "pid", 0) or 0)

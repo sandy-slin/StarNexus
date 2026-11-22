@@ -74,10 +74,42 @@ APPEND_IF_MISSING = {"notify"}
 #   手改成了别的档（那旧值就不等于旧默认）。
 # 所以从这一轮起，新 config 里写一行 `defaults_rev`，意思是「这份文件的默认值是第几轮的」。
 # 以后再改默认值，靠它就能分清，不用再猜。
-DEFAULTS_REV = 16
+DEFAULTS_REV = 17
 # 迁移发生时在 `[agent]` 留一行，桥启动后好告诉用户「你的档位被升了」——
 # 🔴 悄悄把人从只读升到全授权是不行的，他得知道。
 MIGRATED_KEY = "migrated_from"
+
+# ── 第 17 轮：单轮超时默认 900 → 1800，老用户要跟着升 ──
+#
+# 用户（卜弋天）11-20：「15 分钟 timeout 这个有点太短了，设成默认 30 分钟吧」。
+# 🔴 11-21 他又说「我早上仍然遇到这个 15 分钟超时」—— 我 11-20 只改了安装器模板和代码兜底，
+# **漏了这里**：`turn_timeout_sec` 在 `CARRY` 里 ⇒ 每次自动更新都把旧的 900 原样搬回来。
+# 实测（拿我自己那份真 config 走一遍 `carry_over`）：模板 1800 + 旧文件 900 ⇒ 合并后 **900**。
+# 和第 16 轮改默认档位时同一个坑，那次的注释就写着「光改安装器的默认值对老用户无效」。
+#
+# 怎么分清「那只是上一代的默认值」和「他自己设的」：
+#   - 文件里 `defaults_rev` 缺失或 < 17 ⇒ 那份是 r16 及以前写的，里面的 900 是**写死的旧默认**
+#     （r16 的模板就是 900，用户没得选）⇒ 不带，用新模板的 1800。
+#   - 值不等于 900 ⇒ 他手改过（比如设成 600 或 3600）⇒ 照旧带，绝不覆盖。
+#   - `defaults_rev >= 17` ⇒ 这份文件之后写的，里面的值都是他自己的 ⇒ 照旧带。
+# 「一键安装」会话提过另一种判据（存一份我们写入的值再比对），更严；
+# 但这里有 `defaults_rev` 可用，它正是为这件事建的，不用再加一套。
+_R16_TURN_TIMEOUT = 900
+_R17_TURN_TIMEOUT = 1800
+
+
+def _migrating_turn_timeout(old: dict) -> bool:
+    """旧文件里的 `turn_timeout_sec` 是不是「r16 及以前写死的默认值」。"""
+    agent = old.get("agent")
+    if not isinstance(agent, dict):
+        return False
+    try:
+        rev = int(agent.get("defaults_rev") or 0)
+    except (TypeError, ValueError):
+        rev = 0
+    if rev >= 17:
+        return False                                  # 这一轮之后写的 ⇒ 值是他自己的
+    return agent.get("turn_timeout_sec") == _R16_TURN_TIMEOUT
 
 
 def _migrating_from_old_default(old: dict) -> bool:
@@ -132,6 +164,8 @@ def carry_over(old_text: str, new_text: str) -> tuple[str, list[str]]:
         raise OldConfigUnreadable(str(exc)) from exc
 
     migrate = _migrating_from_old_default(old)
+    # 第 17 轮：旧的 900 只是上一代的默认值 ⇒ 不带，让新模板的 1800 生效（见上面那段红字）
+    migrate_timeout = _migrating_turn_timeout(old)
     # 🔴 第 24 轮（R-install 复现）：上次迁移的通知还没送达（标记还在旧文件里）时又来一次自动更新 ⇒
     # 新文件里没有这一行、旧文件又有 defaults_rev 不算迁移 ⇒ 标记被丢、永远不再通知、档位已是全授权。
     # 旧文件里有标记 ⇒ 原样带过去（插的位置和迁移时一样）。
@@ -155,6 +189,8 @@ def carry_over(old_text: str, new_text: str) -> tuple[str, list[str]]:
         key = match.group(2)
         if migrate and section == "agent" and key == "mode":
             continue      # 见 `_migrating_from_old_default`：旧值只是上一代的默认值，不带
+        if migrate_timeout and section == "agent" and key == "turn_timeout_sec":
+            continue      # 同上，见 `_migrating_turn_timeout`（11-21：他「仍然遇到 15 分钟超时」）
         if key not in old.get(section, {}):
             continue
         value = old[section][key]

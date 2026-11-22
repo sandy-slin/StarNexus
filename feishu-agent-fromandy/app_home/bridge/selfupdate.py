@@ -119,6 +119,108 @@ _DETACHED_PROCESS = 0x00000008   # 🔴 不用（见文件头）；列在这里�
 WIN_INSTALLER_BUSY_RC = 3
 
 
+# 🔴 11-20：自动更新装失败时，**退出码必须进得了上报**。
+# 现场：Windows 4 台（…a355bd / …0890c8 / …bc5c47 / …3431af）连着几天同一个指纹
+# f31f81c6b682「安装包退出码 %s build=%s」@ selfupdate.py:636，而 errreport 只发
+# **源码常量模板**（`record.msg`，不是格式化后的），所以 `%s` 的实参一个都没传回来
+# ⇒ 退出码是几、安装器说了什么，查不到，只能猜。
+# 上报那条通道（report_params）只许 5 个字段、`u` 只能是一个词、detail 明确不发，
+# 所以也不能从那儿带。
+# 修法：把退出码**编进常量模板本身**（一句一个码），这样上报拿到的就是带码的那句话。
+# 码是我们自己的程序的退出码，不含路径、用户名、机器信息 ⇒ 不违反「只发常量」。
+# 新增退出码记得加一行；没列到的落到 _RC_OTHER（至少能看出是「别的码」而不是没数据）。
+_INSTALLER_RC_LOGS = {
+    1: "安装包退出码=1（安装器自己报失败）",
+    2: "安装包退出码=2（参数不对 / 用法错）",
+    3: "安装包退出码=3（另一个安装器在跑）",
+    4: "安装包退出码=4（下载或校验没过）",
+    5: "安装包退出码=5（装完了但有警告）",
+    9: "安装包退出码=9（没装上，环境缺东西）",
+    -1: "安装包退出码=-1（被信号杀掉 / 没跑起来）",
+    -9: "安装包退出码=-9（被 SIGKILL 杀掉）",
+    -15: "安装包退出码=-15（被 SIGTERM 杀掉）",
+}
+
+# 🔴 11-20 第二轮：原来「没列到的码」只有一句**不带数字**的常量
+# （`安装包退出码=其他（没列到的码）`）⇒ 落到这个桶等于「知道是别的码」但仍然不知道是几，
+# eba1ced9 想达成的「退出码必须进得了上报」在这条路上**没达成**（「一键安装」会话指出，
+# 当时 3 台 Windows 正卡在这个桶里）。
+#
+# 🔴 它建议的 `f"安装包退出码=其他({rc})"` **行不通，我实测过**：errreport 要求模板
+# **整句**出现在源码常量集合里（`item_from_record` 那段红字），f-string 拼出来的不在
+# ⇒ 整条被替换成 `<动态消息>`，连「其他」都看不到，比现在更糟。
+# 🔴 我的第一版同病：用字典推导 `{rc: f"…{rc}…" for rc in range(256)}` 也**不是**源码字面量
+# ⇒ 实测同样变 `<动态消息>`。能上报的只有**真写在这个文件里**的句子。
+# ⇒ 所以下面是手写的。不铺 0~255（过度设计）：安装器实际只发 0/1/3（`install-windows.ps1`
+# 的 `exit 1`@:109/:2341、`exit 3`@:138），`_PS_BOOT` 那层 0/1/9；
+# 另外几个是 Python `returncode` 的常见形状（被信号杀：负值；127=命令找不到；137=SIGKILL）。
+# 真的落到 `_INSTALLER_RC_OTHER` 时至少知道「码不在这张表里」，再按需加一行。
+_INSTALLER_RC_EXTRA = {
+    0: "安装包退出码=0（没单独归类的码）",
+    6: "安装包退出码=6（没单独归类的码）",
+    7: "安装包退出码=7（没单独归类的码）",
+    8: "安装包退出码=8（没单独归类的码）",
+    10: "安装包退出码=10（没单独归类的码）",
+    126: "安装包退出码=126（找到了但起不来 / 没有执行权限）",
+    127: "安装包退出码=127（命令找不到）",
+    130: "安装包退出码=130（被 Ctrl-C 中断）",
+    137: "安装包退出码=137（被强杀 SIGKILL，常见于杀毒软件或内存不足）",
+    143: "安装包退出码=143（被 SIGTERM 终止）",
+    255: "安装包退出码=255（退出码溢出 / -1 的无符号形式）",
+    -2: "安装包退出码=-2（被 SIGINT 杀掉）",
+    -11: "安装包退出码=-11（段错误 SIGSEGV）",
+    0x80073D28: "安装包退出码=0x80073D28（MSIX 要管理员权限）",
+    # 🔴 Windows **进程层**的码（11-20「一键安装」会话实测我上一版 7/7 全落兜底）。
+    # 为什么是这组：已知那三台的码不在 {1,2,3,4,5,9,…} 里，而安装器正文只发 1/3、
+    # `_PS_BOOT` 只发 0/1/9 ⇒ 码不是我们任何一层脚本给的 ⇒ 只能是 powershell.exe
+    # 没起来 / 起来就崩 / 被外部杀掉，那就是下面这些 NTSTATUS。
+    # Python 的 returncode 在 Windows 上可能是有符号也可能是无符号，两种形式都列。
+    -1073741819: "安装包退出码=0xC0000005（访问冲突，进程崩了）",
+    3221225477: "安装包退出码=0xC0000005（访问冲突，进程崩了；无符号形式）",
+    -1073741510: "安装包退出码=0xC000013A（进程被终止，常见于被外部杀掉）",
+    3221225786: "安装包退出码=0xC000013A（进程被终止；无符号形式）",
+    -1073740791: "安装包退出码=0xC0000409（栈缓冲区溢出）",
+    3221226505: "安装包退出码=0xC0000409（栈缓冲区溢出；无符号形式）",
+    -1073741502: "安装包退出码=0xC0000142（DLL 初始化失败，起不来）",
+    3221225794: "安装包退出码=0xC0000142（DLL 初始化失败；无符号形式）",
+    -1073741515: "安装包退出码=0xC0000135（缺 DLL，起不来）",
+    3221225781: "安装包退出码=0xC0000135（缺 DLL；无符号形式）",
+    4294967295: "安装包退出码=0xFFFFFFFF（-1 的无符号形式，多半没起来）",
+}
+_INSTALLER_RC_OTHER = "安装包退出码=这张表里没有的码（看 emsg 里的数字）"
+
+
+class _RcOnly(Exception):
+    """只用来把退出码塞进上报的 `emsg`。
+
+    `errreport` 对**模板**（`record.msg`）要求「整句是源码常量」，所以带数字的句子
+    只能手写、列不全；但 `emsg`（异常消息）走的是 `_scrub` 脱敏那条路，没有这个限制。
+    ⇒ 挂一个只含 `rc=<数字>` 的异常，任何退出码都能完整传回来，
+    不用再追着往码表里加（11-21）。
+    🔴 这个异常**只装退出码**，一个字别多放：它会原样（脱敏后）发到 198。
+    """
+
+
+def installer_rc_log(rc: object) -> str:
+    """退出码 ⇒ 一句**源码常量**（上报只认整句在源码里的模板）。
+
+    先查有解释的那张表，再查「全码表」拿到带数字的那句，都不中（rc 不是数）才兜底。
+    """
+    # 🔴 只认真正的整数：`int(1.5)` = 1 ⇒ 会把一个莫名的浮点报成「安装器自己报失败」，
+    # 那比「读不出来」更糟（给出一个错的归因）。bool 是 int 的子类，也排掉。
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        try:
+            code = int(str(rc).strip())      # 允许 "9" 这种字符串形式
+        except (TypeError, ValueError):
+            return _INSTALLER_RC_OTHER
+    else:
+        code = rc
+    known = _INSTALLER_RC_LOGS.get(code)
+    if known:
+        return known
+    return _INSTALLER_RC_EXTRA.get(code, _INSTALLER_RC_OTHER)
+
+
 def _windows_powershell() -> str:
     """系统自带的 Windows PowerShell 5.1（和安装器 `$psExe` 同一个），找不到退回 PATH 上的。"""
     root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
@@ -145,6 +247,12 @@ _APP_ID_RE = re.compile(r"^cli_[A-Za-z0-9]{1,40}$")
 # 🔴 新增一个词要同步：`fleet-report.py` 的 FIELD_RE["u"]、brief 里的允许词表（隐私红线）
 # 第 34 轮加 crashloop：**只由启动守卫**（安装器写的 launch-guard.sh，纯 bash）发 —— 桥一启动就崩、
 # 连续 5 次活不过 60 秒时报一次。桥自己不写这个词；列在这里是为了词表只有一张（和 fleet-report 同步）。
+# 🔴 加词要同步三处：这里 + `fleet-report.py` 的 `FIELD_RE["u"]` 和 `_U_LABEL` + `launch_guard.sh`。
+# 🔴 `rolled_back` **故意不在这里**：它只是磁盘上的中间状态，`_reconcile()` 在下次启动时
+# 把它转成 `not_applied` 再上报（见那个函数里 `outcome == ROLLED_BACK` 那支）。
+# 11-20 我一度以为这是「漏了同步」并擅自加进来 ⇒ `test_r38_win_selfupdate.py::
+# test_u_words_match_fleet_report` 直接拦住（它写着「rolled_back 不上报」）。已撤回。
+# 判「这个词该不该上报」先看 `_reconcile` 会不会把它转掉，别只看「state 里出现过」。
 _OUTCOME_WORDS = frozenset({"ok", "fail", "installing", "not_applied", "crashloop"})
 # 安装器退回旧版时写的词（`install-mac.sh` UPDATE-ROLLBACK 段）。不上报：启动后转成 not_applied
 ROLLED_BACK = "rolled_back"
@@ -494,13 +602,37 @@ class SelfUpdater:
     # ---------- 下载 + 核对 ----------
 
     def download(self, info: dict, dest_dir: str) -> str:
-        """下载并核对 sha256。对不上 ⇒ 抛异常，文件删掉（见文件头红线）。"""
-        part = info[installer_key()]
-        url = f"{BASE_URL}/{part['file']}"
-        data = _fetch(url, opener=self._opener)
-        got = hashlib.sha256(data).hexdigest()
-        if got != part["sha256"]:
-            raise ValueError(f"下载回来的安装包校验不过（{got[:12]}… ≠ {part['sha256'][:12]}…）")
+        """下载并核对 sha256。对不上 ⇒ **重读一次 latest.json 再试**，还不对才抛。
+
+        🔴 11-21：为什么要重试一次。发版不是原子的 —— `publish-update.sh` 先换包、
+        最后写 `latest.json`（那个顺序防的是「json 新、包旧」）。但**反方向有个真窗口**：
+        198 实测 `feishu-agent-windows.bat` mtime `12:42:34.638`、`latest.json` `12:42:39.723`
+        ⇒ 这 **5.1 秒**里来查更新的客户端拿到的是**旧 json 的 sha + 已经换好的新包**，
+        sha 必然对不上。现场：`…3431af` 11-20 23:20 的 `ValueError: 下载回来的安装包校验不过`
+        （上报指纹 `856d29f0669c`），而它 23:20:07 正落在那次发版的窗口里。
+        原来这里只下一次、对不上就抛 ⇒ 这一拍记成 fail，白等一轮。
+        重试**不放松校验**：重新取一份 latest.json，拿新的 sha 再核一次，还不对照旧抛。
+        调顺序消不掉这个窗口（两头各有一个），根治要给包名带上 build_id、新旧并存。
+        """
+        for attempt in (1, 2):
+            part = info[installer_key()]
+            url = f"{BASE_URL}/{part['file']}"
+            data = _fetch(url, opener=self._opener)
+            got = hashlib.sha256(data).hexdigest()
+            if got == part["sha256"]:
+                break
+            if attempt == 2:
+                raise ValueError(
+                    f"下载回来的安装包校验不过（{got[:12]}… ≠ {part['sha256'][:12]}…）")
+            # 发版那几秒的错位 ⇒ 重新读一次清单（它这会儿多半已经写好了）。
+            # 🔴 直接用 `latest()`，**不走 `check()`** —— 那个会判冷却、会 `_reconcile`，
+            # 在这一步里都是副作用；这里只要一份新鲜的清单。不带上报参数（这不是一次轮询）。
+            logger.info("安装包 sha 对不上，重读一次清单再试（多半撞上发版那几秒）")
+            fresh = latest(opener=self._opener)
+            if not fresh or installer_key() not in fresh:
+                raise ValueError(
+                    f"下载回来的安装包校验不过（{got[:12]}… ≠ {part['sha256'][:12]}…）")
+            info = fresh
         path = os.path.join(dest_dir, part["file"])
         with open(path, "wb") as handle:
             handle.write(data)
@@ -633,6 +765,33 @@ class SelfUpdater:
             return False, "另一个安装窗口还在跑，等它装完我再自己试。"
         if proc.returncode != 0:
             tail = (proc.stdout or "")[-300:] or (proc.stderr or "")[-300:]
+            # 🔴 两句都打：带码那句是**常量**（上报只认常量模板，`%s` 的实参传不回来），
+            # 带 build 和输出尾巴那句留在本机日志里给排查用。
+            # 11-20 之前只有下面那句 ⇒ 4 台 Windows 连着几天失败，退出码谁都不知道。
+            # 🔴 11-21：码**一定**要能传回来，而不是靠「这张表列全了没有」。
+            # 上一版的做法是手写码表 ⇒ 列不到的就只报「表里没有的码」，
+            # 而「一键安装」会话实测 Windows 进程层那 7 个码我一个都没列到
+            # ⇒ 发了一版等于白发。追着往表里加是打地鼠。
+            # 通道在这里：`errreport` 的 `emsg` 走 `_scrub` 脱敏，**不要求是源码常量**
+            # （只有 `msg`/模板那条有这个红线）⇒ 挂一个只含退出码的异常，
+            # 数字就能完整上报（本轮实测 -1073741819 / 3221225477 都原样回来）。
+            # 异常里只放 `rc=<数字>`：不含路径、用户名、机器信息。
+            # 表继续留着是为了「一眼看懂」（0xC0000005 比 -1073741819 好认），
+            # 但**能不能查到码**已经不依赖它了。
+            # 🔴 11-21：顺带把**安装器日志的形状**也带上（不是内容）。
+            # 现场：…9813b0 装 `04f9541a` 拿到 `rc=4294967295`（0xFFFFFFFF = -1），
+            # 而那一版对 Windows 安装器只改了一个数字（`defaults_rev` 16→17，纯 config 模板），
+            # 且同一版 11 台（含 3 台 Windows）全部 `u=ok` ⇒ **不是包的问题**。
+            # `rc=-1` 的形状是「powershell.exe 没起来 / 起来就死」，这时安装器正文一行都没跑到，
+            # 所以正文里的 `Die`/`trap` 上报点一个都碰不到（今天那台 0 条 her-remote 安装上报，吻合）。
+            # 分「没起来」和「起来就死」只差一个判据：**那个日志文件有没有被写过**。
+            #   `log=empty` ⇒ 进程根本没跑（杀软拦下 / 作业对象限制 / 可执行文件没了）
+            #   `log=<字节数>` ⇒ 起来了但死在半路，那就该去读 state 里的 detail
+            # 🔴 只发「空 / 多少字节」这个形状，**绝不发日志内容**（里面有路径和用户名）。
+            logger.error(
+                installer_rc_log(proc.returncode),
+                exc_info=_RcOnly(
+                    f"installer exited rc={proc.returncode} log={'empty' if not tail else len(tail)}"))
             logger.error("安装包退出码 %s build=%s", proc.returncode, build)
             if (self._state().get(build) or {}).get("outcome") == ROLLED_BACK:
                 # 安装器第 6 步新版没起来、已经换回旧版并记了 rolled_back ⇒ 别用 fail 盖掉它

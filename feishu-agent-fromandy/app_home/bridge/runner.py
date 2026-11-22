@@ -36,6 +36,19 @@ logger = logging.getLogger("feishu-bridge.runner")
 
 _STREAM_LIMIT = 16 * 1024 * 1024
 
+
+def _claude_bin() -> str:
+    """claude 可执行文件的路径；找不到退回裸名（行为和 11-20 之前一样）。
+
+    每轮现查，不缓存：claude 可能在桥跑着的时候被升级 / 换位置，缓存会把
+    「现在能用」说成「还是找不到」。`find_bin` 自己只做 which + 几个 isfile，很便宜。
+    """
+    try:
+        from .fleet.newsession import find_bin
+        return find_bin("claude") or "claude"
+    except Exception:  # noqa: BLE001 —— 解析这一步绝不能把一轮对话弄挂
+        return "claude"
+
 # 附加给 agent 的上下文。写得短 —— 它会进每一轮的 token 预算。
 #
 # 三件事是实测必须说的：
@@ -120,6 +133,9 @@ class Progress:
     tool_calls: int = 0
     last_event_at: float = 0.0
     last_tool: str = ""
+    # 开头那条 `system/init` 里的会话 id。超时 / 被停时 `final` 还是空的，
+    # 只有这里有值 —— 不记下来，那一轮做到一半的东西就接不上了（11-20）。
+    session_id: str = ""
 
 
 class ClaudeRunner:
@@ -141,7 +157,10 @@ class ClaudeRunner:
         # 否则"这次操作按哪一档判的"事后说不清。
         policy = policy or self.policy
         argv = [
-            "claude",
+            # 🔴 11-20：解析过的路径，不留裸名靠 PATH。后台服务那份 PATH 是装机那一刻
+            # 写死的，claude 换过位置就解析不到 ⇒ 下面 FileNotFoundError 那支每轮都中
+            # （liudewang …a355bd 的现场）。解析不到就还是 "claude"，行为不变差。
+            _claude_bin(),
             "-p",
             prompt,
             "--output-format",
@@ -154,16 +173,15 @@ class ClaudeRunner:
             "--verbose",  # stream-json 需要它才给逐事件输出
             "--model",
             policy.model,
-            # manual = 没批准的工具直接拒，不会挂在那儿等人。
-            # 刻意不用 bypassPermissions（那正是调研里那个项目的问题所在）。
-            # 告诉 agent 它在哪、谁在看 —— 不说的话它会当成在终端里干活。
-            # 实测过的后果：用户问"这个项目的测试怎么跑"，agent 去 `npm install`
-            # 装了依赖、还新建了一个测试文件（它以为要"让测试能跑起来"）。
-            # 那一轮弹了 21 张审批卡片。
+            # 11-20 用户拍板改成 bypassPermissions：弋天原话「一劳永逸」、刘国现确认。
+            # 原设计用 manual（没批准的直接拒），实测 21 张审批卡片，且 trusted 档
+            # 行为上仍会弹卡 ⇒ 用户以为「又回到了默认」。
+            # 红线靠 --disallowed-tools（ALWAYS_DENY）守：deny 优先于 allow，
+            # bypass 模式下仍然生效（sudo/push/凭据读 22 条全硬拒）。
             "--append-system-prompt",
             _context_for(workspace or policy.default_workspace, policy),
             "--permission-mode",
-            "manual",
+            "bypassPermissions",
         ]
         for tool in policy.allowed_tools():
             argv += ["--allowed-tools", tool]
@@ -251,13 +269,18 @@ class ClaudeRunner:
                 except json.JSONDecodeError:
                     continue
                 kind = event.get("type")
-                if (kind == "system" and event.get("subtype") == "init"
-                        and on_session is not None and event.get("session_id")):
-                    # 🔴 同步回调、不 await（文件头第 1 条）。回调抛异常不能把这一轮读断。
-                    try:
-                        on_session(str(event["session_id"]))
-                    except Exception:  # noqa: BLE001
-                        logger.exception("on_session 回调出错（只影响重启后续跑）")
+                if kind == "system" and event.get("subtype") == "init" and event.get("session_id"):
+                    # 🔴 11-20：先记下来。超时那支原来取 `(final or {}).get("session_id") or resume`，
+                    # 而超时的时候 `final` 还是空的（它只在收到最终结果时才填）、第一轮 `resume` 也空
+                    # ⇒ 返回 session_id=None ⇒ 上层记不住会话 ⇒ 用户发「继续」会开新轮，
+                    # 做到一半的东西全丢（本轮台架真跑出来的，不是看代码看出来的）。
+                    progress.session_id = str(event["session_id"])
+                    if on_session is not None:
+                        # 🔴 同步回调、不 await（文件头第 1 条）。回调抛异常不能把这一轮读断。
+                        try:
+                            on_session(progress.session_id)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("on_session 回调出错（只影响重启后续跑）")
                 if kind == "stream_event":
                     # 逐字增量。🔴 只认 `text_delta`：`input_json_delta`（工具参数）
                     # 也是 `content_block_delta`，不按 `delta.type` 过滤就会把工具参数的
@@ -333,9 +356,16 @@ class ClaudeRunner:
                 text="",
                 duration_sec=time.monotonic() - started,
                 timed_out=True,
+                # 🔴 11-20：超时这支原来**不带 session_id**（别的分支都带）⇒ 上层记不住会话
+                # ⇒ 用户下一句会开新轮，做到一半的东西全丢。
+                # 会话 id 从 `system/init` 那条就拿到了（on_session 回调的同一个值），
+                # 超时时它早就在手里，只是没放进返回值。
+                session_id=progress.session_id or (final or {}).get("session_id") or resume,
+                # 原来这句是「可以把问题拆小一点再问，或者说得更具体些」——
+                # 把原因推给用户的问法，而干长活的人问得再清楚也会满。
                 error=(
                     f"跑了 {effective.turn_timeout_sec // 60} 分钟还没完，先停下了。"
-                    "可以把问题拆小一点再问，或者说得更具体些。"
+                    "发「继续」就接着做；要它改方向就直接说。"
                 ),
             )
 
@@ -354,7 +384,8 @@ class ClaudeRunner:
             return TurnResult(
                 ok=False,
                 text=partial,
-                session_id=(final or {}).get("session_id") or resume,
+                # 同超时那支：被停时 final 也是空的 ⇒ 要用 progress 里记下的那个
+                session_id=progress.session_id or (final or {}).get("session_id") or resume,
                 duration_sec=time.monotonic() - started,
                 cancelled=True,
                 error="已按你的要求停下",

@@ -233,17 +233,42 @@ class Reviewer:
                 seen.add(text)
                 red.append(why)
 
+        # 🔴 11-21：**全授权档不再因此掐停**，只在回复末尾说一行。
+        # 用户（卜弋天）原话：「他经常会遇到由于权限问题停下来，然后要点继续，很麻烦。」
+        # 现场截图：一轮长活里 3 次撞红线（读密钥/凭据），整轮停住等人点「继续」。
+        #
+        # 为什么敢撤：**这个暂停不提供任何安全保障** —— 上面文档末尾那句自己写着
+        # 「真正的防线是那次 deny 本身，掐停只是『叫人来看』」。操作早就被挡住了，
+        # agent 该做的是跳过继续干。
+        # 而全授权档的语义就是「什么都不问」（11-19 用户拍板），
+        # 这道闸原来一个字都没看 `ctx.mode` ⇒ 全授权档照样停，那是漏洞不是设计。
+        #
+        # 只读 / 可改档**照旧停**（11-21 用户确认不放宽）：那两档用户主动选了「动手前问我」，
+        # 一轮里连撞两次红线值得他看一眼。
         if len(seen) >= 2:
             kinds = list(dict.fromkeys(red))[:3]
+            why = f"这一轮里有 {len(seen)} 次操作撞到了红线（{'、'.join(kinds)}）"
+            if ctx.mode == "trusted":
+                return Decision(
+                    Verdict.ALLOW,
+                    f"{why}，已经挡住了，这一轮照常往下做。",
+                    rule="red_line_probing_noted",
+                )
             return Decision(
                 Verdict.PAUSE,
-                f"这一轮里有 {len(seen)} 次操作撞到了红线（{'、'.join(kinds)}），"
-                "这些是任何时候都不做的事。我先停下了，"
+                f"{why}，这些是任何时候都不做的事。我先停下了，"
                 "确认没问题的话点「继续」。",
                 rule="red_line_probing",
             )
         # 判不出来的那部分照老判据走（见上面"判不出来的"那一段）
         if blind >= 3:
+            # 同上：全授权档只说一句，不掐停。
+            if ctx.mode == "trusted":
+                return Decision(
+                    Verdict.ALLOW,
+                    f"这一轮有 {blind} 次操作被挡下来（看不出它们想做什么），这一轮照常往下做。",
+                    rule="repeated_denials_noted",
+                )
             return Decision(
                 Verdict.PAUSE,
                 f"这一轮有 {blind} 次操作被挡下来，但看不出它们想做什么。"

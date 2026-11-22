@@ -44,7 +44,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .model import TOOLS, ActionResult, FleetJobs, RunResult, SubprocessRunner, friendly_error, short_title
+from .model import (TOOLS, ActionResult, FleetJobs, RunResult, SubprocessRunner, friendly_error,
+                    on_windows, short_title, spawn_fail_log)
 
 logger = logging.getLogger("feishu-bridge.fleet")
 
@@ -119,21 +120,65 @@ _FALLBACKS = {
     "codex": ("/opt/homebrew/bin/codex", "/usr/local/bin/codex", "~/.local/bin/codex"),
     "cursor": ("~/.local/bin/cursor-agent", "/opt/homebrew/bin/cursor-agent", "/usr/local/bin/cursor-agent"),
 }
+# 🔴 11-20：Windows 的兜底位置原来**一个都没有**（上面全是 mac 路径）。
+# 现场 liudewang …a355bd：桥在飞书里一干活就报「找不到要用的文件或程序」
+# （relay.py:525 FileNotFoundError 起 claude），而他 11-18 装 Claude Code 是成功的
+# ⇒ 真病根是**后台服务那份 PATH 失效了**（装机那一刻记的 $claudeDir，claude 后来换了位置），
+# which 找不到、又没有 Windows 兜底 ⇒ 每次都抛。
+# 这几个位置抄 install-windows.ps1 里挑 claudeBin 时试的同一组（改一处要改两处）。
+# 🔴 **只放我们自己装的落点**，别凭猜加。
+# 11-20 我原来还加了 `~\AppData\Local\Programs\claude\claude.exe`（猜的「桌面 App 装法」），
+# 被「一键安装」会话按源码否掉：全仓 `AppData.Local.Programs` 在安装器里 0 命中，
+# 我们装 claude 一律走 npm（`claude-oneclick/src/install-windows.ps1:266`
+# `$npmPrefix = ~\.carher-npm-global`）⇒ 落点就是下面第一个。
+# 留着的代价不是「多试一个空路径」，而是**万一那里真有别人装的 claude.exe，桥会去起它** ——
+# 那份不带我们的 `npm_config_prefix`，`claude update` 会把包装进 `%APPDATA%\npm`
+# 造一个 332MB 影子副本而且永远升不上去（同文件 :988 的注释）。
+# 宁可报「找不到 claude」让人重跑安装器。
+_FALLBACKS_WINDOWS = {
+    "claude": (r"~\.carher-npm-global\claude.cmd", r"~\.local\bin\claude.exe",
+               r"~\AppData\Roaming\npm\claude.cmd"),
+    "codex": (r"~\.carher-npm-global\codex.cmd", r"~\.local\bin\codex.exe",
+              r"~\AppData\Roaming\npm\codex.cmd"),
+    "cursor": (r"~\.local\bin\cursor-agent.exe", r"~\AppData\Roaming\npm\cursor-agent.cmd"),
+}
 _EXE = {"claude": "claude", "codex": "codex", "cursor": "cursor-agent"}
 
 
+# 转发脚本的特征：命令行里的 claude 可能是别的工具（cmux / 各种 wrapper）放的壳，
+# 它会把自己所在目录从 PATH 里剔掉再去找真的 claude。
+# 🔴 把壳的路径写死给后台服务 = 装机侧 11-18 修过的那个坑（install-windows.ps1 的
+# Test-CarherClaudeRuns 注释：「照它写开机自启 ⇒ 任务那份 PATH 里没有真 claude ⇒ 起不动，
+# 用户看到『飞书里能聊，一让它干活就答不出来』」）。本机实测 which 就返回了一个
+# cmux shim（`~/.cmuxterm/cmux-cli-shims/<uuid>/claude`，内容是 bash 转发到
+# cmux-claude-wrapper）⇒ 不排掉的话我这次修法会把同一个坑重新引进来。
+_SHIM_MARKS = ("cmux-cli-shims", "/.cmuxterm/", "cmux-claude-wrapper")
+
+
+def _looks_like_shim(path: str) -> bool:
+    p = str(path).replace("\\", "/")
+    return any(mark in p for mark in _SHIM_MARKS)
+
+
 def find_bin(tool: str, which: Callable[[str], Optional[str]] = shutil.which) -> str:
-    """后台服务的 PATH 很短 ⇒ which 找不到再看默认安装位置。找不到返回空串。"""
+    """后台服务的 PATH 很短 ⇒ which 找不到再看默认安装位置。找不到返回空串。
+
+    `which` 命中一个**转发壳**时先看真实安装位置，都没有才退回那个壳
+    （壳总比什么都没有好 —— 交互窗口里它是能跑的）。
+    """
     if tool not in _EXE:
         return ""
     found = which(_EXE[tool])
-    if found:
+    if found and not _looks_like_shim(found):
         return found
-    for cand in _FALLBACKS[tool]:
+    cands = _FALLBACKS_WINDOWS[tool] if on_windows() else _FALLBACKS[tool]
+    for cand in cands:
         path = os.path.expanduser(cand)
-        if os.path.isfile(path) and os.access(path, os.X_OK):
+        # 🔴 Windows 上不查 X_OK：NTFS 没有执行位，`os.access(..., X_OK)` 对
+        # `.cmd` / `.exe` 返回 False ⇒ 兜底全部失效（加了 Windows 路径也等于没加）。
+        if os.path.isfile(path) and (on_windows() or os.access(path, os.X_OK)):
             return path
-    return ""
+    return found or ""
 
 
 def available_tools(which: Callable[[str], Optional[str]] = shutil.which) -> list:
@@ -203,10 +248,18 @@ def claude_env(auth_env: Optional[dict] = None, approval_dir: str = "", config_d
     return env
 
 
+# 桥起 claude 用的权限档。🔴 **只在这里写一次**。
+# 11-20：原来 `claude_argv` 里写死 bypassPermissions，而窗口那条 `--resume` 不带权限参数
+# ⇒ jsonl 里记 bypass、窗口里的真进程跑用户自己那档 ⇒ relay 按 jsonl 选信使就选错了，
+# 消息被「权限档不同类」扣住（用户看到「📨 发给 Claude 了…」然后「❌ 没发进去」）。
+# 两处共用这一个常量，改档位只改这里。
+BRIDGE_PERMISSION_MODE = "bypassPermissions"
+
+
 def claude_argv(binary: str, sid: str, name: str, prompt: str, policy: Any,
                 hook: Optional[dict] = None, auth_top: Optional[dict] = None) -> list:
-    """和 `ClaudeAdapter._send_argv` 同一套权限：manual 档、一个 settings 来源都不加载、
-    不起用户的 MCP、白名单 / 红线来自 policy、钩子用 --settings 单独带。
+    """和 `ClaudeAdapter._send_argv` 同一套权限：`BRIDGE_PERMISSION_MODE` 档、
+    一个 settings 来源都不加载、不起用户的 MCP、白名单 / 红线来自 policy、钩子用 --settings 单独带。
     区别只在「新建」：`--session-id` 我们自己定，`-n` 起好名字（relay 要它），stream-json 拿 init。"""
     extra = dict(auth_top or {})
     extra.pop("permissions", None)
@@ -216,7 +269,7 @@ def claude_argv(binary: str, sid: str, name: str, prompt: str, policy: Any,
         binary, "-p", _safe_prompt(prompt),
         "--session-id", sid, "-n", name,
         "--output-format", "stream-json", "--verbose",
-        "--permission-mode", "manual",
+        "--permission-mode", BRIDGE_PERMISSION_MODE,
         "--setting-sources", "",
         "--strict-mcp-config",
     ]
@@ -257,37 +310,109 @@ _CURSOR_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 _UUID = _CURSOR_ID
 
 
-def window_script(tool: str, binary: str, sid: str, cwd: str) -> str:
-    """电脑上那个窗口跑的脚本。**只有 id 和目录**，不含第一句话。跑起来先删掉自己。
+def _window_argv(tool: str, binary: str, sid: str, cwd: str,
+                 permission_mode: str = "") -> list:
+    """窗口里要跑的那条命令。两个平台共用，别各写一份（会漂）。
 
-    - Claude：`claude --resume <id>`，不带权限参数 = 用户自己那套设置（和他自己打开一样）
+    - Claude：`claude --resume <id> --permission-mode <桥用的那档>`
     - Codex：`codex resume <id> -s read-only`（手机开的会话是只读的，窗口里也别变成整机全开）
     - Cursor：`cursor-agent --resume <id> --mode ask`
+
+    🔴 11-20：`--permission-mode` 原来**不带**（注释写着「= 用户自己那套设置」），
+    而桥起第一轮用的是 `bypassPermissions`（今天 14c1f705 改的）⇒ jsonl 里那行
+    `user.permissionMode` 记的是 bypass，窗口里的真进程却跑在用户自己那档（manual）。
+    会话间消息要「收发双方权限档同类」，`relay.permission_mode_of()` 读 jsonl 得到 bypass
+    ⇒ 选了 bypass 信使 ⇒ 真进程是 prompting 类 ⇒ **消息被扣住等人点**，
+    用户在群里看到「📨 发给 Claude 了，等它回…」然后「❌ 没发进去」（本轮现场）。
+    改成把桥这一档一起传进去：jsonl 记什么、进程跑什么，是同一个值。
+    改 permission-mode 的默认档时，这里会跟着走（它从 policy 来），不用再记得改第二处。
     """
     if tool == "claude":
-        run = [binary, "--resume", sid]
-    elif tool == "codex":
-        run = [binary, "resume", "-s", "read-only", "-C", cwd, sid]
-    else:
-        run = [binary, "--resume", sid, "--workspace", cwd, "--mode", "ask"]
+        argv = [binary, "--resume", sid]
+        if permission_mode:
+            argv += ["--permission-mode", permission_mode]
+        return argv
+    if tool == "codex":
+        return [binary, "resume", "-s", "read-only", "-C", cwd, sid]
+    return [binary, "--resume", sid, "--workspace", cwd, "--mode", "ask"]
+
+
+def window_script(tool: str, binary: str, sid: str, cwd: str, permission_mode: str = "") -> str:
+    """电脑上那个窗口跑的脚本。**只有 id 和目录**，不含第一句话。跑起来先删掉自己。
+
+    🔴 11-20：Windows 要另一份（见 `window_script_windows`）。原来只有这一份 bash，
+    于是 Windows 上写出 `#!/bin/bash` 的 `.command`、再 `/usr/bin/open -a Terminal`
+    ⇒ `FileNotFoundError`，手机上「➕ 新开一个」勾了「在电脑上开窗口」就报
+    「电脑上找不到要用的文件或程序……刷新一下再试」（liudewang 机器 …a355bd
+    11-20 11:43 现场，newsession.py:285）。
+    """
     return "\n".join([
         "#!/bin/bash",
         'rm -f "$0"; rmdir "$(dirname "$0")" 2>/dev/null',
         "unset " + " ".join(_CLAUDE_INHERITED),
         "cd " + shlex.quote(cwd) + " || exit 1",
-        "exec " + " ".join(shlex.quote(a) for a in run),
+        "exec " + " ".join(shlex.quote(a) for a in _window_argv(tool, binary, sid, cwd, permission_mode)),
         "",
     ])
 
 
+def window_script_windows(tool: str, binary: str, sid: str, cwd: str, permission_mode: str = "") -> str:
+    """同上，`.cmd` 版。
+
+    - `@echo off` 之后**先删自己**：`.cmd` 删掉自己照样能跑完（cmd 按偏移续读，但
+      `start` 之后这行就是最后一行了）⇒ 和 mac 那份一样不留垃圾。
+      🔴 `del "%~f0"` 要放在真正启动**之前**那一刻，不能放最后 —— `exec` 之后不会回来。
+    - 清掉继承来的 CLAUDE_*：`set "VAR="` 是 cmd 的删法（不是 `unset`）。
+    - 路径里有空格/中文一律加引号；cwd 用 `cd /d` 才能跨盘符。
+    """
+    argv = _window_argv(tool, binary, sid, cwd, permission_mode)
+    lines = ["@echo off", 'del "%~f0" >nul 2>&1']
+    lines += [f'set "{name}="' for name in _CLAUDE_INHERITED]
+    lines.append(f'cd /d "{cwd}" || exit /b 1')
+    # 🔴 程序路径**一律加引号**，哪怕当前这个路径里没有空格：
+    # 它是 `C:\Users\<用户名>\…` 开头的，用户名里有空格的机器很常见（「张 三」），
+    # 而「这台没空格所以不用引号」会在别人机器上变成两个参数。后面的参数照常按需加。
+    lines.append(" ".join([_cmd_quote(argv[0], always=True)]
+                          + [_cmd_quote(a) for a in argv[1:]]))
+    lines.append("")
+    return "\r\n".join(lines)
+
+
+def _cmd_quote(arg: str, *, always: bool = False) -> str:
+    """cmd 的引号规则：有空格或特殊字符就用双引号包起来；`always` = 无条件包。
+
+    🔴 不能用 `shlex.quote`（它出单引号，cmd 不认单引号，会把它当成文件名的一部分）。
+    """
+    s = str(arg)
+    if not always and s and not any(c in s for c in ' \t"&|<>^()%!'):
+        return s
+    return '"' + s.replace('"', '""') + '"'
+
+
 def _open_terminal_default(script_path: str) -> tuple:
+    """打开一个真窗口跑那个脚本。mac 用 `open -a Terminal`，Windows 用 `cmd /c start`。"""
+    if on_windows():
+        # `start` 是 cmd 的内建，不是 exe ⇒ 必须经 `cmd /c`。
+        # 第一个 "" 是窗口标题占位：不给的话 `start "C:\有空格\x.cmd"` 会把路径当标题、什么都不跑。
+        # /k 不用（跑完留着窗口会积一堆）；脚本自己 exec 进 CLI，CLI 退出窗口就关。
+        argv = ["cmd", "/c", "start", "", "/d", os.path.dirname(script_path) or ".", script_path]
+        doing = "没能打开命令行窗口"
+    else:
+        argv = ["/usr/bin/open", "-a", "Terminal", script_path]
+        doing = "没能打开终端窗口"
     try:
-        res = subprocess.run(["/usr/bin/open", "-a", "Terminal", script_path],
-                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        res = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, friendly_error(exc, "没能打开终端窗口")
+        # 🔴 先打一句带程序名的**源码常量**日志：上报只发常量模板，光靠 friendly_error
+        # 那句通用模板查不出起的是什么（11-20 这条就是这样卡住的，同 relay.py 的修法）。
+        try:
+            logger.error(spawn_fail_log(argv[0]), exc_info=exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return False, friendly_error(exc, doing)
     if res.returncode != 0:
-        return False, _short_err(res.stderr) or "终端窗口没打开"
+        return False, _short_err(res.stderr) or "窗口没打开"
     return True, ""
 
 # ---------- 「这是从手机开的」：给总览标 📱 用 ----------
@@ -501,6 +626,16 @@ def note_window_opened(sid: str) -> None:
         _WINDOW_OPENED[sid] = time.monotonic()
 
 
+def clear_window_opened(sid: str) -> None:
+    """窗口里的进程确认起来了 ⇒ 这段空窗期的意义就没了（11-20）。
+
+    不清的话，`window_just_opened` 在剩下的几十秒里还会回 True，
+    每个调用点都得自己再判一次「其实已经起来了」。
+    """
+    with _WINDOW_LOCK:
+        _WINDOW_OPENED.pop(sid, None)
+
+
 def window_just_opened(sid: str, now: Optional[float] = None) -> bool:
     """这个会话是不是刚在电脑上开了窗口（WINDOW_GRACE_SEC 内）。"""
     with _WINDOW_LOCK:
@@ -513,19 +648,40 @@ def window_just_opened(sid: str, now: Optional[float] = None) -> bool:
         return True
 
 
-WHY_WINDOW_JUST_OPENED = "电脑上刚给它开了窗口，还在启动；为了不分叉先不发，等一分钟再说，或者直接在电脑窗口里说。"
+# 🔴 11-20：原来写「等一分钟再说」—— 而真正要等的是窗口里那个 claude 起来（通常几秒），
+# 不是一分钟。现在起来了就立刻能发（见 control.send 里那段），所以这句话只在「真的还没起来」时出现。
+WHY_WINDOW_JUST_OPENED = "电脑上那个窗口还在启动，几秒后再发一次就行（现在发会和窗口里那个撞上）。"
 
 
 def open_window_for(tool: str, binary: str, sid: str, cwd: str,
                     open_terminal: Optional[Callable[[str], tuple]] = None,
-                    script_dir: Optional[str] = None) -> tuple:
-    """写一个一次性 `.command`（0700，跑起来先删自己）再 `open -a Terminal` → (开没开, 一句话)。"""
+                    script_dir: Optional[str] = None,
+                    permission_mode: str = "") -> tuple:
+    """写一个一次性脚本（跑起来先删自己）再开一个真窗口 → (开没开, 一句话)。
+
+    mac：`.command` + 0700 + `open -a Terminal`；Windows：`.cmd` + `cmd /c start`。
+    🔴 Windows 上别 `chmod 0700`：NTFS 上这个调用不报错但也不起作用，而真正要紧的是
+    扩展名必须是 `.cmd`（`.command` 在 Windows 上没有关联程序，start 会弹「用什么打开」）。
+    """
+    win = on_windows()
     folder = tempfile.mkdtemp(prefix="carher-newsession-", dir=script_dir)
-    path = os.path.join(folder, f"{tool}-{sid[:8]}.command")
+    ext = "cmd" if win else "command"
+    path = os.path.join(folder, f"{tool}-{sid[:8]}.{ext}")
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(window_script(tool, binary, sid, cwd))
-        os.chmod(path, 0o700)
+        body = (window_script_windows if win else window_script)(tool, binary, sid, cwd, permission_mode)
+        # Windows 的 cmd 按当前代码页读脚本；中文路径用 UTF-8 会乱码 ⇒ 用 mbcs（系统默认，GBK）。
+        # 写不出去的字符退回 UTF-8，总比整条命令废掉好。
+        if win:
+            try:
+                with open(path, "w", encoding="mbcs", newline="") as fh:
+                    fh.write(body)
+            except (LookupError, UnicodeEncodeError):
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(body)
+        else:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(path, 0o700)
         ok, why = (open_terminal or _open_terminal_default)(path)
     except Exception as exc:  # noqa: BLE001
         ok, why = False, friendly_error(exc, "没能打开终端窗口")
@@ -587,7 +743,9 @@ def _bg_finish(tool: str, sid: str, p: _Proc, jobs: FleetJobs, *, timeout: float
         if p.exited() is None:
             note = "它还没停下来，为了不分叉，这次没在电脑上开窗口。"
         else:
-            opened, note = open_window_for(tool, binary, sid, cwd, open_terminal, script_dir)
+            # 🔴 带上桥这一档：jsonl 记什么、窗口里的进程跑什么，必须是同一个值（见 _window_argv 红字）
+            opened, note = open_window_for(tool, binary, sid, cwd, open_terminal, script_dir,
+                                           permission_mode=BRIDGE_PERMISSION_MODE if tool == "claude" else "")
     if on_done is not None:
         try:
             on_done(FirstTurn(tool, sid, ok, text, opened, note))

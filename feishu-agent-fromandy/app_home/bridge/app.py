@@ -66,6 +66,15 @@ from .fleet.actions import do_button as _do_button, fleet_button as _fleet_butto
 
 logger = logging.getLogger("feishu-bridge")
 
+# 单轮墙上时钟上限的兜底（配置里没写 `turn_timeout_sec` 时用）。
+# 🔴 11-20：原来这里有**两个不一样的兜底** —— 读配置那处写 900（15 分钟），
+# 群里干活那两处写 600（10 分钟）⇒ 群里的实际上限比用户以为的还短 5 分钟。
+# 同时按用户反馈（buyitian：「15 分钟 timeout 这个有点太短了，设成默认 30 分钟吧」）
+# 抬到 30 分钟：这道闸**不管挂死**（卡住本来就会等满全程），所以放大只影响
+# 「真的在干长活」那一类；要中途停有 `/stop`。
+# 安装器模板和 config.example.toml 里那行要跟着一样（都是 1800）。
+DEFAULT_TURN_TIMEOUT_SEC = 1800
+
 # 状态卡刷新间隔。飞书对同一用户发消息 5 QPS，单卡片实体操作上限 10 次/秒 ——
 # 15 秒一次远在限额内，同时足够让用户感觉"它在动"。
 _STATUS_REFRESH_SEC = 15
@@ -568,7 +577,7 @@ class Settings:
             workspaces=workspaces,
             default_workspace=agent.get("default_workspace") or (workspaces[0] if workspaces else ""),
             model=agent.get("model", "claude-sonnet-5-5"),
-            turn_timeout_sec=int(agent.get("turn_timeout_sec", 900)),
+            turn_timeout_sec=int(agent.get("turn_timeout_sec", DEFAULT_TURN_TIMEOUT_SEC)),
             ceiling_mode=ceiling,
         )
 
@@ -1538,6 +1547,11 @@ class Bridge:
             self._paused[scope] = outcome.reason
             self._save_paused()
             body += f"\n\n⏸ {outcome.reason}\n确认没问题的话点「继续」。"
+        elif outcome.reason:
+            # 🔴 11-21：全授权档撞红线不再掐停（用户：「要点继续，很麻烦」），
+            # 改成只说一行。原来这里**只处理 PAUSE** ⇒ ALLOW 带的那句话会被丢掉，
+            # 用户就只看到「⛔ 这几步被挡下了」、不知道撞的是红线。
+            body += f"\n\n🔕 {outcome.reason}"
 
         # 🔴 流式卡能装下全文 ⇒ 让它收尾（原地变成终态卡），**不再发一条消息** ——
         # 否则同一段话在聊天里出现两次。装不下 / 没流式 ⇒ 照旧发消息。
@@ -3047,7 +3061,7 @@ class Bridge:
             can_stop=bool(getattr(known, "can_stop", False)),
             first_delay=getattr(settings, "progress_first_notice_sec", 90),
             escalate_sec=getattr(settings, "progress_escalate_sec", 0),
-            limit_sec=float(getattr(policy, "turn_timeout_sec", 600) or 600),
+            limit_sec=float(getattr(policy, "turn_timeout_sec", DEFAULT_TURN_TIMEOUT_SEC) or DEFAULT_TURN_TIMEOUT_SEC),
         )
         wait_stop = asyncio.Event()
         wait_task = asyncio.create_task(wait_card.run(wait_stop))
@@ -3062,7 +3076,7 @@ class Bridge:
             result = await asyncio.to_thread(
                 control.send, target.tool, target.id, text,
                 policy=policy, approval_dir=approval_dir,
-                timeout=float(getattr(policy, "turn_timeout_sec", 600) or 600),
+                timeout=float(getattr(policy, "turn_timeout_sec", DEFAULT_TURN_TIMEOUT_SEC) or DEFAULT_TURN_TIMEOUT_SEC),
                 relay=True, **self._group_run_prefs(scope, target.tool, target.id),
             )
         finally:
