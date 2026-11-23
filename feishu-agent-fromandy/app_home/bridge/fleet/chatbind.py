@@ -125,6 +125,19 @@ class Bound:
     # 终端开着的会话（relay）换不了。旧文件没有这两个键 ⇒ 默认空串。
     model: str = ""
     effort: str = ""
+    # 🔴 第 40 轮（2026-11-22）：这个群最后一次有人说话 / 点按钮的时间。
+    # 为什么要它：**悬浮菜单的点击事件里没有 chat_id**（实测 209 次点击的日志原文，
+    # 字段只有 operator / event_key / timestamp），而主人有 28 个会话群 ⇒ 他在群里点
+    # 「⏹ 停下」，桥原来只能落到单聊（`app._on_menu_click` 的 `scope = f"dm:{clicker}"`）
+    # ⇒ 停的是单聊那个会话，不是他正看着的这个群。
+    # 而「他正看着哪个群」是**推得出来的**：群和会话一对一落盘，谁最近在说话就是谁。
+    # 旧文件没这个键 ⇒ 回落到 `created_at`（刚建的群也算刚活跃过，符合直觉）。
+    seen_at: float = 0.0
+
+    @property
+    def active_at(self) -> float:
+        """最后活跃时间；没打过点就用建群时间。"""
+        return self.seen_at or self.created_at
 
     @property
     def label(self) -> str:
@@ -249,10 +262,15 @@ class ChatBinds:
             created = float(row.get("created_at") or 0.0)
         except (TypeError, ValueError):
             created = 0.0
+        try:
+            seen = float(row.get("seen_at") or 0.0)
+        except (TypeError, ValueError):
+            seen = 0.0
         return Bound(chat_id=chat_id, tool=tool, id=sid,
                      name=_clean_name(row.get("name"))[:MAX_NAME_CHARS],
                      created_at=created, on=bool(row.get("on", True)),
-                     model=clean_model(row.get("model")), effort=clean_effort(row.get("effort")))
+                     model=clean_model(row.get("model")), effort=clean_effort(row.get("effort")),
+                     seen_at=seen)
 
     def _save(self) -> bool:
         with self._lock:
@@ -264,6 +282,8 @@ class ChatBinds:
                     row["model"] = b.model
                 if b.effort:
                     row["effort"] = b.effort
+                if b.seen_at:
+                    row["seen_at"] = b.seen_at
                 payload["binds"][b.chat_id] = row
         try:
             directory = os.path.dirname(self._path)
@@ -301,6 +321,46 @@ class ChatBinds:
         """只要还在转发的那一条。解绑过的 ⇒ None（群里的话按平常处理）。"""
         bound = self.of_scope(scope)
         return bound if bound is not None and bound.on else None
+
+    def touch(self, chat_id: str) -> None:
+        """这个群刚有动静（有人说话 / 点按钮）。给「他正看着哪个群」当依据。
+
+        🔴 **不落盘**（不调 `_save`）：每条消息都写一次文件太重，而这个值只用来猜
+        「刚才那一下是在哪个群点的」—— 重启后丢了就回落到 `created_at`，不影响正确性。
+        别的字段（绑定、模型）该落盘的照旧落。
+        """
+        if not isinstance(chat_id, str) or not chat_id:
+            return
+        with self._lock:
+            bound = self._by_chat.get(chat_id)
+            if bound is not None:
+                self._by_chat[chat_id] = _replace(bound, seen_at=self._now())
+
+    def most_recent_active(self, *, within_sec: float = 0.0) -> Optional[Bound]:
+        """最近有动静、还在转发的那个群。没有 ⇒ None。
+
+        🔴 这是**悬浮菜单落到哪个群**的判据（第 40 轮）。菜单点击事件不带 chat_id
+        （实测：字段只有 operator / event_key / timestamp），而主人有 28 个会话群。
+        「他正看着哪个群」没法从事件里读，但推得出来：群和会话一对一，
+        **谁最近在说话就是他正看着的那个**。
+
+        `within_sec > 0` ⇒ 超过这个时长没动静的不算（避免「三天前聊过的群」把
+        今天的点击吃掉）。调用方给窗口，这里不定策略。
+        """
+        best = None
+        now = self._now()
+        with self._lock:
+            for bound in self._by_chat.values():
+                if not bound.on:
+                    continue
+                at = bound.active_at
+                if not at:
+                    continue
+                if within_sec and (now - at) > within_sec:
+                    continue
+                if best is None or at > best.active_at:
+                    best = bound
+        return best
 
     def of_session(self, tool: str, sid: str) -> Optional[Bound]:
         """这个会话已经有群了吗（幂等的依据）。解绑过的也算有 —— 重新点就复用它。"""

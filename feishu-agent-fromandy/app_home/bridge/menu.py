@@ -217,11 +217,60 @@ def known_commands() -> frozenset[str]:
     return frozenset(known)
 
 
+# 🔴 **只许有这一条**（2026-11-22）。往里加名字之前先读完下面这段。
+#
+# `/clear` 为什么必须写死：它在 `-p --resume` 下**真的执行**，而且
+#   ① 换掉 result 的 session_id ⇒ `app.py` 无条件存新 sid ⇒ 旧上下文的指针丢了
+#   ② 它的 assistant 块是**空的** ⇒ 撞上 runner 的「零输出 = 故障」那支
+#      ⇒ 用户在手机上看到的是「这一轮没出结果，点🆕新话题再问一次」
+#   ③ 手机上没有任何「刚才被清了」的痕迹
+# 三件叠起来 = 后果不可见、而且他事后发现不了。**这才是写死名字的唯一理由。**
+#
+# 🔴 为什么**不**把 `/exit` `/logout` `/permissions` `/export` `/memory` `/bug`
+# `/install-github-app` 一起写进来（我原本打算这么干）：实测它们在 `-p` 下
+# **上游自己就关了**，一律回「isn't available in this environment」、0 turn、0 花费。
+# 写进来 = 我们维护一份**会漂的上游清单**，而且上游哪天放开时我们会静默挡住一条本该能用的命令。
+#
+# `/compact` 实测**安全**（sid 不变、上下文保留），所以不在这里。
+# `/init` 在这里的理由和 `/clear` 同类但不同因：它**真去写 CLAUDE.md**（实测 3 个 turn），
+# 在手机上误发一下就在生产仓库里生成文件 —— 写文件不可逆。
+#
+# 盯着这条的测试：`tests/test_r40_slash_passthrough.py::test_blocklist_has_only_two`
+DESTRUCTIVE = {"/clear": "clear", "/init": "init"}
+
+
+def destructive_command(text: str) -> str:
+    """这条消息是写死拦下的那几条吗。是 ⇒ 返回那个命令；不是 ⇒ 空串。
+
+    只认**整条消息就是这个命令**（允许带参数）；`/clearcache` 这种不认。
+    """
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return ""
+    token = stripped.split()[0].lower()
+    return token if token in DESTRUCTIVE else ""
+
+
 def unknown_command(text: str) -> str:
-    """这条消息是"打错的命令"吗。是 ⇒ 返回那个 token；不是 ⇒ 空串。
+    """这条消息是"**打错的**命令"吗。是 ⇒ 返回那个 token；不是 ⇒ 空串。
 
     判据刻意只看**第一个 token**：`/cd 项目名` 带参数，而参数里有什么都不影响
     "这个命令认不认识"。
+
+    🔴 2026-11-22：判据从「不在我们的表里」换成「**猜得中某个已知命令**」。
+    为什么必须换 —— 原来的判据注定会错：上游 `-p` 下实测有 **51 条**可用命令
+    （`/goal` `/context` `/compact` `/usage` …，init 事件的 `slash_commands` 数组现报），
+    而我们的 `known_commands()` 只有桥自己那二十来条 ⇒ 用户打 `/goal` 被回
+    「没有这个用法」，**而它明明真能跑**（实测：`/goal` 真设了目标、之后每轮都带着）。
+    追着往表里加 = 抄一份会漂的清单，打地鼠。
+
+    换成「猜得中」之后两边都对：
+    - `/sessoins` ⇒ 猜中 `/sessions` ⇒ 照旧当场拦，一分钱不花（11-05 那个场景原样保住）
+    - `/goal` ⇒ 猜不中任何已知命令 ⇒ 放行，交给上游自己回
+    11-05 加这道兜底时怕的是「它会去猜 sessoins 是什么、白跑一轮 agent」。
+    实测现在上游自己处理了这个 case（attachment 类型 `unknown_command_fallback`）：
+    `/nosuchcmd-xyz` ⇒ 1 turn、$0.0017（haiku），它直接回「这个命令没装」+ 列可用的，
+    **不会去猜、不会开工**。和一轮真 agent 差两个数量级。
     """
     stripped = (text or "").strip()
     if not stripped.startswith("/"):
@@ -230,6 +279,10 @@ def unknown_command(text: str) -> str:
     if not _COMMAND_SHAPE.match(token):
         return ""
     if token.lower() in {c.lower() for c in known_commands()}:
+        return ""
+    # 🔴 这一行就是新判据。猜不中 ⇒ 不是打错字，是上游的命令（或者他真打了个不存在的）
+    # ⇒ 放行，别拦。
+    if not _closest_command(token):
         return ""
     return token
 

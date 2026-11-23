@@ -116,6 +116,16 @@ RESEND_GUARD_SEC = 10 * 60     # 同一句话「送进去了但还没等到回�
 
 _REGISTRY_RE = re.compile(r"^\d+\.json$")
 _FROM_MODE_RE = re.compile(r'from-mode="([^"]*)"')
+# 「这是条斜杠命令吗」：和 `menu._COMMAND_SHAPE` 同一个形状。
+# 🔴 刻意放过带第二层斜杠的东西（`/Users/me/codes 里有什么` 是个正常问题），
+# 也放过纯路径 —— 和 menu 那边同一个口径，两处一起改。
+_SLASH_SHAPE = re.compile(r"^/[A-Za-z一-鿿][A-Za-z0-9一-鿿_!·-]{0,19}$")
+
+
+def _looks_like_slash_command(text: str) -> bool:
+    """整条消息的**第一个词**是不是一条斜杠命令。"""
+    head = str(text or "").strip().split()
+    return bool(head) and bool(_SLASH_SHAPE.match(head[0]))
 _FROM_RE = re.compile(r'\bfrom="([^"]*)"')
 
 # `bypassPermissions` 之外一律当 prompting（保守）：二值里只有 bypass 实测过能直达。
@@ -174,6 +184,14 @@ TEXT_RESEND_BLOCKED = (
 WHY_STOP_TARGET = (
     "这个会话停不了：它开在电脑的终端里，从外面停会把整个会话关掉。"
     "要停它手里这一轮，只能到电脑上按 Esc。"
+)
+# 🔴 这句只在**终端正开着**那个会话时才会出现（走 relay 这条路）。
+# 没人占着的会话走 `-p --resume`，斜杠命令**真能跑**，压根到不了这里。
+# 文案里要说清「因为它正开着」，否则用户以为斜杠命令整个功能没了（11-22 现场就是这样）。
+WHY_SLASH_IN_RELAY = (
+    "这个会话正开在你电脑的终端里，而斜杠命令送不进一个开着的会话"
+    "（Claude Code 对别的会话转来的消息一律不跑命令，只当一句话看）。"
+    "要执行它，到那个窗口里自己打；要是把那个窗口关掉，从这儿发就能跑了。"
 )
 
 # 信使的系统提示词：机器看的，不是给用户的文案。按实测那版（haiku 中位 4.8s）原样留着。
@@ -358,6 +376,17 @@ class Target:
     jsonl: str
     cwd: str = ""
     socket: str = ""
+
+    @property
+    def address(self) -> str:
+        """`SendMessage` 的 `to`。**socket 优先**，它和会话一对一、不会重名。
+
+        bundle 原文（第 361200 行）：
+          「, or an explicit `uds:<socket>` / `bridge:<session id>` address.」
+        退回名字只是保险：`check()` 已经保证了 socket 非空（`WHY_NO_SOCKET`），
+        真走到这个分支说明有人改坏了上面那道闸。
+        """
+        return f"uds:{self.socket}" if self.socket else self.name
 
 
 @dataclass(frozen=True)
@@ -767,18 +796,26 @@ class Relay:
         proc = table.get(pid)
         if proc is not None and proc.stopped:
             return Decision(False, WHY_SUSPENDED)
-        name = str(rec.get("name") or "").strip()
-        if not name:
-            return Decision(False, WHY_NO_NAME)
-        # 名字是 SendMessage 的唯一地址 ⇒ 重名就可能进错会话，宁可不发
-        for _src, other_pid, other in live:
-            if other.get("sessionId") == sid or other_pid == pid:
-                continue
-            if str(other.get("name") or "").strip() == name:
-                return Decision(False, WHY_NAME_DUP)
+        # 🔴 2026-11-22：**按 socket 发，不按名字**（主人原话「不应该是用 session id 去发送消息吗？」）。
+        #
+        # 现场：他在群里发 `/goal 看看天气`，回「电脑上有两个会话都叫这个名字，
+        # 发过去可能进错一个。先在电脑上给其中一个改个名」—— 而我们**手里就有
+        # 这个会话自己的 socket 路径**（下面那行 `messagingSocketPath`），
+        # 一对一，压根不会进错。拿名字当地址是我走的弯路，重名那道闸是这个弯路的副作用。
+        #
+        # `SendMessage` 的 `to` 收显式地址，bundle 原文（第 361200 行）：
+        #   「, or an explicit `uds:<socket>` / `bridge:<session id>` address.」
+        # 所以 `uds:/tmp/cc-socks/<pid>.sock` 是官方支持的写法，而且它**唯一**。
+        #
+        # 名字仍然要读：没名字的会话照旧不发（`WHY_NO_NAME`）——
+        # 它是给用户看「发给谁」的那句话用的（`Target.name` → `app` 的文案），
+        # 不再是地址。重名**不再是拒绝的理由**。
         socket = str(rec.get("messagingSocketPath") or "")
         if not socket:
             return Decision(False, WHY_NO_SOCKET)
+        name = str(rec.get("name") or "").strip()
+        if not name:
+            return Decision(False, WHY_NO_NAME)
         path = self.adapter._jsonl_path(sid)
         if not path:
             return Decision(False, WHY_NO_RECORD)
@@ -860,6 +897,28 @@ class Relay:
             return ActionResult(False, WHY_BAD_ID, sid)
         if not text:
             return ActionResult(False, WHY_EMPTY, sid)
+        # 🔴 斜杠命令在**这条**路上送不进去，判据必须在这里 —— 不能在 app.py。
+        #
+        # 2026-11-22 当天的现场：第一版拦在 `app._maybe_send_to_fleet`，主人在群里打
+        # `/goal 看看天气`，回的是「斜杠命令发不进 Claude「198 k3s 节点硬盘」」，
+        # 他问「是我没更新吗？」—— **那条会话本来能跑**。
+        # 对话模式有好几条路，`control.send()` 在动手那一刻现判：
+        #   没人占着 ⇒ `claude -p --resume` ⇒ 斜杠命令**真执行**
+        #   窗口开着、认得那种终端、它又不忙 ⇒ 打进那个窗口（`termsend.py`，第 41 轮）⇒ 也真执行
+        #   窗口开着但正忙 / 认不出那种终端 ⇒ 这里 ⇒ 真跑不了
+        # 拦在 app.py 等于把能跑的那两条也拦了。判据和选路必须在同一个地方。
+        # 🔴 **这句话（`WHY_SLASH_IN_RELAY`）里「把窗口关掉就能发」只对走到这儿的情况成立。**
+        # 「它正忙」那种**不该**看到这句（关窗口解决不了，等它闲下来就行）⇒ 那一支由
+        # `termsend.can_send` 自己回 `WHY_BUSY`，不会落到这里。改这两句话时一起看。
+        #
+        # 为什么这条路真的不行（不是我们挡的，是上游关的）：会话间消息入队时写死
+        # `skipSlashCommands:!0`，配套判据 `Pue(e){return Lg(e.value)&&!e.skipSlashCommands}`
+        # ⇒ 带这个标记就不走命令解析。成对实测（同一条 `/probe-goal`、同一个目标）：
+        #   进目标自己的 stdin ⇒ 回 `GOALCMDRAN`，jsonl 里有 `<command-name>` 行 ⇒ 真跑了
+        #   经会话间消息送进去 ⇒ 目标回「这条命令是别的会话来的、不是你打的，我没跑」
+        # 照发的代价 = 目标花一轮的钱、说一句「我没跑」，比说清楚更差。
+        if _looks_like_slash_command(text):
+            return ActionResult(False, WHY_SLASH_IN_RELAY, sid)
         if not self._lock.acquire(blocking=False):
             return ActionResult(False, WHY_BUSY_RELAY, sid)
         try:
@@ -890,7 +949,10 @@ class Relay:
         # 落地判据要一字不差 ⇒ 后面比对也得用 `wire` 这一份。
         wire = wire_text(text)
         courier = self.courier_for(target.mode_class)
-        why = courier.write(target.name, wire)
+        # 🔴 地址用 `uds:<socket>`，**不用名字**（2026-11-22）。
+        # 名字会重（现场：两个会话都叫「198 k3s 节点硬盘」⇒ 整条发不出去），
+        # 而 socket 路径和会话一对一。bundle 第 361200 行写明 `to` 收这种显式地址。
+        why = courier.write(target.address, wire)
         if why:
             return ActionResult(False, why, sid)
         ident = courier.identity()

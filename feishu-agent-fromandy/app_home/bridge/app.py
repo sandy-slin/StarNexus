@@ -72,14 +72,22 @@ logger = logging.getLogger("feishu-bridge")
 # 同时按用户反馈（buyitian：「15 分钟 timeout 这个有点太短了，设成默认 30 分钟吧」）
 # 抬到 30 分钟：这道闸**不管挂死**（卡住本来就会等满全程），所以放大只影响
 # 「真的在干长活」那一类；要中途停有 `/stop`。
-# 安装器模板和 config.example.toml 里那行要跟着一样（都是 1800）。
-DEFAULT_TURN_TIMEOUT_SEC = 1800
+# 🔴 11-22 主人「你再改成 1 个小时」⇒ 1800 → 3600。
+# 安装器模板（install-mac.sh / install-windows.ps1）和 config.example.toml 里那行
+# 要跟着一样，**而且 `carryover.DEFAULTS_REV` 必须 +1**，否则老用户的 1800 会被
+# 原样搬回来（11-21 就这么漏过一次：「我早上仍然遇到这个 15 分钟超时」）。
+DEFAULT_TURN_TIMEOUT_SEC = 3600
 
 # 状态卡刷新间隔。飞书对同一用户发消息 5 QPS，单卡片实体操作上限 10 次/秒 ——
 # 15 秒一次远在限额内，同时足够让用户感觉"它在动"。
 _STATUS_REFRESH_SEC = 15
 ACK_DELAY_SEC = 1.0   # 晚这么久再贴「在办」：秒回的命令不闪（第 19 轮，见 docs/iteration/r19-ack.md）
 MENU_DEBOUNCE_SEC = 3.0   # 同一个常驻菜单键多久内的重复只算一次（第 22 轮）
+# 悬浮菜单点下去算「在这个会话群里点的」的时间窗（第 40 轮）。
+# 10 分钟：他在群里说完话、看着回复、顺手点悬浮栏 —— 这个动作不会隔很久。
+# 🔴 宁可窗口短：窗口外落回单聊只是「没停对」，而落到一个他早就不看的群
+# 是在别人的活上动手，那个代价大得多。
+MENU_GROUP_WINDOW_SEC = 10 * 60.0
 LATE_NOTICE_SEC = 180   # 消息晚到超过这么久（秒）就在回复前说一句（第 22 轮，Mac 睡眠）
 
 # 按钮点不动时给用户的话。每条都要说清**为什么**和**下一步做什么** ——
@@ -119,7 +127,12 @@ _TALK_MARK_LOCK = threading.Lock()
 # 重启后「这句要发给它吗」那两个按钮，隔多久还算数（同确认前记着的话 `HELD_TTL_SEC`）
 RESTART_OFFER_TTL_SEC = 10 * 60
 # 有任务在跑时，静默阈值放宽到几倍 —— 宁可多等，不要腰斩结果。
-_INFLIGHT_GRACE = 4
+# 🔴 必须保证 `WATCHDOG_SILENT_SEC * _INFLIGHT_GRACE > turn_timeout_sec`，否则
+# 「跑满单轮超时」的那一轮会被看门狗先掐掉（用户看到的是状态卡停住、再也没有回复）。
+# 11-22 把超时改成 3600 时当场撞上：900 × 4 = 3600，**正好相等、不大于** ⇒ 提到 6
+# （900 × 6 = 5400 > 3600，留 30 分钟余量）。
+# 盯着这条的测试：`tests/test_interference.py::test_inflight_grace_covers_the_whole_turn_timeout`
+_INFLIGHT_GRACE = 6
 
 # 长连接握手被**明确拒绝**时的错误码。SDK 把这类错当 `ClientException` 直接抛出、
 # 不重连（`lark_oapi/ws/client.py:187-189`），所以它们都是"重启也治不好"的死法。
@@ -1014,6 +1027,15 @@ class Bridge:
             if not hasattr(self, "_chat_ids"):
                 self._chat_ids = {}
             self._chat_ids[scope] = chat_id
+            # 🔴 第 40 轮：给「悬浮菜单点下去落到哪个群」打点（`chatbind.most_recent_active`）。
+            # 菜单事件不带 chat_id，而主人有 28 个会话群 ⇒ 只能按「谁最近在说话」推。
+            # 失败一声不响：这只是用来猜落点，不能让一条消息因为它丢掉。
+            _binds = getattr(self, "chat_binds", None)
+            if _binds is not None:
+                try:
+                    _binds.touch(chat_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("群活跃打点失败", exc_info=True)
 
         # 丢后台，立刻返回 —— 3 秒纪律。
         if self._loop is None:
@@ -1838,15 +1860,40 @@ class Bridge:
                 return
             self._menu_last[(clicker, event_key)] = now
 
-            # 单聊 chat_id 之前记过就用它；没有就用 open_id 发
+            # 🔴 第 40 轮（2026-11-22，主人原话「我每个会话群都是和会话绑定的，怎么区分不出来呢」）：
+            # **先看他是不是正在某个会话群里**，是就落到那个群。
+            #
+            # 为什么要猜：飞书的菜单点击事件**不带 chat_id**（实测 209 次点击的日志原文 +
+            # SDK 的 `P2ApplicationBotMenuV6Data` 只有 operator / event_key / timestamp）。
+            # 原来无条件写 `dm:{clicker}` ⇒ 他在「Claude · zing 开发」群里点「⏹ 停下」，
+            # 停的是**单聊**那个会话，不是他正看着的这个。现场 28 个会话群，全落错。
+            #
+            # 为什么猜得准：群和会话**一对一**落盘（`chat_binds.json`），
+            # 而「他正看着哪个群」= 最近有动静的那个群（`touch` 在消息入口打点）。
+            # 🔴 窗口 `MENU_GROUP_WINDOW_SEC`：超过这个时长没动静的群**不认**，
+            # 否则「三天前聊过的群」会把今天的点击吃掉 —— 那比落到单聊更糟
+            # （落单聊只是没停对，落到一个他忘了的群是在别人的活上动手）。
+            # 窗口外 ⇒ 照旧走单聊，行为和改之前一样。
             scope = f"dm:{clicker}"
             chat_id = getattr(self, "_chat_ids", {}).get(scope, "") or clicker
             if not hasattr(self, "_chat_ids"):
                 self._chat_ids = {}
             self._chat_ids.setdefault(scope, chat_id)
+            where = "chat" if chat_id != clicker else "open_id"
+            binds = getattr(self, "chat_binds", None)
+            if binds is not None:
+                try:
+                    recent = binds.most_recent_active(within_sec=MENU_GROUP_WINDOW_SEC)
+                except Exception:  # noqa: BLE001 —— 猜不出来就按老路走，别让点击丢掉
+                    logger.debug("找最近活跃的群失败", exc_info=True)
+                    recent = None
+                if recent is not None:
+                    scope, chat_id = recent.scope, recent.chat_id
+                    self._chat_ids.setdefault(scope, chat_id)
+                    where = f"会话群 {recent.label}"
 
             logger.info("菜单点击 转成命令 key=%s 命令=%s 回到=%s", event_key, text.split()[0][:16],
-                        "chat" if chat_id != clicker else "open_id")
+                        where)
             if self._loop is not None:
                 asyncio.run_coroutine_threadsafe(
                     self._handle(scope, chat_id, text), self._loop
@@ -1879,6 +1926,16 @@ class Bridge:
                 value.get("act") if isinstance(value, dict) else type(value).__name__,
                 clicker[:12],
             )
+            # 🔴 第 40 轮：在群里点按钮也算「正看着这个群」⇒ 打点，让随后点悬浮菜单
+            # 落得准。卡片回调**带 chat_id**（和菜单事件不同），所以这里是确定的、不是猜的。
+            _ctx = getattr(event, "context", None)
+            _cid = getattr(_ctx, "open_chat_id", "") or ""
+            _binds = getattr(self, "chat_binds", None)
+            if _cid and _binds is not None:
+                try:
+                    _binds.touch(_cid)
+                except Exception:  # noqa: BLE001
+                    logger.debug("群活跃打点失败（卡片）", exc_info=True)
             if not isinstance(value, dict):
                 return P2CardActionTriggerResponse(
                     {"toast": {"type": "error", "content": _CARD_TOASTS[ApprovalStore.MALFORMED]}}
@@ -2261,13 +2318,15 @@ class Bridge:
                                    "刚发出去那一句还在跑，它的回复还会带回来一次。")
                 return True
             if target is not None:
-                # 🔴 只退出对话模式，**不**停目标那一轮 —— 它可能已经在干活了，
-                # 而且从外面停会关掉用户整个会话。说清这一点，否则他以为「取消」把活也撤了。
+                # 🔴 只退出对话模式，**不**停目标那一轮 —— 它可能已经在干活了。
+                # 说清这一点，否则他以为「取消」把活也撤了。
+                # 🔴 第 41 轮：那一轮现在**真停得了**（在那个窗口里按 Esc，`control.stop` 先试这条），
+                # 所以这里把「停下」按钮一起给出来 —— 文案提到的按钮必须真在卡片上。
                 from .fleet.actions import do_button
 
                 self._say_with_buttons(chat_id, f"好，退出了，不再把你说的话发给{target.label}。"
-                                                "它手里已经开始的那一轮还在跑，要停只能到电脑上按 Esc。",
-                                       [do_button("sessions", "🖥 回到总览")])
+                                                "它手里已经开始的那一轮还在跑，要停就点「停下」。",
+                                       [do_button("stop"), do_button("sessions", "🖥 回到总览")])
             elif pending_consent is not None:
                 self._say(chat_id, "好，不进对话模式。" + ("你刚才说的那几句也没发过去。" if dropped else ""))
             elif restarted:
@@ -2484,10 +2543,38 @@ class Bridge:
                 self._say(chat_id, "没有被暂停，直接说要干什么就行。")
             return True
 
+        # 🔴 后果看不见的那两条（`/clear` / `/init`）在这里拦下（2026-11-22）。
+        # 判据和理由见 `menu.DESTRUCTIVE` 那段红字。两条都**真的会执行**：
+        #   `/clear` 换掉 session_id ⇒ 上下文断了，而手机上只看到「这一轮没出结果」
+        #   `/init`  真去写 CLAUDE.md（实测 3 个 turn）⇒ 在生产仓库里凭空生成文件
+        # 不提供 `/clear!` 这种逃生写法（用户 11-22 拍的）：要清上下文就点「🆕 新话题」，
+        # 效果等价，而且那条路桥**知道**自己清了、能把话说对。
+        from .menu import destructive_command
+
+        blocked = destructive_command(text)
+        if blocked:
+            from .fleet.actions import do_button
+
+            if blocked == "/clear":
+                self._say_with_buttons(
+                    chat_id,
+                    "这条会把刚才聊的全忘掉，而且忘了之后我这边看不出来是你清的。"
+                    "要清就点下面「🆕 新话题」，一样的效果。",
+                    [do_button("new", primary=True)])
+            else:
+                self._say_with_buttons(
+                    chat_id,
+                    "这条会在你电脑上那个项目里新建一个 CLAUDE.md 文件，手机上不好确认改了什么，"
+                    "所以我没发出去。真要做，到电脑上自己打一次。",
+                    [do_button("new")])
+            return True
+
         # 🔴 打错的斜杠命令在这里收口，别往下漏给 claude。
         # 2026-11-05 实测的缺口：`/sessoins` 这种会被当成普通消息发给 claude ⇒
         # 花钱、慢、答非所问。判据只看第一个 token，并且刻意放过带两层斜杠的东西
         # （`/Users/me/codes 里有什么` 是个正常问题，不是打错的命令）—— 见 menu.unknown_command。
+        # 🔴 2026-11-22：判据已从「不在表里」换成「猜得中」⇒ `/goal` `/context` 这些
+        # **上游真能跑**的命令现在会漏到下面去（这是对的，实测它们在 `-p` 下 0 花费）。
         from .menu import unknown_command_reply
 
         guessed = unknown_command_reply(text)
@@ -2988,6 +3075,19 @@ class Bridge:
                                                 "按平常的方式处理。要发给它的话点下面的按钮再说一次。", again)
             return False
 
+        # 🔴 斜杠命令**不在这里拦**（2026-11-22 当天就撞了，主人原话「是我没更新吗？」）。
+        #
+        # 第一版把这一拦放在这儿 ⇒ 他在群里打 `/goal 看看天气`，回的是
+        # 「斜杠命令发不进 Claude「198 k3s 节点硬盘」」 —— **而那条路本来能跑**。
+        # 原因：对话模式**不止一条**路，选哪条是 `control.send()` 在动手那一刻现判的
+        # （见 `fleet/control.py` 的红字）。第 41 轮之后是三条：
+        #   窗口开着、认得那种终端、它又不忙 ⇒ **打进那个窗口**（第 41 轮）⇒ 斜杠命令真执行
+        #   窗口开着但正忙 / 认不出那种终端 ⇒ relay ⇒ 上游写死 `skipSlashCommands` ⇒ 跑不了
+        #   没人占着 ⇒ `claude -p --resume` ⇒ 斜杠命令也真执行
+        # ⇒ 三条里**两条能跑**，在这儿拦等于把能跑的一起拦掉。
+        # 判据必须和选路在**同一个地方**：relay 自己那条在 `fleet/relay.py` 的 `relay()` 入口，
+        # 打进窗口那条在 `fleet/termsend.py` 的 `can_send()`。
+        #
         # 在飞的判断要**在取目标之后、动手之前**，这样第二句得到的是「上一条还在发」，
         # 而不是被另一个会话执行。
         if not hasattr(self, "_fleet_inflight"):
@@ -4494,11 +4594,11 @@ class Bridge:
             return (
                 f"{TALKING_PREFIX} **{target.label}** 说话。"
                 f"{_group_how_to_talk(self._group_perm_report(), here=True, proven=self._group_msg_proven())}\n"
-                "要退出就点「退出对话」。它停不了的那一轮只能在电脑上按 Esc。"
+                "要退出就点「退出对话」。它手里那一轮要停，点「停下」。"
             )
         return (
             f"{TALKING_PREFIX} **{target.label}** {TALKING_SUFFIX}\n"
-            "直接打字发过来就行。它停不了的那一轮只能在电脑上按 Esc。"
+            "直接打字发过来就行。它手里那一轮要停，点「停下」。"
         )
 
     # ---------- 群里确认前说的话：先记着，确认后发 ----------

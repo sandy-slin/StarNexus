@@ -74,7 +74,10 @@ APPEND_IF_MISSING = {"notify"}
 #   手改成了别的档（那旧值就不等于旧默认）。
 # 所以从这一轮起，新 config 里写一行 `defaults_rev`，意思是「这份文件的默认值是第几轮的」。
 # 以后再改默认值，靠它就能分清，不用再猜。
-DEFAULTS_REV = 17
+# 🔴 改这个数之前先确认两个安装器模板里的 `defaults_rev` 跟着改了
+# （`install-mac.sh` / `install-windows.ps1`）—— 三处不一致，迁移判据就失效。
+# 盯着这条的测试：`tests/test_r40_timeout_one_hour.py::test_three_places_agree`
+DEFAULTS_REV = 18
 # 迁移发生时在 `[agent]` 留一行，桥启动后好告诉用户「你的档位被升了」——
 # 🔴 悄悄把人从只读升到全授权是不行的，他得知道。
 MIGRATED_KEY = "migrated_from"
@@ -96,10 +99,26 @@ MIGRATED_KEY = "migrated_from"
 # 但这里有 `defaults_rev` 可用，它正是为这件事建的，不用再加一套。
 _R16_TURN_TIMEOUT = 900
 _R17_TURN_TIMEOUT = 1800
+# ── 第 40 轮（2026-11-22）：主人「你再改成 1 个小时」。1800 → 3600 ──
+# 同一个坑第三次：光改模板对老用户无效（`turn_timeout_sec` 在 `CARRY` 里）。
+# 判据照用 `defaults_rev`，只是多了一代：
+#   rev < 18 且值 == 1800 ⇒ 那是 r17 写死的默认 ⇒ 不带，用新模板的 3600
+#   rev < 17 且值 == 900  ⇒ r16 的默认（上一轮那条，仍然要管：有人还没升上来）
+#   值是别的数            ⇒ 他手改过，照旧带，绝不覆盖
+_R18_TURN_TIMEOUT = 3600
+# 每一代的「写死的默认值」→ 从哪一版起不再算默认。加新一代就往这儿加一行，
+# 别去改下面那个函数（它是遍历这张表的）。
+_OLD_DEFAULT_TIMEOUTS = (
+    (_R16_TURN_TIMEOUT, 17),
+    (_R17_TURN_TIMEOUT, 18),
+)
 
 
 def _migrating_turn_timeout(old: dict) -> bool:
-    """旧文件里的 `turn_timeout_sec` 是不是「r16 及以前写死的默认值」。"""
+    """旧文件里的 `turn_timeout_sec` 是不是「上一代写死的默认值」。
+
+    是 ⇒ 不往新文件里带它，让新模板的默认值生效。
+    """
     agent = old.get("agent")
     if not isinstance(agent, dict):
         return False
@@ -107,9 +126,12 @@ def _migrating_turn_timeout(old: dict) -> bool:
         rev = int(agent.get("defaults_rev") or 0)
     except (TypeError, ValueError):
         rev = 0
-    if rev >= 17:
-        return False                                  # 这一轮之后写的 ⇒ 值是他自己的
-    return agent.get("turn_timeout_sec") == _R16_TURN_TIMEOUT
+    value = agent.get("turn_timeout_sec")
+    for old_default, landed_in_rev in _OLD_DEFAULT_TIMEOUTS:
+        # `rev >= landed_in_rev` ⇒ 这份文件是那一版之后写的 ⇒ 里面的值是他自己的
+        if rev < landed_in_rev and value == old_default:
+            return True
+    return False
 
 
 def _migrating_from_old_default(old: dict) -> bool:

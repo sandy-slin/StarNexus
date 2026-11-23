@@ -1200,6 +1200,47 @@ class ClaudeAdapter(Adapter):
         except Exception as exc:  # 绝不抛给上层
             return ActionResult(False, friendly_error(exc), str(id or ""))
 
+    # ---------- 第三条路：打进那个终端窗口（第 41 轮，2026-11-23） ----------
+
+    def _termsend(self) -> Any:
+        """这家的 TermSend 单例（懒建）。`termsend.py` 反过来 import 本模块 ⇒ **在函数里 import**（同 `_relay`）。"""
+        existing = getattr(self, "_termsend_obj", None)
+        if existing is not None:
+            return existing
+        from .termsend import TermSend
+
+        with self._send_locks_guard:
+            existing = getattr(self, "_termsend_obj", None)
+            if existing is None:
+                existing = TermSend(self)
+                self._termsend_obj = existing
+        return existing
+
+    def can_term_send(self, id: str, *, for_key: bool = False) -> tuple:
+        """发之前那次复查 → (能不能, 不能的话一句大白话)。
+
+        和 `can_relay` **同一个形状**：`why` 空串 = 退回别的路（调用方接着试 relay / resume），
+        有内容 = 真做不到。
+        """
+        try:
+            return self._termsend().can_send(str(id or ""), for_key=for_key)
+        except Exception as exc:
+            return False, friendly_error(exc, "看不出能不能打进那个窗口")
+
+    def term_send(self, id: str, text: str) -> ActionResult:
+        """把一句话**打进**电脑上那个终端窗口（等于主人自己敲的 ⇒ 斜杠命令真执行）。"""
+        try:
+            return self._termsend().send_text(str(id or ""), str(text or ""))
+        except Exception as exc:  # 绝不抛给上层
+            return ActionResult(False, friendly_error(exc), str(id or ""))
+
+    def term_key(self, id: str, key: str) -> ActionResult:
+        """往那个窗口按一个键（现在只有 Esc / Enter，见 `termsend.ALLOWED_KEYS`）。"""
+        try:
+            return self._termsend().send_key(str(id or ""), str(key or ""))
+        except Exception as exc:  # 绝不抛给上层
+            return ActionResult(False, friendly_error(exc), str(id or ""))
+
     def relay_stop(self, id: str) -> ActionResult:
         """对话模式里的 `/stop`：**停不了**，照实说在哪停。
 

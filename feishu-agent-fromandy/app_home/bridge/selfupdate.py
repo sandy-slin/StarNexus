@@ -73,8 +73,8 @@ import logging
 import os
 import platform
 import subprocess
-import tempfile
 import time
+import tempfile
 import re
 import secrets
 import urllib.parse
@@ -188,6 +188,9 @@ _INSTALLER_RC_EXTRA = {
     4294967295: "安装包退出码=0xFFFFFFFF（-1 的无符号形式，多半没起来）",
 }
 _INSTALLER_RC_OTHER = "安装包退出码=这张表里没有的码（看 emsg 里的数字）"
+# 安装器**抛异常**那条路（超时 / 起不来）用的常量。必须是整句写死的字面量：
+# `errreport` 只发 `record.msg`，f-string 拼出来的会变 `<动态消息>`（11-21 实测过两次）。
+_INSTALLER_DIED_WITH_EXC = "安装器抛异常退出（跑了多少秒看 emsg 的 sec=）"
 
 
 class _RcOnly(Exception):
@@ -350,6 +353,9 @@ class SelfUpdater:
         # 换掉进程约 13 秒，这期间进来的新一轮会被半路杀掉、没有任何提示。装的时候把这个置上，
         # 桥看到它就先不开新轮（回一句「正在装新版」）。
         self.installing = False
+        # 上一次跑安装器花了多少秒。装失败时跟着上报：45 秒 vs 6 秒能分出「不是超时」
+        # （见 `_run_installer_windows` 里那段红字）。
+        self._last_installer_sec = -1
         self._opener = opener
         self._runner = runner
         self._now = now
@@ -643,6 +649,20 @@ class SelfUpdater:
 
     def run_installer(self, path: str) -> subprocess.CompletedProcess:
         """跑安装包。它自己会停掉旧服务、装新码、重启 —— 所以这个进程**可能被它杀掉**。"""
+        started = time.monotonic()
+        try:
+            return self._run_installer(path)
+        finally:
+            # 🔴 记时放在**这一层**，不放各平台那支里：这里是 mac / windows / 测试注入
+            # （`self._runner`）三条路的唯一入口 ⇒ 一处就全覆盖。
+            # 第一版只在 `_run_installer_windows` 里记 ⇒ mac 恒 -1、注入 runner 的测试也恒 -1，
+            # 而这个数字正是用来分「被杀 vs 超时」的，少一条腿等于那条腿上查不了。
+            # `finally`：安装器把桥自己杀掉那种情况走不到这里（没关系，那种本来就不上报失败），
+            # 但**抛异常**（timeout / OSError）那条路也要留下秒数 —— 超时 20 分钟和 3 秒被杀，
+            # 上报里得分得开。
+            self._last_installer_sec = int(time.monotonic() - started)
+
+    def _run_installer(self, path: str) -> subprocess.CompletedProcess:
         if self._runner is not None:
             return self._runner(path)
         if platform.system() == "Windows":
@@ -709,6 +729,17 @@ class SelfUpdater:
                     argv, stdin=devnull, stdout=out, stderr=subprocess.STDOUT, env=env,
                     timeout=20 * 60, creationflags=creationflags,
                 )
+            # 🔴 11-22：记下它**跑了多久**。这个数字有鉴别力，不是凑数的 ——
+            # 「一键安装」会话今天在一台手动装的机器上拿到两条同形上报（我核过原文）：
+            #   17:38 子安装器 codex  退出码 -1/0xFFFFFFFF，跑了 **45 秒**
+            #   17:43 子安装器 claude 退出码 -1/0xFFFFFFFF，跑了 **6 秒**
+            # 同一台机器、两个不同的子安装器、都被结束 ⇒ **固定超时不会一次 45 秒一次 6 秒**，
+            # 所以「超时」这个解释被排掉了，剩下的是「有东西在反复杀 powershell.exe」。
+            # 我们这三台卡住的（…0890c8 / …bc5c47 / …3431af）走的是自动更新，
+            # 没有那层「上报 + 当前窗口重试」的兜底，所以直接卡住、而且连这个秒数都没采。
+            # 🔴 采在**桥这边**（`run_installer` 那一层前后记时间），不进 `_PS_BOOT`：
+            # 退出码 -1 意味着 powershell 自己被杀，`-Command` 那段字符串根本没机会跑 ——
+            # 把诊断放进去等于白做（这是「一键安装」会话建议的那一刀，我核过它对这个码无效）。
             try:
                 proc = _go(flags | _CREATE_BREAKAWAY_FROM_JOB)
             except OSError:
@@ -747,6 +778,13 @@ class SelfUpdater:
         except Exception as exc:  # noqa: BLE001 —— 更新失败绝不能把桥带崩
             self.installing = False
             logger.exception("自动更新失败 build=%s", build)
+            # 🔴 抛异常这条路也要带秒数：`TimeoutExpired`（20 分钟）和「3 秒就被杀」
+            # 在上报里必须分得开，而上面那句 `exception` 的 emsg 是异常自己的原文，
+            # 不一定含时间（`OSError` 就不含）。
+            # `sec=-1` 是有意义的值：**安装器一次都没跑**（下载 / 校验就挂了）⇒ 别去查杀软。
+            if self._last_installer_sec >= 0:
+                logger.error(_INSTALLER_DIED_WITH_EXC,
+                             exc_info=_RcOnly(f"installer raised sec={self._last_installer_sec}"))
             self._remember(build, "fail", str(exc))
             self.last_error = str(exc)
             # 给人看的那句不带异常原文（可能是一长串英文栈）；原文进日志
@@ -788,10 +826,20 @@ class SelfUpdater:
             #   `log=empty` ⇒ 进程根本没跑（杀软拦下 / 作业对象限制 / 可执行文件没了）
             #   `log=<字节数>` ⇒ 起来了但死在半路，那就该去读 state 里的 detail
             # 🔴 只发「空 / 多少字节」这个形状，**绝不发日志内容**（里面有路径和用户名）。
+            # 🔴 11-22 第三样：`sec=<跑了多少秒>`。为什么它有鉴别力——
+            # 「一键安装」会话今天在一台**手动**装的机器上拿到两条同形上报（我核过原文）：
+            #   17:38 子安装器 codex  rc=-1/0xFFFFFFFF，跑了 45 秒
+            #   17:43 子安装器 claude rc=-1/0xFFFFFFFF，跑了  6 秒
+            # 同一台机器、两个子安装器、都被结束 ⇒ 固定超时不可能一次 45 秒一次 6 秒，
+            # 「超时」这个解释当场被排掉，剩下的是「有东西在反复杀 powershell.exe」。
+            # 而**走自动更新**的那三台（…0890c8 / …bc5c47 / …3431af）没有那层「上报 + 当前窗口
+            # 重试」的兜底 ⇒ 连这个秒数都没采到，所以查不动。这一刀就是补这个。
+            # 同样只能走 `emsg`：带数字的句子进不了 `msg`（模板必须整句是源码常量）。
             logger.error(
                 installer_rc_log(proc.returncode),
                 exc_info=_RcOnly(
-                    f"installer exited rc={proc.returncode} log={'empty' if not tail else len(tail)}"))
+                    f"installer exited rc={proc.returncode} "
+                    f"log={'empty' if not tail else len(tail)} sec={self._last_installer_sec}"))
             logger.error("安装包退出码 %s build=%s", proc.returncode, build)
             if (self._state().get(build) or {}).get("outcome") == ROLLED_BACK:
                 # 安装器第 6 步新版没起来、已经换回旧版并记了 rolled_back ⇒ 别用 fail 盖掉它
