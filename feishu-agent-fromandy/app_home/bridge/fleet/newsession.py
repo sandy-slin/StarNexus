@@ -389,6 +389,53 @@ def _cmd_quote(arg: str, *, always: bool = False) -> str:
     return '"' + s.replace('"', '""') + '"'
 
 
+def _open_in_cmux(script_path: str) -> bool:
+    """在 cmux 里新开一个工作区跑这个脚本。开成了 True；任何一步不行 False（调用方退回 Terminal.app）。
+
+    凭据取法和 `termsend` 同一个：cmux 只认它自己的子孙，桥不是 ⇒ 从一个活着的 cmux 会话
+    身上取 `CMUX_SOCKET_CAPABILITY`，**只经环境变量**传给子进程（不进 argv、不落盘、不打日志）。
+    """
+    try:
+        from .termsend import _ENV_CAPABILITY, _ENV_SOCKET, _cmux_bin, _process_env
+    except Exception:  # noqa: BLE001
+        return False
+    exe = _cmux_bin()
+    if not exe:
+        return False
+    creds = {}
+    try:
+        reg_dir = os.path.join(os.path.expanduser("~/.claude"), "sessions")
+        for name in sorted(os.listdir(reg_dir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(reg_dir, name), encoding="utf-8") as fh:
+                    pid = (json.load(fh) or {}).get("pid")
+            except Exception:  # noqa: BLE001
+                continue
+            env = _process_env(pid)
+            if env.get(_ENV_CAPABILITY):
+                creds = {k: env[k] for k in (_ENV_CAPABILITY, _ENV_SOCKET) if env.get(k)}
+                break
+    except OSError:
+        return False
+    if not creds:
+        return False
+    env = dict(os.environ)
+    env.update(creds)
+    folder = os.path.dirname(script_path) or "."
+    # 工作区名给人看：不给的话标题是那个一次性脚本的临时路径（`/var/folders/…/carher-newsession-xxx`）。
+    # 真正的工作目录由脚本第一行 `cd` 决定，`--cwd` 只是 cmux 开壳时的起点。
+    argv = [exe, "workspace", "create", "--name", "📱 手机新开的会话", "--cwd", folder,
+            "--command", script_path, "--focus", "false"]
+    try:
+        res = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=10, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return res.returncode == 0 and "OK" in (res.stdout or "")
+
+
 def _open_terminal_default(script_path: str) -> tuple:
     """打开一个真窗口跑那个脚本。mac 用 `open -a Terminal`，Windows 用 `cmd /c start`。"""
     if on_windows():
@@ -398,6 +445,15 @@ def _open_terminal_default(script_path: str) -> tuple:
         argv = ["cmd", "/c", "start", "", "/d", os.path.dirname(script_path) or ".", script_path]
         doing = "没能打开命令行窗口"
     else:
+        # 🔴 11-23：**先开在 cmux 里**，开不了才退回 Terminal.app。
+        # 主人现场：手机「新建会话」开出来的窗口在 Terminal.app ⇒ 那个会话是唯一一个
+        # 认不出的（session-lanes 30/31）⇒ 在群里发 `/goal` 回「插不上手」，而另外 30 个都行。
+        # cmux 里的窗口才有程序接口（termsend：斜杠命令真执行、Esc 真打断）。
+        # 实测（干净环境、非 cmux 子孙、只带一把从活会话身上取的凭据）：
+        # `cmux workspace create --cwd <目录> --command <脚本> --focus false` ⇒ OK、
+        # 不抢焦点、tree 里立刻出现。没装 cmux / 连不上 / 没有凭据 ⇒ 原样走 Terminal.app。
+        if _open_in_cmux(script_path):
+            return True, ""
         argv = ["/usr/bin/open", "-a", "Terminal", script_path]
         doing = "没能打开终端窗口"
     try:
