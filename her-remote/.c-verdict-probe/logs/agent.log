@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/RealName/.carher-feishu-agent/bridge/app.py", line 246
+    ticket=AbC123SecretTicketValue open_id=ou_deadbeef
+tomllib.TOMLDecodeError: Unescaped backslash

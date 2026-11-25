@@ -1,0 +1,80 @@
+# 飞书 → 本机 agent 桥。复制成 config.toml 后填写（config.toml 已入 .gitignore）。
+#
+# 凭据不写在这里也行：环境变量 FEISHU_BRIDGE_APP_ID / FEISHU_BRIDGE_APP_SECRET 优先。
+# 刻意不做「用机器名加密密钥」那种事 —— 调研里有项目这么干，用户改个电脑名就永久解不开。
+
+[feishu]
+app_id = ""
+app_secret = ""
+
+# 只有这些 open_id 能驱动本机。留空 = 谁都不行（fail-closed，故意的）。
+# 怎么拿自己的 open_id：先留空启动，给机器人发一条消息，看日志里打印的 open_id。
+# open_id 是 per-app 的，换 app 要重新取。
+owner_open_ids = []
+
+# ── 一次性配对码 ────────────────────────────────────────────────────────
+# 上面的白名单为空时，**只有正文等于这个码**的消息能把发送者绑定成主人。
+# 绑定成功后这几行会被自动删掉（一次性），并且那条消息不会被当成任务执行。
+#
+# 🔴 为什么不是「第一条消息的发送者自动成为主人」：自建应用默认对全员可见，
+# 同租户任何人抢在你之前私聊机器人发一条，就拿下了这台电脑 —— 而真正的主人
+# 之后只会觉得机器人坏了（他的消息走静默丢弃）。
+#
+# 留空 = 不开配对窗口，谁都绑不上（仍然 fail-closed）。
+# 码由安装器用 CSPRNG 生成并打在终端上；手动填也行，字母表建议避开 0O1lI。
+pairing_code = ""
+# 签发时间（Unix 秒）。**没有它就等于没有有效期** ⇒ 读不到时按已过期处理。
+pairing_issued_at = 0
+# 有效期。过期后要重新生成：
+#   python -c "from bridge.pairing import PairingGate; print(PairingGate.reissue('config.toml'))"
+pairing_ttl_min = 30
+# 试错几次就作废这个窗口。没有上限的话六位码可以被慢慢猜。
+# 计数落盘在 config.toml 旁边的 pairing.state —— 只记内存的话杀一次进程就清零了。
+pairing_max_attempts = 5
+
+[agent]
+# 允许 agent 工作的目录。只认绝对路径，访问范围外的路径一律拒。
+workspaces = ["/Users/Liuguoxian/codes/carher-admin"]
+default_workspace = "/Users/Liuguoxian/codes/carher-admin"
+
+# readonly = 只给看：Read/Glob/Grep + 一组白名单只读命令
+# write    = 允许改文件（仍不含 git 提交/推送、不含 rm）
+# trusted  = 全授权：不问就做，一张审批卡片都不弹
+#            仍挡着少数**不可逆**操作：rm / sudo / git push / git reset
+#            / kubectl delete / curl|wget / 读 .env 和私钥。
+#            留着不是不信任你，是防 prompt injection —— agent 可能读到
+#            某个仓库里的恶意 README 被诱导，而这几条一旦发生就收不回来。
+#
+# 自己一台机器、自己用，建议直接 trusted。改完重启服务生效。
+mode = "readonly"
+
+model = "claude-sonnet-5-5"
+
+# 单轮墙上时钟上限（秒）。超时杀掉子进程并如实回报，不装作成功。
+turn_timeout_sec = 3600
+
+# 空闲多久后下一条消息开新会话，不再 --resume。
+# 调研里 cc-connect 默认 30 分钟，理由是旧history(失败的命令、调试噪音)会被反复重读并开始主导注意力。
+session_idle_reset_min = 30
+
+[limits]
+# 飞书纯文本上限 150KB、卡片 30KB，超了平台静默丢弃（真实案例：活干完了钱花了，用户看到空卡片）。
+# 这里留足余量，超长转文件。
+max_reply_chars = 20000
+
+# 进度提示：多久没有结构化进展就吱一声，每轮最多两次。
+# 抄 botmux 的形状：计时器独立于模型，模型完全不响应时才是最需要提示的时候。
+progress_first_notice_sec = 90
+progress_escalate_sec = 420
+progress_max_notices = 2
+
+[review]
+# 你自己加的禁止项（正则，匹配到就拒绝执行）。
+# 只能更严：写什么都放不开上面那些硬拒项（rm -rf / / git push / 读凭据 等）。
+# 抄 OpenAI dots 的「Custom Rules 关不掉 auto-review」。
+# 例：deny_patterns = ["生产|prod", "客户数据"]
+deny_patterns = []
+
+[notify]
+# Claude 会话进入「等你」（≥20 秒、你不在电脑前）时往你单聊推一张卡。false = 一张都不推。
+waiting = true

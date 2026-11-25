@@ -1,0 +1,8 @@
+#!/bin/bash
+case "$FAKE_STATE" in
+  healthy)   printf '\tstate = running\n\truns = 48\n\tpid = 7082\n' ;;
+  # 崩溃循环里 pid 可能恰好非 0（刚被 KeepAlive 拉起来的那个）—— 这正是 pid 那条拦不住的形状
+  crashloop) printf '\tstate = running\n\truns = %s\n\tpid = 9001\n' "$(cat $FAKE_RUNS)" ;;
+  nopid)     printf '\tstate = spawn scheduled\n\truns = 3\n\tlast exit code = 1\n' ;;
+esac
+exit 0

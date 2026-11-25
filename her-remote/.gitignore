@@ -1,0 +1,10 @@
+config.toml
+.venv/
+__pycache__/
+*.pyc
+
+# 调研时克隆的别人的仓库 / 一次性探针（42MB，而且 cc-connect 的文档里有它自己的示例密钥）
+.work/
+
+# tests/test_service_alive_verdict.py 的夹具目录：测试被打断时会残留，残留会让 build.sh 把版本号标成 -dirty
+.svcverdict-tmp-*/
