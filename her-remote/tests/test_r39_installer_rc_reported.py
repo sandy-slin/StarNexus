@@ -235,7 +235,7 @@ def _e2e_with_log(rc, tail):
 def test_empty_log_means_process_never_ran():
     """`rc=-1` + 日志空 ⇒ powershell 根本没起来（杀软拦下 / 作业对象限制 / 文件没了）。
 
-    现场（…9813b0 11-21 12:04）：装 `04f9541a` 拿到 rc=4294967295（0xFFFFFFFF = -1），
+    现场（…<机器> 11-21 12:04）：装 `04f9541a` 拿到 rc=4294967295（0xFFFFFFFF = -1），
     而那一版对 Windows 安装器只改了一个数字（defaults_rev 16→17，纯 config 模板），
     同一版 11 台（含 3 台 Windows）全部 u=ok ⇒ 不是包的问题。
     这时安装器正文一行都没跑到，正文里的 Die/trap 上报点一个都碰不到

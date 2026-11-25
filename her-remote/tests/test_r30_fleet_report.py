@@ -112,7 +112,7 @@ def test_one_bad_line_does_not_break_report(fr):
     q() + "&id=" + ID_B,                 # 重复键
     # 🔴 11-24：`"v=&id=…&os=mac"`（缺版本号）**已从这张「该被拒」名单里搬走** ——
     #   它现在是**故意接受**的，见下面 test_empty_version_is_accepted_now。
-    #   原因：`…2440a8` 13:09:28 那条 `u=crashloop` 的 `v=` 就是空的（崩在换版那一刻），
+    #   原因：`…<机器>` 13:09:28 那条 `u=crashloop` 的 `v=` 就是空的（崩在换版那一刻），
     #   旧判据把它整条判 `bad`、`id`/`u` 置空 ⇒ **任何桶都看不见它**，谁都没发现。
     #   ⛔ 别把它删掉了当完事：它是唯一守着「放宽 `v` 不许顺带把 `os` 也放开」的用例，
     #     所以搬到下面继续守着。
@@ -420,7 +420,7 @@ def test_bitable_upsert_by_machine_id():
 
 # ── 1121：在线但一次都没试过的落后机器（u 恒空）────────────────────────
 def test_silently_behind_counts_online_machines_that_never_attempted(fr):
-    """🔴 11-21 02:5x 实测缺口：…bfd0d6 停在 `20261110-03fe140f` 已 11 天，每 10 分钟准点轮询
+    """🔴 11-21 02:5x 实测缺口：…<机器> 停在 `20261110-03fe140f` 已 11 天，每 10 分钟准点轮询
     （11-21 当天 18 条、4 天 512 条**全是 `u=`**），但三个桶一个都不收它 ——
     `failed_windows` 只认 `u=fail`、`not_applied` 只认 `u=not_applied`、`stale` 要 24h 不出现
     （它分钟级在线）⇒ 报表上「更新失败 0 / 没装上 0」,人看不出有台机器十一天没跟上。

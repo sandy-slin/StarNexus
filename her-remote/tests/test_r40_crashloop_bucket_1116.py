@@ -44,8 +44,8 @@ def fr():
 CST = timezone(timedelta(hours=8))
 NOW = datetime(2026, 11, 21, 20, 45, 0, tzinfo=CST)
 # 真实那台（…<机器>）的形状：windows、装着正在发的版本、分钟级轮询
-ID_CRASH = "5e07cf2b79755a0f"
-ID_FAIL = "bbbb0000000890c8"
+ID_CRASH = "1a2b3c4d5e6f7a8b"
+ID_FAIL = "a1b2c3d4e5f60718"
 APP_CRASH = "cli_aXXXXXXXXXXXXXX"
 APP_FAIL = "cli_a1b2c3d4e5f60718"
 V_NEW = "20261121-edc925df"
@@ -85,7 +85,7 @@ def test_render_text_has_the_crashloop_line(fr):
     text = fr.render_text(rep, {APP_CRASH: "张三"})
     assert "反复崩溃" in text, text
     hit = [ln for ln in text.splitlines() if ln.startswith("反复崩溃")]
-    assert len(hit) == 1 and "：1 台" in hit[0] and "…<机器>" in hit[0] and "张三" in hit[0], hit
+    assert len(hit) == 1 and "：1 台" in hit[0] and f"…{ID_CRASH[-6:]}" in hit[0] and "张三" in hit[0], hit
     # 一台都不崩的时候只出现数字，不许挂空的「—— 」尾巴
     clean = fr.build_report(
         fr.parse_lines([line(NOW - timedelta(minutes=5), u="ok")]), V_NEW, {}, NOW)
@@ -96,7 +96,7 @@ def test_render_text_has_the_crashloop_line(fr):
 def test_render_wording_does_not_outrun_the_criterion(fr):
     """🔴 桶的条件里没有看 `latest` ⇒ 文案不许说「装的版本是对的」。
 
-    数据：11-17 08:37 …6d6e8d 那条 `u=crashloop` 带的是 `20261110-03fe140f`，
+    数据：11-17 08:37 …<机器> 那条 `u=crashloop` 带的是 `20261110-03fe140f`，
     而那一小时车队 189 条上报里 144 条是 `20261116-f06ffd64` ⇒ 崩的机器也可能是落后版本。
     """
     recs = fr.parse_lines([line(NOW - timedelta(minutes=5), v=V_OLD)])
