@@ -43,6 +43,9 @@ WHY_OUTSIDE_WORKSPACE = (
     "要放开得在电脑上改这个助手的设置。"
 )
 WHY_UNKNOWN_TARGET = "这个会话不在刚才的列表里了，点「回到总览」重新看一眼。"
+# termsend 在那个窗口里替你按了一下 Esc 之后的那句话。这条路**没有回执**（没人回报「停了」），
+# 所以只说「按下去了」，不号称它一定停住了 —— 那一轮可能正好在收尾。
+WHY_STOPPED_BY_ESC = "已经替你在那个窗口里按了一下 Esc。它手里那一轮应该停了，到电脑上或等会话卡刷新看一眼它最后说了什么。"
 
 
 @dataclass(frozen=True)
@@ -266,6 +269,14 @@ class FleetControl:
                 # （claude.py 模块头的实测）。所以这里按「有没有人占着」选路，不按调用方的心愿：
                 # relay=True 但其实没人占着 ⇒ 还是走 send（同步拿回复，不用等信使）；
                 # relay=False 但终端占着 ⇒ send 自己会拒（它在锁里复查），不会分叉。
+                # 🔴 第三条路（termsend，借鉴官方 20261123 第 41 轮）：**只接「非它不可」的那一种
+                # 消息**，排在 relay 之前。它是「往那个终端窗口里打字」=模拟主人按键 ⇒ 斜杠命令真执行。
+                # 判据见 `termsend.wants_terminal`：现在只有斜杠命令。普通话一律走 relay（进输入队列、
+                # 不打断、不丢、自带去重和送达确认）。排在 relay **之前**：顺序反了的话斜杠命令先被
+                # relay 接走、上游写死的 `skipSlashCommands` 让它当闲话，这条路永远试不到。
+                termsent = self._claude_term_first(adapter, sid, text)
+                if termsent is not None:
+                    return termsent
                 if relay and hasattr(adapter, "relay"):
                     can, why = self._claude_relay_ready(adapter, sid)
                     if can:
@@ -425,10 +436,75 @@ class FleetControl:
         if adapter is None:
             return ActionResult(False, WHY_NO_ADAPTER, sid)
         try:
+            # 🔴 termsend：**先试「在那个窗口里按 Esc」**。这是唯一能真停下终端会话那一轮的办法
+            # （从外面发信号会把主人整个会话关掉，见 relay.py 模块头）。办不到就原样退回下面两条，
+            # 用户看到的还是今天那句「只能到电脑上按 Esc」。
+            if tool == "claude":
+                stopped = self._claude_term_stop(adapter, sid)
+                if stopped is not None:
+                    return stopped
             method = (getattr(adapter, "relay_stop", None) if relay else None) or adapter.stop
             return method(sid)
         except Exception as exc:
             return ActionResult(False, friendly_error(exc, "没停成", log_as=f"会话总控停止失败 tool={tool}"), sid)
+
+    def _claude_term_first(self, adapter: Any, sid: str, text: str) -> Optional[ActionResult]:
+        """这句话该打进终端窗口吗？⇒ 打完的结果，或者 `None` = 「这条路不管，按原来的走」。
+
+        🔴 返回 `None` 和返回一个失败的 `ActionResult` 是两回事：
+        `None` ⇒ 下面的 relay / resume 接着照原样处理（**今天的行为一个字不变**）；
+        失败的 ActionResult ⇒ 这件事只有这条路能办、而它办不到，照实告诉用户。
+        后者只在「要打进去的是斜杠命令」且「这条路给了实话」时才出现 —— 否则会把
+        relay 本来能办的普通消息一起挡掉。
+        """
+        from .termsend import wants_terminal
+
+        if not wants_terminal(text):
+            return None
+        checker = getattr(adapter, "can_term_send", None)
+        sender = getattr(adapter, "term_send", None)
+        if checker is None or sender is None:
+            return None
+        try:
+            can, why = checker(sid)
+        except Exception as exc:  # adapter 约定不抛；防它自己炸
+            logger.debug("查能不能打进窗口失败 sid=%s", str(sid)[:8], exc_info=exc)
+            return None
+        if can:
+            return sender(sid, text)
+        # `why` 空串 = 「退回别的路」（和 can_relay 同一个约定）⇒ relay 去处理，
+        # 斜杠命令在那条路上会得到说清为什么的话，比这儿编一句准。
+        if not why:
+            return None
+        return ActionResult(False, why, sid)
+
+    def _claude_term_stop(self, adapter: Any, sid: str) -> Optional[ActionResult]:
+        """能在那个窗口里按 Esc 吗 ⇒ 按完的结果，或 `None` = 「按不了，走原来那两条」。
+
+        🔴 这里**只回 `None` 不回失败**：停不了的那句话（`relay.WHY_STOP_TARGET` / 各家的
+        `why_not_stop`）比这条路能编的任何一句都准，让原路去说。
+        `for_key=True`：要停的本来就是正在跑的那一轮，`can_send` 那道「它正忙着」不适用。
+        """
+        from .termsend import KEY_ESC
+
+        checker = getattr(adapter, "can_term_send", None)
+        presser = getattr(adapter, "term_key", None)
+        if checker is None or presser is None:
+            return None
+        try:
+            can, _why = checker(sid, for_key=True)
+        except Exception as exc:  # adapter 约定不抛；防它自己炸
+            logger.debug("查能不能按 Esc 失败 sid=%s", str(sid)[:8], exc_info=exc)
+            return None
+        if not can:
+            return None
+        out = presser(sid, KEY_ESC)
+        if not getattr(out, "ok", False):
+            return None
+        # 🔴 成了也要**带一句话**：`term_key` 成功时 `text` 是空串（它只管送，不编文案），
+        # 这条路**没有回执**（没人回报「我停了」），所以这句话只敢说「按下去了」，
+        # 不号称它一定停住了 —— 上面那一轮可能正好在收尾。
+        return ActionResult(True, WHY_STOPPED_BY_ESC, sid)
 
 
 def build_default(*, policy: Callable[[], Any], bridge_home: str, hook_settings: Any = None,

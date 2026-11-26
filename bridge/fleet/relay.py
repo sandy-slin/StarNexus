@@ -117,6 +117,18 @@ _REGISTRY_RE = re.compile(r"^\d+\.json$")
 _FROM_MODE_RE = re.compile(r'from-mode="([^"]*)"')
 _FROM_RE = re.compile(r'\bfrom="([^"]*)"')
 
+# 斜杠命令的形状：`/` + 一个字母 / 汉字开头，后面字母数字 / 汉字 / `_ ! · -`，总长 ≤ 20。
+# 中途插话（appsteer）和「打进终端窗口」（termsend）都用它判「这句话第一个词是不是斜杠命令」。
+# 🔴 relay 这条路送不了斜杠命令（上游信使写死 `skipSlashCommands`，不是我们挡的），
+#   所以斜杠命令要么走终端窗口（真执行），要么照实说送不进去。
+_SLASH_SHAPE = re.compile(r"^/[A-Za-z一-鿿][A-Za-z0-9一-鿿_!·-]{0,19}$")
+
+
+def _looks_like_slash_command(text: str) -> bool:
+    """整条消息的**第一个词**是不是一条斜杠命令。"""
+    head = str(text or "").strip().split()
+    return bool(head) and bool(_SLASH_SHAPE.match(head[0]))
+
 # `bypassPermissions` 之外一律当 prompting（保守）：二值里只有 bypass 实测过能直达。
 # `auto` **量过了，归 prompting**（2026-11-06 第 12 轮，一次性会话）：
 #   - 发送方是 auto ⇒ 目标 jsonl 那行 enqueue 写的是 `from-mode="prompting"`（3 次）
