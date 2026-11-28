@@ -46,9 +46,19 @@ StarNexus 在**编排能力**上明显领先官方：CEO 编排、中途插话�
 
 ## 五、本轮移植计划（按价值排序）
 
-1. **termsend（终端送键）** — 高价值，补插话缺口。独立 `claude/` 分支 + worktree，单测覆盖，目标 bot `Her remote · Pro` + MacBook Pro2 真机验收。
-2. **brand_icons（品牌图标）** — 纯 UX，低风险，需 `im:resource` 权限，拿不到回落 🤖。
-3. **toolkit（会话群工具栏）** — 林森 11-26 拍板照搬，依赖官方 `/her-tk` 收件箱。
+1. **termsend（终端送键）** — ✅ 已在 `claude/termsend` 分支完成（代码 + 单测 20 个，全量过）。补插话缺口：斜杠命令走 cmux `paste --submit` 真执行，Esc 走 `send-key escape` 真停。合回 main / 打标签前补 MacBook Pro2 真机验收。
+2. **brand_icons（品牌图标）** — ✅ 已在 `claude/brand-icons` 分支完成（代码 + 单测 12 个，全量过）。需 `im:resource` 权限，拿不到回落 🤖。
+3. **toolkit（会话群工具栏）** — ✅ 已在 `claude/toolkit` 分支完成（代码 + 单测 24 个，全量过）。**适配移植（林森 11-26 两次拍板）**：传输层（工具栏按钮 + `/her-tk` 点击轮询）照官方搬；但 5 个按钮**路由到 StarNexus 已有处理器**（`/stop`、已有 `modelcard`、详情卡、relay「接着干」、`_git_changes`），不新造官方那套 `build_toolbar_model_card` + `set_prefs`（StarNexus 的 `modelcard` + `model_prefs` 更强，照搬会并存两套模型机制）。依赖官方 `/her-tk` 收件箱。建群 body 的 `toolkit_ids` 头启动优化**故意不做**（名字前缀判据脆弱，`ensure_bound` 在同一流程里兜住正确性）。
+
+## 附二：手机答「选择卡」的现状与缺口（林森 11-26 提问）
+
+**问题**：以后 Claude / Codex 弹出「选哪个方案 A/B/C」这种选择卡，怎么从手机（飞书）做选择？
+
+**现状**：分两种卡。
+- **会话内选择卡**（agent 任务中途要你拍板）：StarNexus 后台走 `claude -p --resume`，这个模式**没有 `AskUserQuestion` 工具**（`fleet/choices.py` 模块头 2026-11-17 实测），Claude 会改成在回复里写「问题 + 1. 2. 3. 编号选项」。`choices.py` 的 `extract_choices` 认出结尾那组编号选项（2~6 个 + 在问的语气），挂成**回复下方的按钮**；点一下（`_on_choice_click`，act=`ch`）把那一项当你的回答发回同一会话（限主人、有时效）。手机上**点按钮或直接打字**都能答。
+- **Claude Code 自己的 `AskUserQuestion` 对话框**（就是本轮我弹给林森的那种）：属于客户端 harness UI，不经过桥，飞书里没有对应按钮；经飞书的等价物就是上面那条文本回落。
+
+**缺口（future 候选，未动）**：`choices.py` 只接**文本回落形式**，依赖 agent 把选项写成干净编号。待核：对 Codex 的选项格式、字母选项（A/B/C，正则已含）、多选、更花哨的排版的覆盖度。要「手机答任意 agent 的选择卡」得把这层做厚。
 
 ## 附：「198」和 `/her-tk` 是什么
 

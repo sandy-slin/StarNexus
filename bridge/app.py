@@ -223,6 +223,46 @@ def _redact_text(text: str) -> str:
     return redact(str(text or ""))[0]
 
 
+def _git_changes(cwd: str, timeout: float = 5.0, limit: int = 2500) -> str:
+    """工具栏「📂 改动」：`git status --short` + `git diff --stat`，**只读**、各自超时。读不出 ⇒ 一句人话。
+
+    借鉴官方 20261123 第 37 轮。`--no-optional-locks`：不去碰 `.git/index.lock`
+    （电脑上正在跑的 git 不会被我们撞上）。
+    """
+    import subprocess
+
+    def run(*args: str) -> tuple:
+        try:
+            proc = subprocess.run(["git", "--no-optional-locks", "-C", cwd, *args],
+                                  capture_output=True, text=True, timeout=timeout,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return None, "git 超过 %d 秒没回，先不看了。" % int(timeout)
+        except (OSError, ValueError):
+            return None, "这台电脑上跑不了 git。"
+        if proc.returncode != 0:
+            return None, "这个目录不是 git 仓库，看不了改动。"
+        return proc.stdout.strip(), ""
+
+    status, why = run("status", "--short")
+    if status is None:
+        return why
+    stat, why = run("diff", "--stat")
+    if stat is None:
+        return why
+    if not status and not stat:
+        return "没有没提交的改动。"
+    parts = []
+    if stat:
+        parts.append(stat)
+    untracked = [line for line in status.splitlines() if line.startswith("??")]
+    if untracked:
+        parts.append(f"另有 {len(untracked)} 个新文件没加进 git：" + "、".join(
+            line[3:].strip() for line in untracked[:5]) + ("…" if len(untracked) > 5 else ""))
+    text = "\n".join(parts)
+    return text if len(text) <= limit else text[:limit] + "\n…（太长，截掉了）"
+
+
 def _pending_fallback(sess) -> str:
     """详情卡发不出去时，文字版里那段「它在等什么」。没有就空串；出错也空串（不能让兜底文字发不出去）。"""
     try:
@@ -4370,6 +4410,15 @@ class Bridge:
 
         bound = result.bound
         group_scope = bound.scope
+        # 借鉴官方 20261123 第 37 轮：新建 / 复用的 Claude 群绑上快捷工具栏（toolkit 内部丢后台、
+        # 不阻塞、不抛；起不来不影响建群）。
+        if bound.tool == "claude":
+            try:
+                from .fleet import toolkit
+
+                toolkit.ensure_bound(bound.chat_id)
+            except Exception:  # noqa: BLE001
+                logger.debug("工具栏绑新群没起来", exc_info=True)
         reopened = result.how != CREATED and not bound.on
         if reopened:
             self.chat_binds.turn_on(bound.chat_id)
@@ -5830,6 +5879,149 @@ class Bridge:
         asyncio.run_coroutine_threadsafe(
             self._maybe_send_to_fleet(scope, offer["chat_id"], answer), self._loop)
         return toast("info", f"好，回答：{answer[:20]}", "发出")
+
+    # ---------- Claude 会话群输入框上方的快捷工具栏（借鉴官方 20261123 第 37 轮） ----------
+    #
+    # 点击从官方 198 收件箱（`/her-tk`）来（`fleet/toolkit.py` 的轮询线程 → `_on_toolbar_click`），
+    # **没有飞书签名**：防伪造靠 webhook 里的 hook_id 保密 + 这里核 payload（主人 + 绑定表里开着的
+    # Claude 群）。🔴 适配移植：按钮一律**路由到 StarNexus 已有的处理器**（/stop、mdl 模型卡、详情卡、
+    # relay「接着干」、git 改动），不新造一套模型机制（StarNexus 的 modelcard + model_prefs 更强）。
+    TOOLBAR_ACTIONS = ("stop", "go_on", "model", "progress", "changes")
+    TOOLBAR_GO_ON_TEXT = "接着干"
+    TOOLBAR_GIT_TIMEOUT = 5.0
+    TOOLBAR_GIT_MAX_CHARS = 2500
+
+    def _toolbar_bound(self, chat_id: str, open_id: str, what: str):
+        """工具栏的闸门 → 这个群的 Bound；不让做 ⇒ None（记一行日志，不回群里任何话）。"""
+        owners = getattr(getattr(self, "settings", None), "owner_open_ids", ()) or ()
+        if not isinstance(open_id, str) or open_id not in owners:
+            logger.info("工具栏 丢弃 %s 原因=不是主人", what)
+            return None
+        binds = getattr(self, "chat_binds", None)
+        if binds is None or not isinstance(chat_id, str) or not chat_id:
+            logger.info("工具栏 丢弃 %s 原因=没有绑定表", what)
+            return None
+        try:
+            bound = binds.of_chat(chat_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("工具栏 读群绑定失败")
+            return None
+        if bound is None:
+            logger.info("工具栏 丢弃 %s 原因=不是会话群", what)
+            return None
+        if not bound.on:
+            logger.info("工具栏 丢弃 %s 原因=这个群解绑了", what)
+            return None
+        if bound.tool != "claude":
+            logger.info("工具栏 丢弃 %s 原因=不是 Claude 群 tool=%s", what, bound.tool)
+            return None
+        return bound
+
+    def _on_toolbar_click(self, click):
+        """`toolkit.start` 的回调，在**轮询线程**里调 ⇒ 只核 + 丢进桥的 loop，绝不抛。
+
+        返回 future（测试用）；不执行 ⇒ None。
+        """
+        try:
+            action = getattr(click, "action", "")
+            if action not in self.TOOLBAR_ACTIONS:
+                logger.info("工具栏 丢弃 原因=不认识的按钮 %s", str(action)[:16])
+                return None
+            bound = self._toolbar_bound(getattr(click, "chat_id", ""), getattr(click, "open_id", ""), action)
+            if bound is None:
+                return None
+            loop = getattr(self, "_loop", None)
+            if loop is None:
+                logger.info("工具栏 丢弃 %s 原因=桥还没起好", action)
+                return None
+            logger.info("工具栏 点击 %s 会话=%s", action, bound.id[:8])
+            return asyncio.run_coroutine_threadsafe(self._toolbar_dispatch(action, bound), loop)
+        except Exception:  # noqa: BLE001 —— 轮询线程里不能炸
+            logger.exception("工具栏 处理点击失败")
+            return None
+
+    async def _toolbar_dispatch(self, action: str, bound) -> None:
+        chat_id = bound.chat_id
+        try:
+            if action == "stop":
+                await self._toolbar_stop(bound)
+            elif action == "go_on":
+                await self._toolbar_go_on(bound)
+            elif action == "model":
+                await self._toolbar_model(bound)
+            elif action == "progress":
+                await self._toolbar_progress(bound)
+            elif action == "changes":
+                await self._toolbar_changes(bound)
+        except Exception:  # noqa: BLE001
+            logger.exception("工具栏 %s 出错", action)
+            self._say(chat_id, "这一下没做成，我这边出错了。过一会儿再点一次。")
+        finally:
+            self._sync_talk_marker(bound.scope)
+
+    async def _toolbar_stop(self, bound) -> None:
+        """⏹ = 群里 `/stop` 同一套。没有在跟它说话的记录（5 分钟过了 / 刚重启）⇒ 直接问 adapter 停这个会话：
+        桥自己起的那一轮能停；终端占着的照实说「到电脑上按 Esc」。"""
+        scope, chat_id = bound.scope, bound.chat_id
+        known = getattr(self, "_fleet_inflight", {}).get(scope) or self._talking_to(scope)
+        if known is not None:
+            await self._handle_command(scope, chat_id, "/stop")
+            return
+        res = await asyncio.to_thread(self.fleet.stop, bound.tool, bound.id)
+        self._say(chat_id, ("⏹ " if res.ok else "") + res.text)
+
+    async def _toolbar_go_on(self, bound) -> None:
+        """▶️ = 往它送「接着干（时:分:秒）」，走群消息**同一条**送达路径（权限确认 / 暂停 / 审查 / 在飞）。
+
+        带到秒：relay 同一句话 10 分钟内「送到了还没回」会被拦、接收端也会丢一字不差的重复。
+        🔴 不落进桥自己的 claude：`_maybe_send_to_fleet` 返回 False 就照实说没送。
+        """
+        scope, chat_id = bound.scope, bound.chat_id
+        text = f"{self.TOOLBAR_GO_ON_TEXT}（{time.strftime('%H:%M:%S')}）"
+        paused = scope in getattr(self, "_paused", {})
+        busy = scope in getattr(self, "_fleet_inflight", {})
+        granted = self._relay_granted(scope, bound.tool, bound.id) \
+            or self._talk_ident_same(scope, bound.tool, bound.id)
+        if not paused and not busy and granted:
+            self._say(chat_id, "▶️ 已让它接着干")
+        if not await self._maybe_send_to_fleet(scope, chat_id, text):
+            self._say(chat_id, "这次没送进去，在群里直接说一句「接着干」试试。")
+
+    async def _toolbar_model(self, bound) -> None:
+        """🧠 = 打开 StarNexus 已有的模型卡（`modelcard`，按工具默认 + 会话单独设），不另造一套。"""
+        from .fleet.model import can
+        from .fleet.modelcard import home_card
+
+        mp = getattr(self, "model_prefs", None)
+        if mp is None:
+            self._say(bound.chat_id, "模型设置这会儿没起来，过一会儿再点。")
+            return
+        session = (bound.tool, bound.id, bound.name or bound.tool) if can(bound.tool, "model") else None
+        self._send_card_or_text(bound.chat_id, home_card(mp, session), "模型卡发不出去，在群里发 /model 看看。")
+
+    async def _toolbar_progress(self, bound) -> None:
+        """📜 = 读会话最近几条 + 它在等你什么（同详情卡），不往会话里送话、不花一轮。走 StarNexus 已有的详情卡。"""
+        await self._fleet_detail(bound.chat_id, bound.tool, bound.id, bound.scope)
+
+    async def _toolbar_changes(self, bound) -> None:
+        """📂 = 会话目录里 `git status --short` + `git diff --stat`（只读、各 5 秒超时）。"""
+        control = self.fleet
+        try:
+            sess, _why = await asyncio.to_thread(control.refresh, bound.tool, bound.id)
+        except Exception:  # noqa: BLE001
+            sess = None
+        sess = sess or control.cached(bound.tool, bound.id)
+        cwd = str(getattr(sess, "cwd", "") or "") if sess is not None else ""
+        if not cwd:
+            self._say(bound.chat_id, "看不出这个会话在哪个目录，没法看改动。")
+            return
+        resolver = getattr(self.policy, "resolve_workspace", None)
+        real = resolver(cwd) if resolver is not None else None
+        if not real:
+            self._say(bound.chat_id, "这个会话的目录不在手机能看的范围里，没看改动。")
+            return
+        text = await asyncio.to_thread(_git_changes, real, self.TOOLBAR_GIT_TIMEOUT, self.TOOLBAR_GIT_MAX_CHARS)
+        self._say(bound.chat_id, f"📂 {os.path.basename(real.rstrip(os.sep)) or real} 的改动\n{_redact_text(text)}")
 
     def _fleet_continue_text(self, tool: str, commands: list) -> str:
         """批准后续跑那一句。Codex 没有 defer，要把批过的命令原样告诉它重跑（钩子按指纹放行一次）。"""
@@ -7595,6 +7787,17 @@ class Bridge:
                               or os.path.expanduser("~/.carher-feishu-agent"))
         except Exception:  # noqa: BLE001 —— 图标起不来不能影响启动
             logger.info("品牌图标没起来，总览用 🤖", exc_info=True)
+        # 借鉴官方 20261123 第 37 轮：Claude 会话群输入框上方的快捷工具栏（建 toolkit + 补绑老群 +
+        # 向官方 198 收件箱 /her-tk 长轮询点击）。后台线程、不阻塞、不抛；起不来只是群里没有工具栏。
+        try:
+            from .fleet import toolkit
+
+            toolkit.start(self.client, self.settings.app_id,
+                          os.path.dirname(self.settings.config_path)
+                          or os.path.expanduser("~/.carher-feishu-agent"),
+                          self._on_toolbar_click)
+        except Exception:  # noqa: BLE001
+            logger.info("群工具栏没起来，Claude 会话群里没有快捷按钮", exc_info=True)
         # 第 32 轮：上次被重启打断的那一轮，等长连接连上后接着做（`bridge/inflight.py`）。
         # 钩子上面已经装好；连上之前不续 —— 续了也发不出「我让它接着做」和结果。
         threading.Thread(target=self._resume_after_restart_when_connected, args=(loop,),
