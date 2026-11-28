@@ -619,7 +619,13 @@ class ProcTable:
         `proc_start` 可以是：ps lstart 原样字符串（本地时间）、毫秒/秒时间戳、UTC ISO、
         Claude 注册表里的 UTC ctime 串。对不上、读不出来一律 False —— 宁可说「不在跑」，
         也不能把复用了 pid 的别的进程认成会话。
+
+        `proc_start` 也可以是一串候选（termsend 的 `_own_pids` 传
+        `(procStart, procStartFt, startedAt)`）：任一对得上就算。Windows 的 procStartFt 和
+        Mac 的 procStart 不会同时有，startedAt 兜底。
         """
+        if isinstance(proc_start, (list, tuple)):
+            return any(self.same_process(pid, v) for v in proc_start if v not in (None, ""))
         proc = self.get(pid)
         if proc is None:
             return False
