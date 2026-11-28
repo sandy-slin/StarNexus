@@ -564,7 +564,7 @@ def main_project(sessions: list) -> str:
     return max(sorted(set(projects), key=projects.index), key=projects.count)
 
 
-def group_heading(tool: str, items: list, shown: list, clean=None) -> str:
+def group_heading(tool: str, items: list, shown: list, clean=None, brand: str = "") -> str:
     """分组标题：把一组里**一样的那几样**（工具名、项目）提到这里来。
 
     例 `🤖 **Claude** · carher-admin（6 个）`。一个工具跨几个项目时写成
@@ -580,7 +580,9 @@ def group_heading(tool: str, items: list, shown: list, clean=None) -> str:
     label = TOOL_LABELS.get(tool, tool)
     rows = shown or items
     main = main_project(rows)
-    bits = [f"🤖 **{escape_card(label)}**"]
+    # 借鉴官方 20261123 第 36 轮：有这一家的品牌图标（`brand` = img_key，画在面板标题的 icon 上，
+    # 见 `_panel`）⇒ 不再写 🤖；拿不到图标照旧写 🤖。
+    bits = [f"**{escape_card(label)}**" if brand else f"🤖 **{escape_card(label)}**"]
     text = clip_cells(_safe_clean(clean, main), HEADING_PROJECT_CELLS) if main else ""
     if text:  # 脱敏失败 ⇒ 空串 ⇒ 不写项目，别留一个「 · （1 个）」
         kinds = len({project_of(s.cwd) for s in rows})
@@ -808,9 +810,20 @@ def group_summary(items: list, seen_at: Optional[float] = None) -> str:
     return "没有在跑的"
 
 
-def panel_title(tool: str, items: list, shown: list, clean=None, seen_at: Optional[float] = None) -> str:
+def panel_title(tool: str, items: list, shown: list, clean=None, seen_at: Optional[float] = None,
+                brand: str = "") -> str:
     """例「🤖 **Claude** · carher-admin（6 个）· 🟢 1 个在跑」。前半截就是原来的 `group_heading`。"""
-    return f"{group_heading(tool, items, shown, clean)}· {group_summary(items, seen_at)}"
+    return f"{group_heading(tool, items, shown, clean, brand)}· {group_summary(items, seen_at)}"
+
+
+def _brand_key(tool: str) -> str:
+    """这一家的品牌图标 img_key（`fleet/brand_icons.py`）；没有 / 出任何错 ⇒ ""，标题照旧写 🤖。"""
+    try:
+        from .brand_icons import key_for
+
+        return key_for(tool)
+    except Exception:  # noqa: BLE001 —— 图标是锦上添花，总览绝不能因为它画不出来
+        return ""
 
 
 def more_button_label(hidden: list, seen_at: Optional[float] = None) -> str:
@@ -835,13 +848,21 @@ def overflow_note(hidden: list, seen_at: Optional[float] = None) -> str:
     return f"{'⚠️ ' if extra else ''}还有 {len(hidden)} 个这张卡放不下{what}，在电脑上看"
 
 
-def _panel(title: str, expanded: bool, elements: list) -> dict:
-    """折叠面板：客户端本地展开 / 收起，不走回调（字段照主会话 2026-11-08 真发通过的那张）。"""
+def _panel(title: str, expanded: bool, elements: list, brand: str = "") -> dict:
+    """折叠面板：客户端本地展开 / 收起，不走回调（字段照主会话 2026-11-08 真发通过的那张）。
+
+    `brand`（借鉴官方 20261123 第 36 轮）= 这一家品牌图标的 img_key ⇒ 放在**标题 markdown 自己的
+    `icon`**（前缀图标，`custom_icon`）。header 的 `icon` 已经是右边的展开箭头，一个 header 只有
+    一个 icon 位。官方 2026-11-16 真发：这种写法飞书接受（code=0）。
+    """
+    head = {"tag": "markdown", "content": title}
+    if brand:
+        head["icon"] = {"tag": "custom_icon", "img_key": brand}
     return {
         "tag": "collapsible_panel",
         "expanded": bool(expanded),
         "header": {
-            "title": {"tag": "markdown", "content": title},
+            "title": head,
             "width": "fill",
             "vertical_align": "center",
             "icon": dict(PANEL_ICON),
@@ -961,7 +982,8 @@ def _build_overview_card(view: Overview, redact, expand: str, seen_at: Optional[
                 inner.append(_button(more_button_label(hidden, seen_at), fleet_value("more", tool)))
             # 🔴 展开与否看**整组**（不只是列出来的那几行）：藏着的那几个要他管，也得展开让他看见那个按钮
             expanded = opened or any(_busy(s, seen_at) for s in items)
-            elements.append(_panel(panel_title(tool, items, shown, clean, seen_at), expanded, inner))
+            brand = _brand_key(tool)
+            elements.append(_panel(panel_title(tool, items, shown, clean, seen_at, brand), expanded, inner, brand))
         legend = status_legend(view.sessions, seen_at)
         if legend:
             elements.append(_md(legend, small=True))

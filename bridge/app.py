@@ -3147,6 +3147,39 @@ class Bridge:
         if not sent:
             self._say(chat_id, fallback)
 
+    @staticmethod
+    def _brand_icons_in(card) -> bool:
+        """这张卡里有没有品牌图标（`custom_icon`，借鉴官方 20261123 第 36 轮）。"""
+        try:
+            from .fleet.brand_icons import card_uses_icons
+
+            return card_uses_icons(card)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _send_branded_overview(self, chat_id: str, card: str) -> bool:
+        """总览卡带了品牌图标 ⇒ 先试发一次；被拒就 `brand_icons.disable()` 返回 False。
+        没带图标 ⇒ 直接 False（调用方照老路发）。🔴 不抛。
+
+        🔴 飞书里只要有一个不认的 img_key，**整张卡**被拒（230099 / 200570）⇒ 带图标的发失败时
+        这个进程里关掉图标，调用方按原样重造一张（不带图标）再发，绝不让总览因为图标发不出去。
+        """
+        if not self._brand_icons_in(card):
+            return False
+        sender = getattr(getattr(self, "replier", None), "send_card", None)
+        try:
+            if sender is not None and sender(chat_id, card):
+                return True
+        except Exception:  # noqa: BLE001
+            logger.exception("带品牌图标的总览卡发送抛异常")
+        try:
+            from .fleet import brand_icons
+
+            brand_icons.disable("带图标的总览卡被飞书拒了")
+        except Exception:  # noqa: BLE001
+            logger.debug("关品牌图标失败", exc_info=True)
+        return False
+
     async def _fleet_overview(self, chat_id: str) -> None:
         from .fleet.cards import build_overview_card, row_label
 
@@ -3187,6 +3220,14 @@ class Bridge:
         card = self._honest_overview_card(
             build_overview_card(view, redact=_redact_text, row_button=self._overview_row_button(chat_id)),
             view, unread)
+        # 借鉴官方 20261123 第 36 轮：带品牌图标的那张先试发一次；被拒（img_key 不认 ⇒ 整张卡
+        # 230099/200570）⇒ 关掉图标、按原样重造一张再走老路发。
+        if card and self._send_branded_overview(chat_id, card):
+            return
+        if card and self._brand_icons_in(card):
+            card = self._honest_overview_card(
+                build_overview_card(view, redact=_redact_text, row_button=self._overview_row_button(chat_id)),
+                view, unread)
         if card:
             self._send_card_or_text(chat_id, card, fallback)
         else:
@@ -7544,6 +7585,16 @@ class Bridge:
         # FC-15：旧会话群补上 `SN·` 前缀，飞书里搜「SN·」能列出全部会话群。只改我们起的、没人动过的群名。
         threading.Thread(target=self._migrate_group_prefix, daemon=True, name="sn-prefix").start()
         threading.Thread(target=self._selfupdate_loop, daemon=True, name="selfupdate").start()
+        # 借鉴官方 20261123 第 36 轮：总览卡分组标题前的三家品牌图标（claude / cursor / codex）。
+        # 后台上传一次、按 app_id 缓存；拿不到就还是 🤖。起不来不影响启动。
+        try:
+            from .fleet import brand_icons
+
+            brand_icons.start(self.client, self.settings.app_id,
+                              os.path.dirname(self.settings.config_path)
+                              or os.path.expanduser("~/.carher-feishu-agent"))
+        except Exception:  # noqa: BLE001 —— 图标起不来不能影响启动
+            logger.info("品牌图标没起来，总览用 🤖", exc_info=True)
         # 第 32 轮：上次被重启打断的那一轮，等长连接连上后接着做（`bridge/inflight.py`）。
         # 钩子上面已经装好；连上之前不续 —— 续了也发不出「我让它接着做」和结果。
         threading.Thread(target=self._resume_after_restart_when_connected, args=(loop,),
