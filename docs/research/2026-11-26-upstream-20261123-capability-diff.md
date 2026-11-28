@@ -60,6 +60,11 @@ StarNexus 在**编排能力**上明显领先官方：CEO 编排、中途插话�
 
 **缺口（future 候选，未动）**：`choices.py` 只接**文本回落形式**，依赖 agent 把选项写成干净编号。待核：对 Codex 的选项格式、字母选项（A/B/C，正则已含）、多选、更花哨的排版的覆盖度。要「手机答任意 agent 的选择卡」得把这层做厚。
 
+**已做厚（2026-11-28，#3）**：`fleet/choices.py` 扩了选项识别 + 加了多选。
+- 识别更多编号形状（都实测过 Claude / Codex 真会这么写）：`- 1. x`（列表符+编号）、`(1) x`（括号）、`① x`（圈号）、`**1.** x`（强调）、`a) x`（小写字母）。🔴 **纯无编号列表 `- 苹果` 不收**（否则任何 markdown 列表都误报）。
+- 多选（`wants_multi`）：回复里有「可多选 / 多选 / select all / multiple」等信号 ⇒ 渲染成**勾/取消**按钮（`multi_value`，toggle 原地更新卡、不发）+ 一个「✅ 就这些」（`submit_value`）；点提交才把勾中的几项用「、」拼起来发回会话。单选保持老行为（点一下直接发）。`resolve_multi_click` 校验形状防伪造；单选/多选回调互斥，串不了。
+- 测试：`tests/test_choices.py` 从 8 个扩到 22 个（新增 5 种编号格式 + 多选 toggle/submit 端到端 + 空提交拒绝 + 伪造拒绝）。
+
 ## 附：「198」和 `/her-tk` 是什么
 
 官方注释里的「198」就是官方后端服务器，对外域名 `chat.auto-link.com.cn`。官方产品用到的路径：
@@ -94,6 +99,7 @@ StarNexus 在**编排能力**上明显领先官方：CEO 编排、中途插话�
 - termsend：工具栏 ▶️「接着干」端到端通 —— 19:20 从手机点击，经 `/her-tk` → `_on_toolbar_click` → `_toolbar_go_on` → relay 原样送达（文案与代码 `接着干（时:分:秒）` 一字不差）。
 - brand_icons：授权 `im:resource` 后，claude/codex/cursor 三个 img_key 上传成功并缓存（`~/.carher-feishu-agent/brand_icons.json`）。
 - toolkit：授权 `im:chat` 后，5 个按钮建成，13 个 Claude 群全绑上工具栏（`~/.carher-feishu-agent/toolkit.json`）。
+- termsend 核心机制（2026-11-28，#4）：在一个**一次性** cmux workspace（跑普通 bash，不碰任何真实会话）上，用 termsend 完全相同的两条命令实测：`cmux paste --submit`（正文走 stdin）把 `echo <marker>` 打进窗口并**真执行**，`read-screen` 读回命令行 + 输出；`cmux send-key escape` 送达成功（命令回 OK）、终端仍活、还能继续收键。连跑两次都过，用完 `workspace close --force` 销毁，26 个真实会话一个没动。固化成可复跑脚本 `tools/termsend_live_check.py`（退出码 0=两项都过）。🔴 为什么不往真实会话发斜杠命令验：termsend 送的是会真执行的命令，`/clear` 这类会真清上下文，不能拿主人正在干活的会话冒险。Esc 在普通 bash 里不打断前台命令、在 Claude TUI 里才打断当前轮——是否打断取决于目标程序，termsend 的契约只是「把键送进去」。
 
 **权限**：林森已在飞书开放平台为应用 `cli_aa79a6789a381bf6` 开通 `im:resource`（+`im:resource:upload`）和 `im:chat` 并发布版本；之前日志里的 99991672 已消除。
 

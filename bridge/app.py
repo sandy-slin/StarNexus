@@ -5829,9 +5829,13 @@ class Bridge:
         return longreply.publish(bm._http, token, longreply.title_for(label.lstrip("🖥🆕 "), clean), clean, owner)
 
     def _choice_buttons(self, scope: str, chat_id: str, tool: str, sid: str, text: str) -> list:
-        """回复结尾是「选一个」⇒ 每个选项一个按钮（FC-07）。选项文字记在服务端，按钮只带序号。"""
+        """回复结尾是「选一个」⇒ 每个选项一个按钮（FC-07）。选项文字记在服务端，按钮只带序号。
+
+        「可多选」时（`choices.wants_multi`）：每项是**勾/取消**按钮 + 一个「✅ 就这些」提交，
+        点项不立即发、攒着，点提交才把勾中的几项一起发回会话。单选保持老行为（点一下直接发）。
+        """
         from .fleet.actions import _button
-        from .fleet.choices import choice_value, extract_choices
+        from .fleet.choices import choice_value, extract_choices, multi_value, submit_value, wants_multi
 
         options = extract_choices(text)
         if not options or not sid:
@@ -5839,37 +5843,97 @@ class Bridge:
         import secrets
 
         nonce = secrets.token_hex(6)
+        multi = wants_multi(text)
         if not hasattr(self, "_choice_offers"):
             self._choice_offers = {}
         self._choice_offers[scope] = {"n": nonce, "options": options, "tool": tool, "sid": sid,
-                                      "chat_id": chat_id}
+                                      "chat_id": chat_id, "multi": multi, "picked": set()}
         from .redact import redact
 
-        return [_button(f"👉 {redact(label)[0]}", choice_value(nonce, i), primary=(i == 0))
-                for i, label in enumerate(options)]
+        if not multi:
+            return [_button(f"👉 {redact(label)[0]}", choice_value(nonce, i), primary=(i == 0))
+                    for i, label in enumerate(options)]
+        # 多选：每项「☐ 文字」toggle（没勾），最后一个「✅ 就这些」提交
+        buttons = [_button(f"☐ {redact(label)[0]}", multi_value(nonce, i)) for i, label in enumerate(options)]
+        buttons.append(_button("✅ 就这些", submit_value(nonce), primary=True))
+        return buttons
+
+    def _multi_choice_card(self, offer: dict) -> dict:
+        """多选卡当前样子：勾中的项 ☑、没勾的 ☐，底下「✅ 就这些」。用于 toggle 后原地更新。"""
+        from .fleet.actions import _button, build_buttons_card
+        from .fleet.choices import multi_value, submit_value
+        from .redact import redact
+
+        nonce, picked = offer["n"], offer["picked"]
+        buttons = [_button(f"{'☑' if i in picked else '☐'} {redact(label)[0]}", multi_value(nonce, i))
+                   for i, label in enumerate(offer["options"])]
+        buttons.append(_button("✅ 就这些", submit_value(nonce), primary=True))
+        return json.loads(build_buttons_card(buttons))  # build_buttons_card 回 JSON 串；toast 的 data 要 dict
 
     def _on_choice_click(self, event, clicker: str, value: dict):
-        """点了回复下面的选项按钮 ⇒ 把那一项当成主人的回答发回同一个会话。"""
+        """点了回复下面的选项按钮 ⇒ 把那一项当成主人的回答发回同一个会话。
+
+        单选：点一下直接发（老行为）。多选：toggle 勾/取消（原地更新卡、不发），「就这些」才把勾中的几项一起发。
+        """
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
             P2CardActionTriggerResponse,
         )
 
-        from .fleet.choices import resolve_choice_click
+        from .fleet.choices import OP_SUBMIT, OP_TOGGLE, resolve_choice_click, resolve_multi_click
 
-        def toast(kind: str, content: str, result: str):
+        def toast(kind: str, content: str, result: str, card: dict = None):
             logger.info("选项按钮点击 结果=%s", result)
-            return P2CardActionTriggerResponse({"toast": {"type": kind, "content": content}})
+            body = {"toast": {"type": kind, "content": content}}
+            if card is not None:
+                body["card"] = {"type": "raw", "data": card}
+            return P2CardActionTriggerResponse(body)
 
         if clicker not in self.settings.owner_open_ids:
             return toast("error", _CARD_TOASTS[ApprovalStore.FORBIDDEN], "拒绝:不是主人")
+        offers = getattr(self, "_choice_offers", {})
+
+        # 多选：toggle / submit
+        op, m_nonce, m_index = resolve_multi_click(value)
+        if op:
+            found = next(((scope, o) for scope, o in offers.items() if o["n"] == m_nonce), None)
+            if found is None:
+                return toast("info", "这组选项已经过期了（之后又有新回复），直接打字回答就行", "拒绝:过期")
+            scope, offer = found
+            if not offer.get("multi"):
+                return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED], "拒绝:不是多选")
+            if op == OP_TOGGLE:
+                if m_index >= len(offer["options"]):
+                    return toast("info", "这组选项已经过期了，直接打字回答就行", "拒绝:越界")
+                picked = offer["picked"]
+                picked.discard(m_index) if m_index in picked else picked.add(m_index)
+                n = len(picked)
+                return toast("info", f"已选 {n} 项，继续勾或点「就这些」" if n else "已取消，重新勾",
+                             "多选:toggle", card=self._multi_choice_card(offer))
+            # OP_SUBMIT
+            picked = sorted(offer.get("picked") or set())
+            if not picked:
+                return toast("info", "还没勾任何一项，先勾几个再点「就这些」", "多选:空提交",
+                             card=self._multi_choice_card(offer))
+            control = getattr(self, "fleet", None)
+            if control is None or self._loop is None:
+                return toast("error", "我这边还没准备好，直接打字回答就行", "拒绝:没起来")
+            offers.pop(scope, None)
+            answer = "、".join(offer["options"][i] for i in picked)
+            control.set_pending(scope, offer["tool"], offer["sid"])
+            asyncio.run_coroutine_threadsafe(
+                self._maybe_send_to_fleet(scope, offer["chat_id"], answer), self._loop)
+            return toast("info", f"好，回答：{answer[:20]}", "多选:发出")
+
+        # 单选
         nonce, index = resolve_choice_click(value)
         if not nonce:
             return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED], "拒绝:形状不对")
-        offers = getattr(self, "_choice_offers", {})
         found = next(((scope, o) for scope, o in offers.items() if o["n"] == nonce), None)
         if found is None or index >= len(found[1]["options"]):
             return toast("info", "这组选项已经过期了（之后又有新回复），直接打字回答就行", "拒绝:过期")
         scope, offer = found
+        if offer.get("multi"):
+            return toast("error", _CARD_TOASTS[ApprovalStore.MALFORMED], "拒绝:多选走 toggle")
         offers.pop(scope, None)
         answer = offer["options"][index]
         control = getattr(self, "fleet", None)
