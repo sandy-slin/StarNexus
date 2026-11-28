@@ -80,3 +80,25 @@ StarNexus 在**编排能力**上明显领先官方：CEO 编排、中途插话�
 - 不移植 `errreport.py`（向官方服务器上报）。
 - 不移植官方 `newsession.py`（我们的 `nscard.py` 更强）。
 - 不整包合并共享核心模块。
+
+## 七、交付记录（2026-11-28）
+
+**版本**：`1.12.0`（一次合并带三个功能）。合并提交 `03d4828`（`Merge claude/borrow-20261123`）。
+已推 `origin main` + 标签 `1.12.0`（无强推，远端一致）。各功能分支：`claude/termsend`（`625e306` + 探针 `b8a4365`）、`claude/brand-icons`（`655a201`）、`claude/toolkit`（`c76995c`），集成分支 `claude/borrow-20261123`（`5348ebb`）。
+
+**测试**：全量 530 过（merged main 上复跑一次仍 530 过）。新增单测：termsend 20、brand_icons 12、toolkit 24（含闸门 + 路由）。
+
+**部署**：人工部署到运行目录（`selfupgrade --now` 只装 GitHub 标签、装不了未合并 dev 分支，故走人工 rsync）。备份 `~/.carher-feishu-agent/bridge.bak-borrow-20261128-181307`；rsync 只改预期 9 文件（6 改 3 新、无误删）；桥 18:13 / 19:17 两次重启均「桥已启动」、飞书连上、零报错、`.local-deploy` 挡住官方覆盖。运行版本已 `--mark-installed 1.12.0`。
+
+**真机验收**（林森手机实点）：
+- termsend：工具栏 ▶️「接着干」端到端通 —— 19:20 从手机点击，经 `/her-tk` → `_on_toolbar_click` → `_toolbar_go_on` → relay 原样送达（文案与代码 `接着干（时:分:秒）` 一字不差）。
+- brand_icons：授权 `im:resource` 后，claude/codex/cursor 三个 img_key 上传成功并缓存（`~/.carher-feishu-agent/brand_icons.json`）。
+- toolkit：授权 `im:chat` 后，5 个按钮建成，13 个 Claude 群全绑上工具栏（`~/.carher-feishu-agent/toolkit.json`）。
+
+**权限**：林森已在飞书开放平台为应用 `cli_aa79a6789a381bf6` 开通 `im:resource`（+`im:resource:upload`）和 `im:chat` 并发布版本；之前日志里的 99991672 已消除。
+
+**<span style="color:red">待办 / 需林森知悉</span>**：
+- <span style="color:red">弱网缺口：toolkit 断网超 2 分钟再恢复，这期间手机点的工具栏按钮会被当过期丢掉（`/her-tk` 只存 120 秒 `CLICK_MAX_AGE_SEC`）。表现为「点了没反应」，但安全（不迟到乱执行），且只影响工具栏、不影响发消息和 termsend。照搬官方设计，未改。</span>
+- <span style="color:red">toolkit 依赖官方 `chat.auto-link.com.cn/her-tk` 收件箱（林森 11-26 两次拍板照搬）：与「自升级改走 GitHub、减少官方依赖」方向相反，已知并接受。官方那台挂了工具栏按钮无反应，其他功能不受影响。「以后再说」是否自建收件箱。</span>
+- 主桥长连接重连逻辑（`wsfast.py` / `stream.py`）本轮未改；新增三个后台线程均 `daemon` + 指数退避，不拖累主桥。
+- future 候选：`choices.py`「手机答选择卡」只接文本回落形式，待把 Codex 格式 / 字母选项 / 多选覆盖做厚（见附二）。
